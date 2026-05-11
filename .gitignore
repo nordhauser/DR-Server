@@ -1,0 +1,11 @@
+/*
+!/.gitignore
+!/DR_Server/
+DR_Server/*
+!/DR_Server/Assets/
+DR_Server/Assets/*
+!/DR_Server/Assets/DungeonRunners/
+DR_Server/Assets/DungeonRunners/**/*
+!/DR_Server/Assets/DungeonRunners/**/
+!/DR_Server/Assets/DungeonRunners/**/*.cs
+!/DR_Server/Assets/DungeonRunners/**/*.cs.meta

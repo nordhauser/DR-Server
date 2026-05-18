@@ -635,7 +635,7 @@ namespace DungeonRunners.Networking
         // Status codes other than 0 trigger error chat lines (e.g. "Failed to set Leader.",
         // "You are not the founder...", "Posses are currently unavailable.") — we never send
         // those from the server path because we already rejected the action via SendSystemMessage.
-        private void BroadcastProcessChangeLeader(Posse posse, uint oldLeaderId, uint newLeaderId,
+        private void BroadcastProcessChangeLeader(PosseRecord posse, uint oldLeaderId, uint newLeaderId,
             UnityGameServer server)
         {
             foreach (var memberConn in server.GetConnectedMemberConnsForPosse(posse.Id))

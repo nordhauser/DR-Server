@@ -762,11 +762,11 @@ namespace DungeonRunners.Data
                 Name = null
             };
 
-            // Add the 7 inventory children
-            var childNames = new[] { "Inventory", "TradeInventory", "Bank1", "Bank2", "Bank3", "Bank4", "Bank5" };
-            var childGCClasses = new[] { "avatar.base.Inventory", "avatar.base.TradeInventory", "avatar.base.Bank", "avatar.base.Bank2", "avatar.base.Bank3", "avatar.base.Bank4", "avatar.base.Bank5" };
+            // Add the 9 inventory children (Inventory + Trade + 7 bank pages, matching avatar.gc DefaultBankObject..DefaultBankObject7)
+            var childNames = new[] { "Inventory", "TradeInventory", "Bank1", "Bank2", "Bank3", "Bank4", "Bank5", "Bank6", "Bank7" };
+            var childGCClasses = new[] { "avatar.base.Inventory", "avatar.base.TradeInventory", "avatar.base.Bank", "avatar.base.Bank2", "avatar.base.Bank3", "avatar.base.Bank4", "avatar.base.Bank5", "avatar.base.Bank6", "avatar.base.Bank7" };
 
-            for (int i = 0; i < 7; i++)
+            for (int i = 0; i < 9; i++)
             {
                 var child = new GCObject
                 {

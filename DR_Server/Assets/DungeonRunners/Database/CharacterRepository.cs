@@ -164,6 +164,14 @@ namespace DungeonRunners.Database
                     ch.completedQuests = LoadCompletedQuests(conn, (int)characterId);
                     ch.unlockedCheckpoints = LoadCheckpoints(conn, (int)characterId);
 
+                    // Posse name: denormalize from posses table for OP3 use without a JOIN at write time.
+                    if (ch.posseId != 0)
+                    {
+                        object pn = GameDatabase.ExecuteScalar(conn,
+                            "SELECT name FROM posses WHERE id = @id", ("@id", (int)ch.posseId));
+                        ch.posseName = pn == null || pn == DBNull.Value ? "" : Convert.ToString(pn);
+                    }
+
                     return ch;
                 }
             }
@@ -260,7 +268,8 @@ namespace DungeonRunners.Database
                             last_respec_time = @lrt,
                             respec_count = @rsc, pvp_wins = @pvpw, pvp_rating = @pvpr,
                             tp_zone = @tpz, tp_zone_id = @tpzid, tp_target_zone = @tptz,
-                            tp_pos_x = @tppx, tp_pos_y = @tppy, tp_pos_z = @tppz
+                            tp_pos_x = @tppx, tp_pos_y = @tppy, tp_pos_z = @tppz,
+                            posse_id = @pid, posse_join_cooldown = @pcd
                         WHERE id = @id",
                         ("@id", (int)ch.id), ("@lv", (int)ch.level), ("@xp", (int)ch.experience),
                         ("@g", (int)ch.gold), ("@ac", ch.avatarClass ?? ""),
@@ -276,7 +285,8 @@ namespace DungeonRunners.Database
                         ("@rsc", ch.respecCount), ("@pvpw", ch.pvpWins), ("@pvpr", ch.pvpRating),
                         ("@tpz", ch.tpZone ?? ""), ("@tpzid", ch.tpZoneId),
                         ("@tptz", ch.tpTargetZone ?? ""),
-                        ("@tppx", ch.tpPosX), ("@tppy", ch.tpPosY), ("@tppz", ch.tpPosZ));
+                        ("@tppx", ch.tpPosX), ("@tppy", ch.tpPosY), ("@tppz", ch.tpPosZ),
+                        ("@pid", (int)ch.posseId), ("@pcd", ch.posseJoinCooldown));
 
                     // Replace equipment
                     GameDatabase.ExecuteNonQuery(conn, "DELETE FROM character_equipment WHERE character_id = @cid", ("@cid", (int)ch.id));
@@ -297,15 +307,15 @@ namespace DungeonRunners.Database
                         InsertEquipment(conn, (int)ch.id, "amulet", ch.equipment.amulet ?? "", sr.TryGetValue("amulet", out rv) ? rv : -1, sl.TryGetValue("amulet", out lv) ? lv : -1);
                     }
 
-                    // Replace inventory
+                    // Replace inventory (includes bank containers — distinguished by container_id column)
                     GameDatabase.ExecuteNonQuery(conn, "DELETE FROM character_inventory WHERE character_id = @cid", ("@cid", (int)ch.id));
                     if (ch.inventory != null)
                     {
                         foreach (var item in ch.inventory)
                         {
                             GameDatabase.ExecuteNonQuery(conn,
-                                "INSERT INTO character_inventory (character_id, gc_class, slot_x, slot_y, count, buy_price, rarity, stored_level) VALUES (@cid, @gc, @x, @y, @c, @bp, @r, @sl)",
-                                ("@cid", (int)ch.id), ("@gc", item.gcClass), ("@x", (int)item.x), ("@y", (int)item.y), ("@c", item.count), ("@bp", (int)item.buyPrice), ("@r", item.rarity), ("@sl", item.storedLevel));
+                                "INSERT INTO character_inventory (character_id, gc_class, slot_x, slot_y, count, buy_price, rarity, stored_level, container_id) VALUES (@cid, @gc, @x, @y, @c, @bp, @r, @sl, @cont)",
+                                ("@cid", (int)ch.id), ("@gc", item.gcClass), ("@x", (int)item.x), ("@y", (int)item.y), ("@c", item.count), ("@bp", (int)item.buyPrice), ("@r", item.rarity), ("@sl", item.storedLevel), ("@cont", (int)item.containerId));
                         }
                     }
 
@@ -453,6 +463,9 @@ namespace DungeonRunners.Database
                 respecCount = GameDatabase.GetInt(r, "respec_count"),
                 pvpWins = GameDatabase.GetInt(r, "pvp_wins"),
                 pvpRating = GameDatabase.GetInt(r, "pvp_rating"),
+                posseId = GameDatabase.GetUInt(r, "posse_id"),
+                posseJoinCooldown = GameDatabase.GetInt(r, "posse_join_cooldown"),
+                posseRankId = GameDatabase.GetInt(r, "posse_rank_id"),
             };
         }
 
@@ -622,7 +635,7 @@ namespace DungeonRunners.Database
         {
             var items = new List<SavedInventoryItem>();
             using (var r = GameDatabase.ExecuteReader(conn,
-                "SELECT gc_class, slot_x, slot_y, count, COALESCE(buy_price, 0), COALESCE(rarity, -1), COALESCE(stored_level, -1) FROM character_inventory WHERE character_id = @cid",
+                "SELECT gc_class, slot_x, slot_y, count, COALESCE(buy_price, 0), COALESCE(rarity, -1), COALESCE(stored_level, -1), COALESCE(container_id, 11) FROM character_inventory WHERE character_id = @cid",
                 ("@cid", charId)))
             {
                 while (r.Read())
@@ -634,6 +647,7 @@ namespace DungeonRunners.Database
                     int buyPrice = r.GetInt32(4);
                     int rarity = r.GetInt32(5);
                     int storedLevel = r.GetInt32(6);
+                    int containerId = r.GetInt32(7);
 
                     // ═══════════════════════════════════════════════════════════════
                     // INVENTORY ROW VALIDATOR
@@ -651,13 +665,17 @@ namespace DungeonRunners.Database
                     //   rarity       -1 or 0..5
                     //   stored_level -1 or 1..120
                     // ═══════════════════════════════════════════════════════════════
+                    // Container-aware Y bound: main inv (0x0B) is 10x8, bank pages (0x0C, 0x0E-0x13) are 10x14.
+                    bool isBank = (containerId == 0x0C) || (containerId >= 0x0E && containerId <= 0x13);
+                    int maxY = isBank ? 13 : 7;
+
                     bool bad = false;
                     string reason = "";
                     if (string.IsNullOrEmpty(gc))
                     { bad = true; reason += "empty-gc_class "; }
                     if (sx < 0 || sx > 9)
                     { bad = true; reason += $"slot_x-out-of-range({sx}) "; }
-                    if (sy < 0 || sy > 7)
+                    if (sy < 0 || sy > maxY)
                     { bad = true; reason += $"slot_y-out-of-range({sy}) "; }
                     if (count < 1)
                     { bad = true; reason += $"count-invalid({count}) "; }
@@ -670,11 +688,11 @@ namespace DungeonRunners.Database
                     {
                         Debug.LogError(
                             $"[INV-VALIDATOR] ⚠️ CORRUPT ROW in character_inventory " +
-                            $"char_id={charId} slot=({sx},{sy}) gc_class='{gc ?? "NULL"}' " +
+                            $"char_id={charId} container=0x{containerId:X2} slot=({sx},{sy}) gc_class='{gc ?? "NULL"}' " +
                             $"count={count} rarity={rarity} stored_level={storedLevel} " +
                             $"buy_price={buyPrice} reasons={reason.Trim()}");
                         // Skip rows we can't repair; clamp the rest. DB is not modified.
-                        if (string.IsNullOrEmpty(gc) || sx < 0 || sx > 9 || sy < 0 || sy > 7)
+                        if (string.IsNullOrEmpty(gc) || sx < 0 || sx > 9 || sy < 0 || sy > maxY)
                         {
                             Debug.LogError($"[INV-VALIDATOR] → SKIPPING row (unrepairable)");
                             continue;
@@ -693,7 +711,8 @@ namespace DungeonRunners.Database
                         count = count,
                         buyPrice = (uint)buyPrice,
                         rarity = rarity,
-                        storedLevel = storedLevel
+                        storedLevel = storedLevel,
+                        containerId = (byte)containerId
                     });
                 }
             }

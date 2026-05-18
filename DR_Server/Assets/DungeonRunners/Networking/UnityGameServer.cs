@@ -590,6 +590,78 @@ namespace DungeonRunners.Networking
             return null;
         }
 
+        // Yields every currently-connected RRConnection (used by PosseManager when it needs to
+        // find a target player by character id, e.g., kick/invite recipients).
+        public IEnumerable<RRConnection> AllConnectedConnections()
+        {
+            foreach (var conn in _connections.Values)
+            {
+                if (!conn.IsConnected || string.IsNullOrEmpty(conn.LoginName)) continue;
+                yield return conn;
+            }
+        }
+
+        // Yields each online RRConnection whose selected character belongs to the given posse.
+        // Used by PosseManager to push CachedPosseFull updates to every member when posse state
+        // changes (rename, MOTD, member kick/promote/demote etc.).
+        public IEnumerable<RRConnection> GetConnectedMemberConnsForPosse(uint posseId)
+        {
+            if (posseId == 0) yield break;
+            foreach (var conn in _connections.Values)
+            {
+                if (!conn.IsConnected || string.IsNullOrEmpty(conn.LoginName)) continue;
+                if (!_selectedCharacter.TryGetValue(conn.LoginName, out var gcObj) || gcObj == null) continue;
+                var sc = CharacterRepository.GetCharacter(gcObj.Id);
+                if (sc != null && sc.posseId == posseId) yield return conn;
+            }
+        }
+
+        // Pushes the right CachedPosseInfo state to the client based on whether the
+        // character is in a posse. Called on login (HandleCharacterPlay) and the
+        // queue-bridge resend path.
+        private void SendPosseStateForCharacter(RRConnection conn, uint characterId,
+            Action<RRConnection, byte, byte, byte[]> sendCompressed)
+        {
+            try
+            {
+                var savedChar = CharacterRepository.GetCharacter(characterId);
+                if (savedChar != null && savedChar.posseId != 0)
+                {
+                    var posse = PosseRepository.GetPosse(savedChar.posseId);
+                    if (posse != null)
+                    {
+                        var memberNames = PosseRepository.MemberNames(posse.Id);
+                        var members = new List<(uint, string, bool)>(memberNames.Count);
+                        using (var dbConn = GameDatabase.GetConnection())
+                        using (var r = GameDatabase.ExecuteReader(dbConn,
+                            "SELECT id, name FROM characters WHERE posse_id = @pid ORDER BY id",
+                            ("@pid", (int)posse.Id)))
+                        {
+                            while (r.Read())
+                            {
+                                uint cid = (uint)r.GetInt32(0);
+                                string cname = r.GetString(1);
+                                members.Add((cid, cname, cid == posse.FounderCharacterId));
+                            }
+                        }
+                        Debug.LogError($"[POSSE-LOGIN] Restoring posse '{posse.Name}' id={posse.Id} ({members.Count} members) for {savedChar.name}");
+                        PosseManager.Instance.SendCachedPosseFull(conn, characterId, posse, members, sendCompressed, this);
+                        return;
+                    }
+                    Debug.LogError($"[POSSE-LOGIN] character id={characterId} has posse_id={savedChar.posseId} but row missing — falling back to no-posse state");
+                }
+                // No posse: do NOT send UpdateCachedPosse(0,0). Any UpdateCachedPosse sets bit 0
+                // of [PosseClient+0x128] ("have cached posse info"), which Tad's button check
+                // reads as "Already in a Posse!". ConnectionNotification alone (sent before this
+                // helper runs) is enough to unlock the Posse tab and /posse chat verbs.
+                Debug.LogError($"[POSSE-LOGIN] character id={characterId} has no posse — skipping cache push so Tad button reads 'eligible'");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[POSSE-LOGIN] SendPosseStateForCharacter error: {ex.Message}");
+            }
+        }
+
         // ═══════════════════════════════════════════════════════════════════
         // COMBAT SYSTEM METHODS
         // ═══════════════════════════════════════════════════════════════════
@@ -2301,24 +2373,36 @@ namespace DungeonRunners.Networking
         // INVENTORY ITEM TRACKING
         // ═══════════════════════════════════════════════════════════════════════════════
 
-        public void TrackInventoryItem(string connId, uint index, GCObject item, byte x, byte y)
+        // Container keys: 0x0B (main inv) maps to the raw connId to preserve all existing
+        // dict accesses across the codebase. Bank containers (0x0C, 0x0E-0x13) get suffixed keys.
+        // Bank pages are 10x14 (per Bank.gc); main inv is 10x8.
+        private static string InvKey(string connId, byte containerId)
+            => containerId == 0x0B ? connId : $"{connId}:0x{containerId:X2}";
+
+        private static bool IsBankContainer(byte containerId)
+            => containerId == 0x0C || (containerId >= 0x0E && containerId <= 0x13);
+
+        private static int ContainerHeight(byte containerId) => IsBankContainer(containerId) ? 14 : 8;
+        private const int CONTAINER_WIDTH = 10;
+
+        public void TrackInventoryItem(string connId, uint index, GCObject item, byte x, byte y, byte containerId = 0x0B)
         {
-            if (!_playerInventoryItems.ContainsKey(connId))
-                _playerInventoryItems[connId] = new Dictionary<uint, (GCObject, byte, byte)>();
-            _playerInventoryItems[connId][index] = (item, x, y);
-            Debug.LogError($"[INV-TRACK] Player {connId}: Index {index} = {item.GCClass} at ({x}, {y})");
+            string key = InvKey(connId, containerId);
+            if (!_playerInventoryItems.ContainsKey(key))
+                _playerInventoryItems[key] = new Dictionary<uint, (GCObject, byte, byte)>();
+            _playerInventoryItems[key][index] = (item, x, y);
+            Debug.LogError($"[INV-TRACK] Player {connId} container=0x{containerId:X2}: Index {index} = {item.GCClass} at ({x}, {y})");
         }
 
-        public (int x, int y) FindNextFreeInventorySlot(string connId, int width, int height)
+        public (int x, int y) FindNextFreeInventorySlot(string connId, int width, int height, byte containerId = 0x0B)
         {
-            const int INV_WIDTH = 10;
-            const int INV_HEIGHT = 8;
+            int invHeight = ContainerHeight(containerId);
 
-            for (byte y = 0; y <= INV_HEIGHT - height; y++)
+            for (byte y = 0; y <= invHeight - height; y++)
             {
-                for (byte x = 0; x <= INV_WIDTH - width; x++)
+                for (byte x = 0; x <= CONTAINER_WIDTH - width; x++)
                 {
-                    if (!IsInventorySlotOccupied(connId, x, y, width, height))
+                    if (!IsInventorySlotOccupied(connId, x, y, width, height, containerId))
                     {
                         return (x, y);
                     }
@@ -2330,18 +2414,20 @@ namespace DungeonRunners.Networking
 
         private Dictionary<string, Dictionary<uint, int>> _inventoryStackCounts = new Dictionary<string, Dictionary<uint, int>>();
 
-        public int GetStackCount(string connId, uint slot)
+        public int GetStackCount(string connId, uint slot, byte containerId = 0x0B)
         {
-            if (_inventoryStackCounts.ContainsKey(connId) && _inventoryStackCounts[connId].ContainsKey(slot))
-                return _inventoryStackCounts[connId][slot];
+            string key = InvKey(connId, containerId);
+            if (_inventoryStackCounts.ContainsKey(key) && _inventoryStackCounts[key].ContainsKey(slot))
+                return _inventoryStackCounts[key][slot];
             return 1;
         }
 
-        public void SetStackCount(string connId, uint slot, int count)
+        public void SetStackCount(string connId, uint slot, int count, byte containerId = 0x0B)
         {
-            if (!_inventoryStackCounts.ContainsKey(connId))
-                _inventoryStackCounts[connId] = new Dictionary<uint, int>();
-            _inventoryStackCounts[connId][slot] = count;
+            string key = InvKey(connId, containerId);
+            if (!_inventoryStackCounts.ContainsKey(key))
+                _inventoryStackCounts[key] = new Dictionary<uint, int>();
+            _inventoryStackCounts[key][slot] = count;
         }
 
         public void RemoveEquippedItem(string connId, uint slot)
@@ -2373,12 +2459,13 @@ namespace DungeonRunners.Networking
 
 
 
-        public (GCObject item, byte x, byte y)? GetAndRemoveInventoryItem(string connId, uint index)
+        public (GCObject item, byte x, byte y)? GetAndRemoveInventoryItem(string connId, uint index, byte containerId = 0x0B)
         {
-            if (_playerInventoryItems.ContainsKey(connId) && _playerInventoryItems[connId].ContainsKey(index))
+            string key = InvKey(connId, containerId);
+            if (_playerInventoryItems.ContainsKey(key) && _playerInventoryItems[key].ContainsKey(index))
             {
-                var data = _playerInventoryItems[connId][index];
-                _playerInventoryItems[connId].Remove(index);
+                var data = _playerInventoryItems[key][index];
+                _playerInventoryItems[key].Remove(index);
 
                 // Get item dimensions from database
                 ItemData itemData = DatabaseLoader.FindItem(data.item.GCClass);
@@ -2386,10 +2473,10 @@ namespace DungeonRunners.Networking
                 int height = itemData?.inventoryHeight ?? 1;
 
                 // Free ALL slots this item occupied
-                FreeInventorySlots(connId, data.x, data.y, width, height);
+                FreeInventorySlots(connId, data.x, data.y, width, height, containerId);
                 return data;
             }
-            Debug.LogError($"[INV-TRACK] ❌ No item at index {index}!");
+            Debug.LogError($"[INV-TRACK] ❌ No item at index {index} in container 0x{containerId:X2}!");
             return null;
         }
 
@@ -2397,13 +2484,15 @@ namespace DungeonRunners.Networking
 
 
 
-        public bool IsInventorySlotOccupied(string connId, byte x, byte y, int width, int height)
+        public bool IsInventorySlotOccupied(string connId, byte x, byte y, int width, int height, byte containerId = 0x0B)
         {
-            // Bounds check: item must fit within 10x6 grid
-            if (x + width > 10 || y + height > 8)
+            int invHeight = ContainerHeight(containerId);
+            // Bounds check
+            if (x + width > CONTAINER_WIDTH || y + height > invHeight)
                 return true;  // treat out-of-bounds as occupied
 
-            if (!_occupiedInventorySlots.ContainsKey(connId))
+            string key = InvKey(connId, containerId);
+            if (!_occupiedInventorySlots.ContainsKey(key))
                 return false;
 
             // Check ALL cells the item would occupy
@@ -2411,10 +2500,10 @@ namespace DungeonRunners.Networking
             {
                 for (int dy = 0; dy < height; dy++)
                 {
-                    int slotIndex = (y + dy) * 10 + (x + dx);
-                    if (_occupiedInventorySlots[connId].Contains(slotIndex))
+                    int slotIndex = (y + dy) * CONTAINER_WIDTH + (x + dx);
+                    if (_occupiedInventorySlots[key].Contains(slotIndex))
                     {
-                        Debug.LogError($"[INV-TRACK] ❌ Cell ({x + dx}, {y + dy}) is already occupied!");
+                        Debug.LogError($"[INV-TRACK] ❌ Cell ({x + dx}, {y + dy}) in container 0x{containerId:X2} is already occupied!");
                         return true;
                     }
                 }
@@ -2422,43 +2511,46 @@ namespace DungeonRunners.Networking
             return false;
         }
 
-        public void OccupyInventorySlots(string connId, byte x, byte y, int width, int height)
+        public void OccupyInventorySlots(string connId, byte x, byte y, int width, int height, byte containerId = 0x0B)
         {
-            if (!_occupiedInventorySlots.ContainsKey(connId))
-                _occupiedInventorySlots[connId] = new HashSet<int>();
+            string key = InvKey(connId, containerId);
+            if (!_occupiedInventorySlots.ContainsKey(key))
+                _occupiedInventorySlots[key] = new HashSet<int>();
 
             for (int dx = 0; dx < width; dx++)
             {
                 for (int dy = 0; dy < height; dy++)
                 {
-                    int slotIndex = (y + dy) * 10 + (x + dx);
-                    _occupiedInventorySlots[connId].Add(slotIndex);
+                    int slotIndex = (y + dy) * CONTAINER_WIDTH + (x + dx);
+                    _occupiedInventorySlots[key].Add(slotIndex);
                 }
             }
-            Debug.LogError($"[INV-TRACK] ✅ Occupied {width}x{height} slots starting at ({x}, {y})");
+            Debug.LogError($"[INV-TRACK] ✅ Occupied {width}x{height} slots starting at ({x}, {y}) in container 0x{containerId:X2}");
         }
 
-        public void FreeInventorySlots(string connId, byte x, byte y, int width, int height)
+        public void FreeInventorySlots(string connId, byte x, byte y, int width, int height, byte containerId = 0x0B)
         {
-            if (!_occupiedInventorySlots.ContainsKey(connId))
+            string key = InvKey(connId, containerId);
+            if (!_occupiedInventorySlots.ContainsKey(key))
                 return;
 
             for (int dx = 0; dx < width; dx++)
             {
                 for (int dy = 0; dy < height; dy++)
                 {
-                    int slotIndex = (y + dy) * 10 + (x + dx);
-                    _occupiedInventorySlots[connId].Remove(slotIndex);
+                    int slotIndex = (y + dy) * CONTAINER_WIDTH + (x + dx);
+                    _occupiedInventorySlots[key].Remove(slotIndex);
                 }
             }
-            Debug.LogError($"[INV-TRACK] ✅ Freed {width}x{height} slots starting at ({x}, {y})");
+            Debug.LogError($"[INV-TRACK] ✅ Freed {width}x{height} slots starting at ({x}, {y}) in container 0x{containerId:X2}");
         }
 
-        public (uint slot, GCObject item, byte x, byte y)? FindInventoryItemByGCClass(string connId, string gcClass)
+        public (uint slot, GCObject item, byte x, byte y)? FindInventoryItemByGCClass(string connId, string gcClass, byte containerId = 0x0B)
         {
-            if (!_playerInventoryItems.ContainsKey(connId)) return null;
+            string key = InvKey(connId, containerId);
+            if (!_playerInventoryItems.ContainsKey(key)) return null;
             string gcLower = gcClass.ToLower();
-            foreach (var kvp in _playerInventoryItems[connId])
+            foreach (var kvp in _playerInventoryItems[key])
             {
                 if (kvp.Value.Item1.GCClass.ToLower() == gcLower)
                     return (kvp.Key, kvp.Value.Item1, kvp.Value.Item2, kvp.Value.Item3);
@@ -2472,12 +2564,20 @@ namespace DungeonRunners.Networking
             var savedChar = CharacterRepository.GetCharacter(_selectedCharacter[conn.LoginName].Id);
             if (savedChar == null) return;
             savedChar.inventory.Clear();
-            if (_playerInventoryItems.ContainsKey(connId))
+
+            // Iterate every container: main inv (0x0B) and the 7 bank pages.
+            // Items are tagged with containerId so LoadInventory restores them to the right container.
+            byte[] saveContainers = { 0x0B, 0x0C, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13 };
+            foreach (byte cid in saveContainers)
             {
-                foreach (var kvp in _playerInventoryItems[connId])
+                string dictKey = InvKey(connId, cid);
+                if (!_playerInventoryItems.ContainsKey(dictKey)) continue;
+                foreach (var kvp in _playerInventoryItems[dictKey])
                 {
-                    int count = GetStackCount(connId, kvp.Key);
+                    int count = GetStackCount(connId, kvp.Key, cid);
+                    // Position conflicts only apply within the same container.
                     var posConflict = savedChar.inventory.Find(i =>
+                        i.containerId == cid &&
                         i.x == kvp.Value.Item2 &&
                         i.y == kvp.Value.Item3);
                     if (posConflict != null)
@@ -2487,7 +2587,6 @@ namespace DungeonRunners.Networking
                             posConflict.gcClass = kvp.Value.Item1.GCClass;
                             posConflict.count = count;
                         }
-                        // Preserve buy price
                         uint bpConflict = DungeonRunners.Managers.MerchantManager.GetBuyPrice(connId, kvp.Value.Item1.GCClass);
                         if (bpConflict > 0) posConflict.buyPrice = bpConflict;
                     }
@@ -2503,7 +2602,8 @@ namespace DungeonRunners.Networking
                             count = count,
                             buyPrice = bp,
                             rarity = kvp.Value.Item1.GetEffectiveRarity(),
-                            storedLevel = kvp.Value.Item1.StoredLevel
+                            storedLevel = kvp.Value.Item1.StoredLevel,
+                            containerId = cid
                         });
                     }
                 }
@@ -3761,28 +3861,48 @@ namespace DungeonRunners.Networking
             Debug.LogError($"[SAVE] ✅ Level={savedChar.level} XP={savedChar.experience} HP={savedChar.currentHP / 256}/{savedChar.maxHP} Mana={savedChar.currentMana / 256}/{savedChar.maxMana} for {conn.LoginName}");
         }
 
-        public (GCObject item, byte x, byte y)? GetInventoryItemBySlot(string connId, uint slotIndex)
+        public (GCObject item, byte x, byte y)? GetInventoryItemBySlot(string connId, uint slotIndex, byte containerId = 0x0B)
         {
-            if (_playerInventoryItems.ContainsKey(connId) && _playerInventoryItems[connId].ContainsKey(slotIndex))
+            string key = InvKey(connId, containerId);
+            if (_playerInventoryItems.ContainsKey(key) && _playerInventoryItems[key].ContainsKey(slotIndex))
             {
-                return _playerInventoryItems[connId][slotIndex];
+                return _playerInventoryItems[key][slotIndex];
             }
-            Debug.LogError($"[INV-TRACK] No item at slot {slotIndex}");
+            Debug.LogError($"[INV-TRACK] No item at slot {slotIndex} in container 0x{containerId:X2}");
             return null;
         }
 
-        public void RemoveInventoryItemBySlot(string connId, uint slotIndex)
+        public void RemoveInventoryItemBySlot(string connId, uint slotIndex, byte containerId = 0x0B)
         {
-            if (_playerInventoryItems.ContainsKey(connId) && _playerInventoryItems[connId].ContainsKey(slotIndex))
+            string key = InvKey(connId, containerId);
+            if (_playerInventoryItems.ContainsKey(key) && _playerInventoryItems[key].ContainsKey(slotIndex))
             {
-                _playerInventoryItems[connId].Remove(slotIndex);
-                Debug.LogError($"[INV-TRACK] Removed item at slot {slotIndex}");
+                _playerInventoryItems[key].Remove(slotIndex);
+                Debug.LogError($"[INV-TRACK] Removed item at slot {slotIndex} in container 0x{containerId:X2}");
             }
         }
-        public Dictionary<uint, (GCObject item, byte x, byte y)> GetAllInventoryItems(string connId)
+        public Dictionary<uint, (GCObject item, byte x, byte y)> GetAllInventoryItems(string connId, byte containerId = 0x0B)
         {
-            if (_playerInventoryItems.ContainsKey(connId))
-                return _playerInventoryItems[connId];
+            string key = InvKey(connId, containerId);
+            if (_playerInventoryItems.ContainsKey(key))
+                return _playerInventoryItems[key];
+            return null;
+        }
+
+        // Pickup packets carry only a slot index, not a container ID. This searches
+        // main inventory first, then each bank page. Returns the containerId where
+        // the slot lives, or null if no container has it.
+        public byte? FindContainerForSlot(string connId, uint slotIndex)
+        {
+            if (_playerInventoryItems.ContainsKey(connId) && _playerInventoryItems[connId].ContainsKey(slotIndex))
+                return 0x0B;
+            byte[] bankIds = { 0x0C, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13 };
+            foreach (byte cid in bankIds)
+            {
+                string key = InvKey(connId, cid);
+                if (_playerInventoryItems.ContainsKey(key) && _playerInventoryItems[key].ContainsKey(slotIndex))
+                    return cid;
+            }
             return null;
         }
 
@@ -4772,6 +4892,23 @@ namespace DungeonRunners.Networking
                                             Debug.LogError($"[DLL-HP] PLAYER DIED! Saving state...");
                                             SavePlayerLevel(hpConn);
 
+                                            // PvP: if dying player was in an active duel, route to ReportKill.
+                                            // Match-attribution for queued PvP matches is wired in Phase 3+ (needs team awareness).
+                                            try
+                                            {
+                                                var pendingDuel = _duelManager.GetDuel(hpConn.LoginName);
+                                                if (pendingDuel != null && pendingDuel.State == Managers.DuelManager.DuelState.Active)
+                                                {
+                                                    string winnerLogin = string.Equals(pendingDuel.ChallengerLogin, hpConn.LoginName, StringComparison.OrdinalIgnoreCase)
+                                                        ? pendingDuel.TargetLogin
+                                                        : pendingDuel.ChallengerLogin;
+                                                    var (_, _, duelInfo) = _duelManager.ReportKill(winnerLogin, hpConn.LoginName);
+                                                    if (duelInfo != null)
+                                                        SendDuelEndPackets(winnerLogin, hpConn.LoginName, duelInfo);
+                                                }
+                                            }
+                                            catch (Exception ex) { Debug.LogError($"[PVP-DUEL] Death-hook error: {ex.Message}"); }
+
                                             // MULTIPLAYER: Broadcast death animation to other players
                                             BroadcastPlayerDeath(hpConn);
                                         }
@@ -5683,6 +5820,9 @@ namespace DungeonRunners.Networking
             if (conn.LoginName != null && _selectedCharacter.TryGetValue(conn.LoginName, out var disconnChar))
             {
                 SocialManager.Instance.PlayerOffline(conn.LoginName, disconnChar.Name, SendSocialViaAuth);
+                // Posse: rebroadcast CachedPosseFull to other posse members so they see the offline state.
+                try { PosseManager.Instance.NotifyMemberStateChange(disconnChar.Id, this); }
+                catch (Exception ex) { Debug.LogError($"[POSSE] disconnect notify failed: {ex.Message}"); }
             }
             else if (conn.LoginName != null)
             {
@@ -6027,8 +6167,25 @@ namespace DungeonRunners.Networking
                 case 11: // GroupClient channel (0x0B) — per binary VA 0x458B9B
                     HandleGroupClientChannel(conn, messageType, data);
                     break;
+                case 15: // PosseClient channel (0x0F) — binary-verified via Ghidra (2026-05-16)
+                    // PosseClient::start @ 0x00610610 has PUSH 0xf @ 0x00610676 immediately
+                    // before CALL TChannelManager<>::createChannel @ 0x0061067F. Dispatch
+                    // jump table for incoming messages lives at 0x00611F60. See PosseManager.cs
+                    // header for the full opcode map.
+                    PosseManager.Instance.HandleMessage(conn, messageType, data, SendSocialViaAuth, this);
+                    break;
                 default:
-                    Debug.LogWarning($"Unhandled channel: {channel}");
+                    {
+                        // Unknown-channel canary. PosseClient (slot 15) is wired above; any other
+                        // channel that surfaces here is a still-unmapped gateway client
+                        // (TradeClient candidates etc.). Keep the [POSSE-PROBE] prefix so the
+                        // existing RuntimeEvidenceManager.IsFocusedLog entry continues to surface
+                        // it in server.log.
+                        string hex = (data != null && data.Length > 0)
+                            ? BitConverter.ToString(data, 0, Math.Min(48, data.Length))
+                            : "EMPTY";
+                        Debug.LogError($"[POSSE-PROBE] Unhandled channel={channel} type=0x{messageType:X2} dataLen={data?.Length ?? 0} hex={hex}");
+                    }
                     break;
             }
         }
@@ -8668,6 +8825,9 @@ namespace DungeonRunners.Networking
 
             SendAdminHPSync(conn, ps);
             Debug.LogError($"[ADMIN-LEVELUP] Sent {newLevel - oldLevel} XP packet(s) + HP sync for level {oldLevel}->{newLevel}");
+            // Posse: refresh other members' rosters with the new Lvl value.
+            try { if (conn.CharSqlId != 0) PosseManager.Instance.NotifyMemberStateChange(conn.CharSqlId, this); }
+            catch (Exception px) { Debug.LogError($"[POSSE] level-up notify failed: {px.Message}"); }
         }
 
 
@@ -10524,6 +10684,14 @@ namespace DungeonRunners.Networking
                     if (npc.IsMerchant)
                     {
                         TrackPendingMerchantActivation(conn, npc);
+                    }
+                    if (npc.IsPosseMagnate)
+                    {
+                        // Tad's dialog Create-Posse button is currently NOT surfaced (NPC component
+                        // GCType still unknown — both "PosseRegistryOption" and "posse" got Zone
+                        // Error 10). Fall back to a chat hint until we find the right string.
+                        SendSystemMessage(conn, "Open the Posse tab in your menu, or type /posse create <name> to start a posse (level 15+, 1,000,000 gold). Type /posse help for the full list of commands.");
+                        Debug.LogError($"[POSSE] Player clicked PosseMagnate {npc.GCClass} — chat hint sent");
                     }
                     Debug.LogError($"[NPC] ✅ Set CurrentDialogNpcId = {conn.CurrentDialogNpcId}");
                 }
@@ -13412,6 +13580,10 @@ namespace DungeonRunners.Networking
             public bool IsAdminMerchant;  // ← NEW
             public bool IsTrainer;
             public uint TrainerId;
+            public bool IsBank;
+            public uint BankComponentId;
+            public bool IsPosseMagnate;
+            public uint PosseOptionComponentId;
             /// <summary>
             /// Ordered list of AvailableSkill GC classes from the trainer's GC file.
             /// Index = the uint32 V sent in the train request packet.
@@ -13554,6 +13726,8 @@ namespace DungeonRunners.Networking
             {
                 bool isMerchant = MerchantManager.IsMerchant(npcData.gcType);
                 bool isTrainer = npcData.gcType.IndexOf("Trainer", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool isBank = npcData.gcType.EndsWith(".Bank", StringComparison.OrdinalIgnoreCase);
+                bool isPosseMagnate = npcData.gcType.EndsWith(".PosseMagnate", StringComparison.OrdinalIgnoreCase);
                 var npc = new ZoneNPC
                 {
                     GCClass = npcData.gcType,
@@ -13568,11 +13742,15 @@ namespace DungeonRunners.Networking
                     MerchantId = isMerchant ? _nextEntityId++ : 0,
                     IsTrainer = isTrainer,
                     TrainerId = isTrainer ? _nextEntityId++ : 0,
-                    TrainerSkills = isTrainer ? GetTrainerSkillList(npcData.gcType) : null
+                    TrainerSkills = isTrainer ? GetTrainerSkillList(npcData.gcType) : null,
+                    IsBank = isBank,
+                    BankComponentId = isBank ? _nextEntityId++ : 0,
+                    IsPosseMagnate = isPosseMagnate,
+                    PosseOptionComponentId = isPosseMagnate ? _nextEntityId++ : 0
                 };
 
                 _zoneNPCs[zoneId].Add(npc);
-                string tags = (isMerchant ? " [MERCHANT]" : "") + (isTrainer ? $" [TRAINER cid={npc.TrainerId}]" : "");
+                string tags = (isMerchant ? " [MERCHANT]" : "") + (isTrainer ? $" [TRAINER cid={npc.TrainerId}]" : "") + (isBank ? $" [BANK cid={npc.BankComponentId}]" : "") + (isPosseMagnate ? $" [POSSE cid={npc.PosseOptionComponentId}]" : "");
                 Debug.LogError($"[InitTownNPCs] ✓ Created NPC: {npc.Name} (ID: {npc.Id}){tags}");
             }
             // Initialize Tutorial NPCs
@@ -13588,6 +13766,8 @@ namespace DungeonRunners.Networking
                     {
                         bool isMerchant = MerchantManager.IsMerchant(npcData.gcType);
                         bool isTrainer = npcData.gcType.IndexOf("Trainer", StringComparison.OrdinalIgnoreCase) >= 0;
+                        bool isBank = npcData.gcType.EndsWith(".Bank", StringComparison.OrdinalIgnoreCase);
+                        bool isPosseMagnate = npcData.gcType.EndsWith(".PosseMagnate", StringComparison.OrdinalIgnoreCase);
                         var npc = new ZoneNPC
                         {
                             GCClass = npcData.gcType,
@@ -13602,11 +13782,15 @@ namespace DungeonRunners.Networking
                             MerchantId = isMerchant ? _nextEntityId++ : 0,
                             IsTrainer = isTrainer,
                             TrainerId = isTrainer ? _nextEntityId++ : 0,
-                            TrainerSkills = isTrainer ? GetTrainerSkillList(npcData.gcType) : null
+                            TrainerSkills = isTrainer ? GetTrainerSkillList(npcData.gcType) : null,
+                            IsBank = isBank,
+                            BankComponentId = isBank ? _nextEntityId++ : 0,
+                            IsPosseMagnate = isPosseMagnate,
+                            PosseOptionComponentId = isPosseMagnate ? _nextEntityId++ : 0
                         };
 
                         _zoneNPCs[tutorialZoneId].Add(npc);
-                        string tags = (isMerchant ? " [MERCHANT]" : "") + (isTrainer ? $" [TRAINER cid={npc.TrainerId}]" : "");
+                        string tags = (isMerchant ? " [MERCHANT]" : "") + (isTrainer ? $" [TRAINER cid={npc.TrainerId}]" : "") + (isBank ? $" [BANK cid={npc.BankComponentId}]" : "") + (isPosseMagnate ? $" [POSSE cid={npc.PosseOptionComponentId}]" : "");
                         Debug.LogError($"[InitTutorialNPCs] ✓ Created NPC: {npc.Name} (ID: {npc.Id}){tags}");
                     }
                 }
@@ -13627,6 +13811,8 @@ namespace DungeonRunners.Networking
                 {
                     bool isMerchant = MerchantManager.IsMerchant(npcData.gcType);
                     bool isTrainer = npcData.gcType.IndexOf("Trainer", StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool isBank = npcData.gcType.EndsWith(".Bank", StringComparison.OrdinalIgnoreCase);
+                    bool isPosseMagnate = npcData.gcType.EndsWith(".PosseMagnate", StringComparison.OrdinalIgnoreCase);
                     bool isPvpNpc = npcData.gcType.IndexOf("L33tenant", StringComparison.OrdinalIgnoreCase) >= 0
                                  || npcData.name.IndexOf("L33tenant", StringComparison.OrdinalIgnoreCase) >= 0;
                     var npc = new ZoneNPC
@@ -13643,7 +13829,11 @@ namespace DungeonRunners.Networking
                         MerchantId = isMerchant ? _nextEntityId++ : 0,
                         IsTrainer = isTrainer,
                         TrainerId = isTrainer ? _nextEntityId++ : 0,
-                        TrainerSkills = isTrainer ? GetTrainerSkillList(npcData.gcType) : null
+                        TrainerSkills = isTrainer ? GetTrainerSkillList(npcData.gcType) : null,
+                        IsBank = isBank,
+                        BankComponentId = isBank ? _nextEntityId++ : 0,
+                        IsPosseMagnate = isPosseMagnate,
+                        PosseOptionComponentId = isPosseMagnate ? _nextEntityId++ : 0
                     };
 
                     _zoneNPCs[pvpZoneId].Add(npc);
@@ -13828,6 +14018,43 @@ namespace DungeonRunners.Networking
                     WriteGCType(writer, skillTrainerGcType, preserveCase: true);
                     writer.WriteByte(0x00); // hasInit = false → client reads available skills from GC
                     if (VerbosePacketLogging) Debug.LogError($"[NPC-{npcCounter}] 🔷 SKILLTRAINER DONE (trainerId=0x{npc.TrainerId:X4})");
+                }
+
+                // ========== OP5d: Create Bank Component (0x32) - IF BANK ==========
+                // GCType "banker" sourced from DungeonRunners.exe strings table (offset 4798220,
+                // paired with "Merchant" at 4798452). hasInit=0x00 mirrors trainer pattern since
+                // the player's avatar.base.Bank container is already sent in OP8 UNITCONTAINER.
+                // Probe 1 with "bank" caused Zone error 10; "banker" is the corrected guess.
+                if (npc.IsBank)
+                {
+                    Debug.LogError($"[NPC-{npcCounter}] 🔷 CREATING BANK COMPONENT (bankId={npc.BankComponentId})");
+                    writer.WriteByte(0x32);
+                    writer.WriteUInt16(npcId);
+                    writer.WriteUInt16((ushort)npc.BankComponentId);
+                    WriteGCType(writer, "banker", preserveCase: false);
+                    writer.WriteByte(0x00); // hasInit = false (speculative; iterate if rejected)
+                    Debug.LogError($"[NPC-{npcCounter}] 🔷 BANK DONE (bankId=0x{npc.BankComponentId:X4})");
+                }
+
+                // ========== OP5e: Posse option component — PROBE 3 ==========
+                // The client registers 8 Posse* classes via DFCKernel::registerClass + a
+                // matching create<Name> factory (mirroring _register_class_Banker / createBanker
+                // at 0x0059A910). Of those, only "PosseRegistry" is the bare-noun analog of
+                // "Banker" / "Merchant" — every other Posse* is a UI class (Dialog/Panel/Control).
+                // Probes attempted previously:
+                //   "PosseRegistryOption" (preserveCase) — UI class name, Zone Error 10
+                //   "posse" (lowercase)                  — bare noun, Zone Error 10
+                // This probe writes "PosseRegistry" via the same path as banker (WriteGCType
+                // lowercases to "posseregistry" — DFCKernel::registerClass is case-insensitive).
+                if (npc.IsPosseMagnate)
+                {
+                    Debug.LogError($"[POSSE] CREATING POSSE COMPONENT (cid={npc.PosseOptionComponentId}) for {npc.GCClass}");
+                    writer.WriteByte(0x32);
+                    writer.WriteUInt16(npcId);
+                    writer.WriteUInt16((ushort)npc.PosseOptionComponentId);
+                    WriteGCType(writer, "PosseRegistry", preserveCase: false);
+                    writer.WriteByte(0x00);
+                    Debug.LogError($"[POSSE] POSSE COMPONENT DONE (cid=0x{npc.PosseOptionComponentId:X4})");
                 }
 
                 // ========== OP6: Init NPC Entity (0x02) ==========
@@ -14305,27 +14532,70 @@ namespace DungeonRunners.Networking
                 return;
             }
 
-            // Look up both characters for level check
-            var challengerChar = _selectedCharacter.TryGetValue(conn.LoginName, out var cs)
+            IssueDuelChallenge(conn, target);
+        }
+
+        /// <summary>
+        /// Shared duel-challenge path used by both opcode 0x2D and the @duel chat command.
+        /// Returns null on success, or a human-readable rejection reason.
+        /// </summary>
+        public string IssueDuelChallenge(RRConnection challengerConn, RRConnection targetConn)
+        {
+            if (challengerConn == null || targetConn == null) return "Connection not found.";
+
+            // Look up both characters for level check + CharSqlId
+            var challengerChar = _selectedCharacter.TryGetValue(challengerConn.LoginName, out var cs)
                 ? CharacterRepository.GetCharacter(cs.Id) : null;
-            var targetChar = CharacterRepository.GetCharacter(targetCharSqlId);
-            if (challengerChar == null || targetChar == null) { Debug.LogError("[PVP-DUEL] Character lookup failed"); return; }
+            var targetChar = _selectedCharacter.TryGetValue(targetConn.LoginName, out var ts)
+                ? CharacterRepository.GetCharacter(ts.Id) : null;
+            if (challengerChar == null || targetChar == null)
+            {
+                Debug.LogError("[PVP-DUEL] Character lookup failed");
+                return "Character lookup failed.";
+            }
 
             uint challengerCharSqlId = (uint)challengerChar.id;
-            string err = _duelManager.TryChallenge(conn.LoginName, challengerCharSqlId,
-                target.LoginName, targetCharSqlId,
+            uint targetCharSqlId     = (uint)targetChar.id;
+            string err = _duelManager.TryChallenge(challengerConn.LoginName, challengerCharSqlId,
+                targetConn.LoginName, targetCharSqlId,
                 challengerChar.level, targetChar.level);
             if (err != null)
             {
                 Debug.LogError($"[PVP-DUEL] Challenge rejected: {err}");
-                return;
+                return err;
             }
 
             // Notify target: Challenged
             byte[] targetPkt = PVPPackets.BuildDuelStatus(
                 PVPPackets.DuelStatusType.Challenged, challengerCharSqlId, 0, 0);
-            SendToClient(target, targetPkt);
-            Debug.LogError($"[PVP-DUEL] Sent Challenged to {target.LoginName}");
+            SendToClient(targetConn, targetPkt);
+            Debug.LogError($"[PVP-DUEL] Sent Challenged to {targetConn.LoginName}");
+            return null;
+        }
+
+        /// <summary>Chat-driven duel accept: same effect as opcode 0x2E.</summary>
+        public bool AcceptDuel(RRConnection conn)
+        {
+            HandleDuelAccept(conn);
+            return _duelManager.IsInDuel(conn.LoginName);
+        }
+
+        /// <summary>Chat-driven duel decline: same effect as opcode 0x2F.</summary>
+        public bool DeclineDuel(RRConnection conn)
+        {
+            var hadDuel = _duelManager.IsInDuel(conn.LoginName);
+            HandleDuelDecline(conn);
+            return hadDuel;
+        }
+
+        /// <summary>Human-readable duel state for @duel status.</summary>
+        public string GetDuelStatusFor(string loginName)
+        {
+            var d = _duelManager.GetDuel(loginName);
+            if (d == null) return "No active duel.";
+            string other = string.Equals(d.ChallengerLogin, loginName, StringComparison.OrdinalIgnoreCase)
+                ? d.TargetLogin : d.ChallengerLogin;
+            return $"{d.State} vs {other}";
         }
 
         private void HandleDuelAccept(RRConnection conn)
@@ -14343,6 +14613,12 @@ namespace DungeonRunners.Networking
             if (target != null)
                 SendToClient(target, PVPPackets.BuildDuelStatus(
                     PVPPackets.DuelStatusType.Accepted, duel.ChallengerCharSqlId, 0, 0));
+
+            // Schedule Countdown→Active transition. Drained from ProcessMatchmakingTick.
+            _pendingDuelActivations.Add((
+                DateTime.UtcNow.AddSeconds(Managers.DuelManager.DuelInfo.CountdownSec),
+                duel));
+            Debug.LogError($"[PVP-DUEL] Activation scheduled for {duel.ChallengerLogin} vs {duel.TargetLogin} in {Managers.DuelManager.DuelInfo.CountdownSec}s");
         }
 
         private void HandleDuelDecline(RRConnection conn)
@@ -14354,6 +14630,55 @@ namespace DungeonRunners.Networking
             if (challenger != null)
                 SendToClient(challenger, PVPPackets.BuildDuelStatus(
                     PVPPackets.DuelStatusType.Declined, duel.TargetCharSqlId, 0, 0));
+        }
+
+        // Phase 1: pending Countdown→Active activations, drained from ProcessMatchmakingTick.
+        private readonly List<(DateTime dueAt, Managers.DuelManager.DuelInfo duel)> _pendingDuelActivations
+            = new List<(DateTime, Managers.DuelManager.DuelInfo)>();
+
+        private void SendCombatStart(Managers.DuelManager.DuelInfo duel)
+        {
+            var challenger = FindConnectionByLogin(duel.ChallengerLogin);
+            var target     = FindConnectionByLogin(duel.TargetLogin);
+            if (challenger != null)
+            {
+                SendToClient(challenger, PVPPackets.BuildDuelStatus(
+                    PVPPackets.DuelStatusType.InProgress, duel.TargetCharSqlId, 0, 0));
+                SendToClient(challenger, PVPPackets.BuildPVPStatusChanged(pvpState: 1, matchId: 0));
+            }
+            if (target != null)
+            {
+                SendToClient(target, PVPPackets.BuildDuelStatus(
+                    PVPPackets.DuelStatusType.InProgress, duel.ChallengerCharSqlId, 0, 0));
+                SendToClient(target, PVPPackets.BuildPVPStatusChanged(pvpState: 1, matchId: 0));
+            }
+            Debug.LogError($"[PVP-DUEL] Combat start sent: {duel.ChallengerLogin} vs {duel.TargetLogin}");
+        }
+
+        private void SendDuelEndPackets(string winnerLogin, string loserLogin, Managers.DuelManager.DuelInfo duel)
+        {
+            // Resolve CharSqlIds from the duel record so we don't depend on connection state.
+            uint winnerCharSqlId = string.Equals(duel.ChallengerLogin, winnerLogin, StringComparison.OrdinalIgnoreCase)
+                ? duel.ChallengerCharSqlId : duel.TargetCharSqlId;
+            uint loserCharSqlId  = string.Equals(duel.ChallengerLogin, loserLogin,  StringComparison.OrdinalIgnoreCase)
+                ? duel.ChallengerCharSqlId : duel.TargetCharSqlId;
+
+            var winnerConn = FindConnectionByLogin(winnerLogin);
+            var loserConn  = FindConnectionByLogin(loserLogin);
+
+            if (winnerConn != null)
+            {
+                SendToClient(winnerConn, PVPPackets.BuildDuelStatus(
+                    PVPPackets.DuelStatusType.Won, loserCharSqlId, 0, 0));
+                SendToClient(winnerConn, PVPPackets.BuildPVPStatusChanged(pvpState: 0, matchId: 0));
+            }
+            if (loserConn != null)
+            {
+                SendToClient(loserConn, PVPPackets.BuildDuelStatus(
+                    PVPPackets.DuelStatusType.Lost, winnerCharSqlId, 0, 0));
+                SendToClient(loserConn, PVPPackets.BuildPVPStatusChanged(pvpState: 0, matchId: 0));
+            }
+            Debug.LogError($"[PVP-DUEL] End packets sent: winner={winnerLogin} loser={loserLogin}");
         }
 
         private RRConnection FindConnectionByLogin(string loginName)
@@ -14441,6 +14766,23 @@ namespace DungeonRunners.Networking
             if (!forceRun && (DateTime.UtcNow - _lastMatchmakingTick).TotalMilliseconds < 1000)
                 return;
             _lastMatchmakingTick = DateTime.UtcNow;
+
+            // Drain pending duel Countdown→Active activations.
+            if (_pendingDuelActivations.Count > 0)
+            {
+                var now = DateTime.UtcNow;
+                for (int i = _pendingDuelActivations.Count - 1; i >= 0; i--)
+                {
+                    var (dueAt, duel) = _pendingDuelActivations[i];
+                    if (dueAt <= now)
+                    {
+                        _pendingDuelActivations.RemoveAt(i);
+                        // Skip if duel was cancelled (declined / disconnect) before countdown elapsed.
+                        if (_duelManager.ActivateCombat(duel.ChallengerLogin))
+                            SendCombatStart(duel);
+                    }
+                }
+            }
 
             var (newMatches, endedMatches) = Managers.PVPMatchManager.Instance.Tick();
             foreach (var match in newMatches)
@@ -15381,6 +15723,9 @@ namespace DungeonRunners.Networking
                 string zoneName = startZone?.name ?? "tutorial";
                 conn.CurrentZoneName = zoneName;  // Exact zone name for multiplayer
                 GroupManager.Instance.UpdateMemberZone(conn.ConnId, zoneName);
+                // Posse: live-update other members' rosters with the new Location/world.
+                try { if (conn.CharSqlId != 0) PosseManager.Instance.NotifyMemberStateChange(conn.CharSqlId, this); }
+                catch (Exception px) { Debug.LogError($"[POSSE] zone-notify failed: {px.Message}"); }
                 //  conn.CurrentZoneGcType = startZone?.gcType ?? "world.tutorial"; // For quest filtering
                 Debug.LogError($"[ZONE-MSG] Zone ID: {zoneId} (0x{zoneId:X8})");
                 // Extract zone prefix for quest filtering
@@ -15410,6 +15755,15 @@ namespace DungeonRunners.Networking
                 // Social system — register player online and send initial social data
                 SocialManager.Instance.PlayerOnline(conn.LoginName, character.Name, conn, SendSocialViaAuth);
                 SocialManager.Instance.SendLoginSocialInit(conn, character.Name, SendSocialViaAuth);
+
+                // Posse system — push processConnectionNotification(connected=true) so the
+                // right-side Posse tab flips from "Posses are currently unavailable" to enabled.
+                // Unlocks the entire posse action surface (Create/Join/Invite/Kick/...).
+                PosseManager.Instance.SendConnectionNotification(conn, true, SendSocialViaAuth);
+                SendPosseStateForCharacter(conn, character.Id, SendSocialViaAuth);
+                // Tell other posse members this player came online so their rosters refresh.
+                try { PosseManager.Instance.NotifyMemberStateChange(character.Id, this); }
+                catch (Exception ex2) { Debug.LogError($"[POSSE] login-notify (HandleCharacterPlay) failed: {ex2.Message}"); }
             }
             catch (Exception ex)
             {
@@ -17177,9 +17531,11 @@ namespace DungeonRunners.Networking
                 writer.WriteByte(0x00);   // PvP Team null string
                 Debug.LogError($"[OP3] After WriteByte(0x00) PvP team: position {writer.Position} (should be +1)");
 
-                Debug.LogError($"[OP3] Before WriteCString(Reborn): position {writer.Position}");
-                writer.WriteCString("Reborn"); // Posse Name
-                Debug.LogError($"[OP3] After WriteCString(Reborn): position {writer.Position} (should be +15)");
+                // Posse name (empty string → client renders <No Posse>, see EXE 0x4643A0).
+                string op3PosseName = savedChar.posseName ?? "";
+                Debug.LogError($"[OP3] Before WriteCString posseName='{op3PosseName}': position {writer.Position}");
+                writer.WriteCString(op3PosseName);
+                Debug.LogError($"[OP3] After WriteCString posseName: position {writer.Position}");
 
                 Debug.LogError($"[OP3] Before final WriteUInt32(0x00): position {writer.Position}");
                 writer.WriteUInt32(0x00);
@@ -18745,23 +19101,74 @@ namespace DungeonRunners.Networking
                 writer.WriteUInt32(savedChar.gold);
 
                 Debug.LogError($"[UNITCONTAINER] 💰 Writing player gold: {savedChar.gold}");
-                writer.WriteByte(0x03);
 
                 var mainInventory = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.Inventory");
-                var bankInventory = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.Bank");
+                var bankPage1 = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.Bank");
+                var bankPage2 = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.Bank2");
+                var bankPage3 = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.Bank3");
+                var bankPage4 = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.Bank4");
+                var bankPage5 = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.Bank5");
+                var bankPage6 = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.Bank6");
+                var bankPage7 = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.Bank7");
                 var tradeInventory = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.TradeInventory");
 
-                if (mainInventory == null || bankInventory == null || tradeInventory == null)
+                if (mainInventory == null || bankPage1 == null || tradeInventory == null
+                    || bankPage2 == null || bankPage3 == null || bankPage4 == null
+                    || bankPage5 == null || bankPage6 == null || bankPage7 == null)
                 {
                     Debug.LogError("❌ Missing required inventories!");
                     return;
                 }
 
+                // Container IDs: TradeInventory stays at 0x0D (preserves trade compat).
+                // Bank pages take 0x0C (page 1, original) then 0x0E..0x13 (pages 2..7).
                 var inventoriesToWrite = new[] {
             (inventory: mainInventory, id: (byte)0x0B, name: "Inventory"),
-            (inventory: bankInventory, id: (byte)0x0C, name: "Bank"),
-            (inventory: tradeInventory, id: (byte)0x0D, name: "TradeInventory")
+            (inventory: bankPage1, id: (byte)0x0C, name: "Bank"),
+            (inventory: tradeInventory, id: (byte)0x0D, name: "TradeInventory"),
+            (inventory: bankPage2, id: (byte)0x0E, name: "Bank2"),
+            (inventory: bankPage3, id: (byte)0x0F, name: "Bank3"),
+            (inventory: bankPage4, id: (byte)0x10, name: "Bank4"),
+            (inventory: bankPage5, id: (byte)0x11, name: "Bank5"),
+            (inventory: bankPage6, id: (byte)0x12, name: "Bank6"),
+            (inventory: bankPage7, id: (byte)0x13, name: "Bank7")
         };
+
+                // Inventory count byte — must match the array length.
+                writer.WriteByte((byte)inventoriesToWrite.Length);
+
+                // Clear stale tracking from previous zone — for ALL containers, not just main inv.
+                // Done once before the loop; slot counter is per-player so it gets reset too.
+                {
+                    string clearConnId = conn.ConnId.ToString();
+                    byte[] allContainers = { 0x0B, 0x0C, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13 };
+                    foreach (byte cid in allContainers)
+                    {
+                        string key = InvKey(clearConnId, cid);
+                        if (_playerInventoryItems.ContainsKey(key))
+                            _playerInventoryItems[key].Clear();
+                        if (_inventoryStackCounts.ContainsKey(key))
+                            _inventoryStackCounts[key].Clear();
+                        if (_occupiedInventorySlots.ContainsKey(key))
+                            _occupiedInventorySlots[key].Clear();
+                    }
+                    if (_inventorySlotCounters.ContainsKey(clearConnId))
+                        _inventorySlotCounters.Remove(clearConnId);
+
+                    // Restore buy prices once across all containers.
+                    if (savedChar.inventory != null)
+                    {
+                        foreach (var bpItem in savedChar.inventory)
+                        {
+                            if (bpItem.buyPrice > 0)
+                                DungeonRunners.Managers.MerchantManager.SetBuyPrice(clearConnId, bpItem.gcClass, bpItem.buyPrice);
+                        }
+                    }
+                }
+
+                // Slot indices must be globally unique across containers so HandlePickup's
+                // single-index lookup (via FindContainerForSlot) finds the right item.
+                uint globalItemIndex = 1;
 
                 foreach (var inv in inventoriesToWrite)
                 {
@@ -18770,34 +19177,21 @@ namespace DungeonRunners.Networking
                     writer.WriteByte(inv.id);
                     writer.WriteByte(0x01);
 
-                    // Only main inventory (0x0B) gets starter items
-                    // Only main inventory (0x0B) gets starter items
-                    if (inv.id == 0x0B && savedChar.inventory != null && savedChar.inventory.Count > 0)
+                    // Filter items belonging to this container. Trade (0x0D) is never persisted.
+                    bool isPersistedContainer = (inv.id == 0x0B || inv.id == 0x0C || (inv.id >= 0x0E && inv.id <= 0x13));
+                    var containerItems = (isPersistedContainer && savedChar.inventory != null)
+                        ? savedChar.inventory.FindAll(i => i.containerId == inv.id)
+                        : new List<SavedInventoryItem>();
+
+                    if (containerItems.Count > 0)
                     {
-                        // Clear stale tracking from previous zone
                         string clearConnId = conn.ConnId.ToString();
-                        if (_playerInventoryItems.ContainsKey(clearConnId))
-                            _playerInventoryItems[clearConnId].Clear();
-                        if (_inventoryStackCounts.ContainsKey(clearConnId))
-                            _inventoryStackCounts[clearConnId].Clear();
-                        if (_occupiedInventorySlots.ContainsKey(clearConnId))
-                            _occupiedInventorySlots[clearConnId].Clear();
-                        if (_inventorySlotCounters.ContainsKey(clearConnId))
-                            _inventorySlotCounters.Remove(clearConnId);
+                        writer.WriteByte((byte)containerItems.Count);
+                        Debug.LogError($"      → GCType: {inv.inventory.GCClass}, ID: 0x{inv.id:X2}, Items: {containerItems.Count}");
 
-                        writer.WriteByte((byte)savedChar.inventory.Count);
-                        Debug.LogError($"      → GCType: {inv.inventory.GCClass}, ID: 0x{inv.id:X2}, Items: {savedChar.inventory.Count}");
-
-                        // Restore buy prices from DB for sell price calculation
-                        foreach (var bpItem in savedChar.inventory)
+                        foreach (var item in containerItems)
                         {
-                            if (bpItem.buyPrice > 0)
-                                DungeonRunners.Managers.MerchantManager.SetBuyPrice(clearConnId, bpItem.gcClass, bpItem.buyPrice);
-                        }
-
-                        uint itemIndex = 1;
-                        foreach (var item in savedChar.inventory)
-                        {
+                            uint itemIndex = globalItemIndex++;
                             string gcTypeToSend = item.gcClass.ToLowerInvariant();
                             // Compute prefixed gc class via single source of truth in GCObject
                             string packetGcType = GCObject.GetPacketGCClassFor(item.gcClass);
@@ -18899,7 +19293,7 @@ namespace DungeonRunners.Networking
                                 }
                             }
 
-                            // Track inventory item
+                            // Track inventory item (container-aware via inv.id)
                             string gcLow = item.gcClass.ToLower();
                             string nc = "Armor";
                             if (gcLow.Contains("questitem") || gcLow.Contains("consumable") || gcLow.Contains("townportal") || gcLow.Contains("ring") || gcLow.Contains("amulet") || gcLow.Contains("scroll") || gcLow.Contains("potion") || gcLow.Contains("skillbook") || gcLow.Contains("voucher"))
@@ -18911,14 +19305,13 @@ namespace DungeonRunners.Networking
                             var gcObj = new GCObject { GCClass = item.gcClass, NativeClass = nc };
                             gcObj.StoredRarity = item.rarity;
                             gcObj.StoredLevel = item.storedLevel;
-                            TrackInventoryItem(conn.ConnId.ToString(), itemIndex, gcObj, item.x, item.y);
+                            TrackInventoryItem(conn.ConnId.ToString(), itemIndex, gcObj, item.x, item.y, inv.id);
                             var itemDims = DungeonRunners.Managers.MerchantManager.GetItemDimensions(item.gcClass);
                             int iw = itemDims.width, ih = itemDims.height;
-                            OccupyInventorySlots(conn.ConnId.ToString(), item.x, item.y, iw, ih);
-                            SetStackCount(conn.ConnId.ToString(), itemIndex, item.count > 0 ? item.count : 1);
+                            OccupyInventorySlots(conn.ConnId.ToString(), item.x, item.y, iw, ih, inv.id);
+                            SetStackCount(conn.ConnId.ToString(), itemIndex, item.count > 0 ? item.count : 1, inv.id);
 
-                            Debug.LogError($"        → Item {itemIndex}: {gcTypeToSend} at ({item.x},{item.y})");
-                            itemIndex++;
+                            Debug.LogError($"        → Item {itemIndex} (container 0x{inv.id:X2}): {gcTypeToSend} at ({item.x},{item.y})");
                         }
                     }
                     else
@@ -18926,6 +19319,14 @@ namespace DungeonRunners.Networking
                         writer.WriteByte(0x00);
                         Debug.LogError($"      → GCType: {inv.inventory.GCClass}, ID: 0x{inv.id:X2}, Items: 0");
                     }
+                }
+
+                // Ensure new placements (GetNextInventorySlot starts at 100) never collide
+                // with slot indices we just assigned to loaded items.
+                {
+                    string sc = conn.ConnId.ToString();
+                    uint floor = globalItemIndex > 100 ? globalItemIndex : 100;
+                    _inventorySlotCounters[sc] = floor;
                 }
 
                 writer.WriteByte(0x00);
@@ -20074,6 +20475,10 @@ namespace DungeonRunners.Networking
                     {
                         Debug.LogError($"[QUEUE-BRIDGE] Queue ready for {username} — resending social init");
                         SocialManager.Instance.SendLoginSocialInit(conn, sc.Name, SendSocialViaAuth);
+                        PosseManager.Instance.SendConnectionNotification(conn, true, SendSocialViaAuth);
+                        SendPosseStateForCharacter(conn, sc.Id, SendSocialViaAuth);
+                        try { PosseManager.Instance.NotifyMemberStateChange(sc.Id, this); }
+                        catch (Exception ex2) { Debug.LogError($"[POSSE] login-notify (OnQueueStreamReady) failed: {ex2.Message}"); }
                     }
                     break;
                 }

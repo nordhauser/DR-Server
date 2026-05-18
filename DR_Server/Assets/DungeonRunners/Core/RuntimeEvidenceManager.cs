@@ -310,6 +310,7 @@ namespace DungeonRunners.Core
                 "[COMBAT",
                 "[ATTACK]",
                 "[ACTION",
+                "[NPC]",
                 "[DAMAGE]",
                 "[MON-DAMAGE]",
                 "[MON-ATTACK]",
@@ -341,7 +342,18 @@ namespace DungeonRunners.Core
                 "[ZONE-IN]",
                 "[CHESTS]",
                 "[WORLD-ENTITIES]",
-                "[INSTANCE]"
+                "[INSTANCE]",
+                "[MERCHANT-DIAG]",
+                "[POSSE]",
+                "[POSSE-PROBE]",
+                "[PVP]",
+                "[PVP-DUEL]",
+                "[PVP-MATCH]",
+                "[DUELARENA]",
+                "[GROUP-CH0B]",
+                "[GROUP]",
+                "[ADMIN]",
+                "[ACCOUNT]"
             };
 
             foreach (string prefix in allowedPrefixes)

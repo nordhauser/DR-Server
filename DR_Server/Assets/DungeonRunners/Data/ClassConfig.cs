@@ -61,6 +61,7 @@ namespace DungeonRunners.Data
         public uint buyPrice = 0;  // Store buy price for accurate sell calculation
         public int rarity = 0;     // ItemRarity enum value (0=Normal, 1=Superior, 2=Magical, 3=Rare, 4=Unique, 5=Mythic)
         public int storedLevel = -1; // Fixed item level (-1 = legacy/compute from GCClass)
+        public byte containerId = 0x0B; // Inventory container: 0x0B main, 0x0C bank1, 0x0E-0x13 bank2-7
     }
 
     [Serializable]
@@ -114,6 +115,12 @@ namespace DungeonRunners.Data
         public int tpZoneId = 0;
         public string tpTargetZone = "";
         public float tpPosX = 0, tpPosY = 0, tpPosZ = 0;
+
+        // Posse membership. posseId=0 means no posse; posseName is denormalized for OP3 use.
+        public uint posseId = 0;
+        public string posseName = "";
+        public int posseJoinCooldown = 0;  // Unix timestamp the cooldown expires.
+        public int posseRankId = 1;        // Posse rank 1..10. New members join at 1; founder is 10. Promote/demote moves by ±1.
 
         // Skill levels — maps skill GCClass → trained level (default 1)
         // Updated when player trains at skill trainer

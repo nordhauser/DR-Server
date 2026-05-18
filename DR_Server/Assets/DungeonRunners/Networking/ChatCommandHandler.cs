@@ -41,7 +41,14 @@ namespace DungeonRunners.Networking
 
             string command = message.Substring(1).Trim().ToLower();
 
-            // All @ commands require admin
+            // @duel is normal gameplay (not admin) — must come before the admin gate.
+            if (command == "duel" || command.StartsWith("duel "))
+            {
+                string duelArgs = command.Length > 4 ? command.Substring(4).Trim() : "";
+                return HandleDuelCommand(conn, duelArgs, sendMessage);
+            }
+
+            // All other @ commands require admin
             if (!_server.IsPlayerAdmin(conn.LoginName))
             {
                 sendMessage(conn, "You do not have permission to use this command.");
@@ -78,6 +85,29 @@ namespace DungeonRunners.Networking
             {
                 string targetName = command.Substring(8).Trim();
                 return HandleGroupCommand(conn, "leader " + targetName, sendMessage);
+            }
+
+            // @duelarena <name>         — both into PVPGroupDuelMatch
+            // @duelpractice <name>      — both into PVPGroupPracticeMatch (less strict zone)
+            // @duelzone <zone> <name>   — both into a specific zone (debug)
+            if (command.StartsWith("duelarena "))
+            {
+                string targetName = command.Substring(10).Trim();
+                return HandleDuelArenaProbe(conn, "PVPGroupDuelMatch", targetName, sendMessage);
+            }
+            if (command.StartsWith("duelpractice "))
+            {
+                string targetName = command.Substring(13).Trim();
+                return HandleDuelArenaProbe(conn, "PVPGroupPracticeMatch", targetName, sendMessage);
+            }
+            if (command.StartsWith("duelzone "))
+            {
+                string rest = command.Substring(9).Trim();
+                int sp = rest.IndexOf(' ');
+                if (sp <= 0) { sendMessage(conn, "[DUELZONE] Usage: @duelzone <zoneName> <playerName>"); return true; }
+                string zone = rest.Substring(0, sp).Trim();
+                string targetName = rest.Substring(sp + 1).Trim();
+                return HandleDuelArenaProbe(conn, zone, targetName, sendMessage);
             }
 
             if (command.StartsWith("behavior"))
@@ -1438,6 +1468,110 @@ namespace DungeonRunners.Networking
             }
 
             sendMessage(conn, $"[PVP] Unknown subcommand '{sub}'. Try: queue | cancel | status | leave");
+            return true;
+        }
+
+        // ════════════════════════════════════════════════════════════════
+        // @duel command — chat-driven 1v1 duel for admins.
+        //   @duel <name>          — challenge a player
+        //   @duel accept (or a)   — accept incoming challenge
+        //   @duel decline (or d)  — decline incoming challenge
+        //   @duel status (or s)   — show current duel state
+        // The client also has its own opcode-based path (0x2D/0x2E/0x2F)
+        // via right-click → Duel; @duel is a deterministic fallback.
+        // ════════════════════════════════════════════════════════════════
+        private bool HandleDuelCommand(RRConnection conn, string args, Action<RRConnection, string> sendMessage)
+        {
+            args = (args ?? "").Trim();
+            if (args.Length == 0)
+            {
+                sendMessage(conn, "[DUEL] Usage: @duel <playername> | accept | decline | status");
+                return true;
+            }
+
+            string sub = args.ToLowerInvariant();
+
+            if (sub == "accept" || sub == "a")
+            {
+                _server.AcceptDuel(conn);
+                sendMessage(conn, "[DUEL] Accept sent.");
+                return true;
+            }
+
+            if (sub == "decline" || sub == "d")
+            {
+                bool had = _server.DeclineDuel(conn);
+                sendMessage(conn, had ? "[DUEL] Declined." : "[DUEL] No pending duel to decline.");
+                return true;
+            }
+
+            if (sub == "status" || sub == "s")
+            {
+                sendMessage(conn, $"[DUEL] {_server.GetDuelStatusFor(conn.LoginName)}");
+                return true;
+            }
+
+            // Otherwise treat the args as a target player name.
+            string targetName = args;
+            var targetConn = _server.FindConnectionByName(targetName);
+            if (targetConn == null)
+            {
+                sendMessage(conn, $"[DUEL] Player '{targetName}' not online.");
+                return true;
+            }
+            string err = _server.IssueDuelChallenge(conn, targetConn);
+            sendMessage(conn, err == null
+                ? $"[DUEL] Challenge sent to {targetName}. They have 30s to accept."
+                : $"[DUEL] Cannot challenge {targetName}: {err}");
+            return true;
+        }
+
+        // ════════════════════════════════════════════════════════════════
+        // @duelarena <name> — Option-B PROBE (admin only)
+        // Forces both players into the SAME instance of PVPGroupDuelMatch
+        // (by temporarily putting them in a group together). Tests whether
+        // same-instance presence is enough for the client to allow PvP hits,
+        // or whether we still need the 0x4E processChangedPVPStatus payload.
+        // ════════════════════════════════════════════════════════════════
+        private bool HandleDuelArenaProbe(RRConnection conn, string zoneName, string targetName, Action<RRConnection, string> sendMessage)
+        {
+            if (string.IsNullOrEmpty(targetName))
+            {
+                sendMessage(conn, $"[DUELARENA] Usage: @duelarena <playername>  (zone={zoneName})");
+                return true;
+            }
+            var targetConn = _server.FindConnectionByName(targetName);
+            if (targetConn == null || targetConn == conn)
+            {
+                sendMessage(conn, $"[DUELARENA] Target '{targetName}' not online (or same as you).");
+                return true;
+            }
+
+            // Form a temporary group: challenger creates, invites target, target auto-accepts.
+            // This makes AssignInstanceId give them the same instance ID inside the arena zone.
+            GroupManager.Instance.LeaveGroup(conn.ConnId);
+            GroupManager.Instance.LeaveGroup(targetConn.ConnId);
+
+            var g = GroupManager.Instance.CreateGroup(conn.ConnId, conn.LoginName, conn.LoginName);
+            bool invited = GroupManager.Instance.InvitePlayer(conn.ConnId, targetConn.ConnId);
+            if (!invited)
+            {
+                sendMessage(conn, "[DUELARENA] Failed to invite target.");
+                return true;
+            }
+            var joined = GroupManager.Instance.AcceptInvite(targetConn.ConnId, targetConn.LoginName, targetConn.LoginName);
+            if (joined == null)
+            {
+                sendMessage(conn, "[DUELARENA] Target failed to join group.");
+                return true;
+            }
+
+            Debug.LogError($"[DUELARENA] Probe: temp group {g.GroupId} formed: {conn.LoginName} + {targetConn.LoginName} → zone {zoneName}");
+            sendMessage(conn, $"[DUELARENA] Group {g.GroupId} formed with {targetName}. Teleporting both to {zoneName}…");
+
+            _server.ChatChangeZone(conn, zoneName);
+            _server.ChatChangeZone(targetConn, zoneName);
+            Debug.LogError($"[DUELARENA] Both teleported to {zoneName}. Watch for: same-instance, sync errors, and whether you can damage each other.");
             return true;
         }
 

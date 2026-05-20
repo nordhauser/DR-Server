@@ -229,13 +229,19 @@ namespace DungeonRunners.Managers
             // Block re-accepting a quest that is already active
             if (playerState.ActiveQuests.Any(q => q.QuestId.Equals(questId, StringComparison.OrdinalIgnoreCase)))
                 return result;
-            // Block re-accepting a quest that was already completed this session
-            if (playerState.CompletedQuests.Any(q => q.Equals(questId, StringComparison.OrdinalIgnoreCase)))
-                return result;
 
             var questData = DatabaseLoader.Quests.FirstOrDefault(q =>
                 q.id.Equals(questId, StringComparison.OrdinalIgnoreCase));
             if (questData == null) return result;
+
+            // Block re-accepting a completed quest unless it is flagged repeatable.
+            // Repeatable quests (e.g. world.town.quest.well.base_r — Toss a King's Coin)
+            // are removed from CompletedQuests on turn-in elsewhere, but defend here too.
+            bool alreadyCompleted = playerState.CompletedQuests.Any(q =>
+                q.Equals(questId, StringComparison.OrdinalIgnoreCase));
+            if (alreadyCompleted && !questData.repeatable) return result;
+            if (alreadyCompleted && questData.repeatable)
+                playerState.CompletedQuests.RemoveAll(q => q.Equals(questId, StringComparison.OrdinalIgnoreCase));
 
             var activeQuest = new ActiveQuest
             {

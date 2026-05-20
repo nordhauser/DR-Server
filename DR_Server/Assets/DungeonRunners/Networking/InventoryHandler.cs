@@ -424,9 +424,9 @@ namespace DungeonRunners.Networking
             int itemWidth = itemData?.inventoryWidth ?? 1;
             int itemHeight = itemData?.inventoryHeight ?? 1;
 
-            if (_server.IsInventorySlotOccupied(conn.ConnId.ToString(), x, y, itemWidth, itemHeight))
+            if (_server.IsInventorySlotOccupied(conn.ConnId.ToString(), x, y, itemWidth, itemHeight, inventoryID))
             {
-                Debug.LogError($"[INVENTORY] ❌ Cannot place {itemWidth}x{itemHeight} item at ({x}, {y}) - overlaps!");
+                Debug.LogError($"[INVENTORY] ❌ Cannot place {itemWidth}x{itemHeight} item at ({x}, {y}) in container 0x{inventoryID:X2} - overlaps!");
                 return;
             }
 
@@ -469,9 +469,9 @@ namespace DungeonRunners.Networking
                     writer.WriteByte(0x00);  // transient Mod1 flags
                 writer.WriteByte(0x00);  // ReadChildData<ItemModifier> count = 0
 
-                // Restore stack tracking after write
-                _server.SetStackCount(connId, trackingSlot, stackCount);
-                _server.SetStackCount(connId, 0xFFFFFFFF, 0);  // clear temp
+                // Restore stack tracking after write — into the destination container
+                _server.SetStackCount(connId, trackingSlot, stackCount, inventoryID);
+                _server.SetStackCount(connId, 0xFFFFFFFF, 0);  // clear temp cursor (stays in main inv namespace)
             }
             else
             {
@@ -483,8 +483,8 @@ namespace DungeonRunners.Networking
             writer.WriteByte(0x06);
 
             _server.SendToClient(conn, writer.ToArray());
-            _server.OccupyInventorySlots(conn.ConnId.ToString(), x, y, itemWidth, itemHeight);
-            _server.TrackInventoryItem(conn.ConnId.ToString(), trackingSlot, item, x, y);
+            _server.OccupyInventorySlots(conn.ConnId.ToString(), x, y, itemWidth, itemHeight, inventoryID);
+            _server.TrackInventoryItem(conn.ConnId.ToString(), trackingSlot, item, x, y, inventoryID);
 
             playerState.ActiveItem = null;
             _server.SavePlayerInventoryPublic(conn);
@@ -507,10 +507,14 @@ namespace DungeonRunners.Networking
                 return;
             }
 
-            var itemData = _server.GetAndRemoveInventoryItem(connId, index);
+            // Pickup packet doesn't carry a container ID — find which container holds this slot.
+            byte sourceContainer = _server.FindContainerForSlot(connId, index) ?? (byte)0x0B;
+            Debug.LogError($"[INVENTORY] PICKUP source container: 0x{sourceContainer:X2}");
+
+            var itemData = _server.GetAndRemoveInventoryItem(connId, index, sourceContainer);
             if (itemData == null)
             {
-                Debug.LogError($"[INVENTORY] ❌ No item at index {index}!");
+                Debug.LogError($"[INVENTORY] ❌ No item at index {index} in container 0x{sourceContainer:X2}!");
                 return;
             }
 
@@ -525,9 +529,17 @@ namespace DungeonRunners.Networking
             string gcLower = item.GCClass.ToLower();
 
             // ── QUEST ITEMS: pick up to cursor with bare format (no ScaleMod) ──
+            // QuestItemPAL.Token etc. are stackable up to 100 (per QuestItemPAL.gc).
+            // Previously this branch hardcoded the cursor quantity to 0x01 and never
+            // set the cursor stack count, so picking up a 50-stack of King's Coins
+            // gave the cursor 1 and lost the other 49 on the next drop/place. Read
+            // the stack count from the source slot and carry it on the cursor, the
+            // way the consumable branch below does.
             if (gcLower.Contains("questitem"))
             {
-                _server.FreeInventorySlots(connId, storedX, storedY, itemWidth, itemHeight);
+                int qiStackCount = _server.GetStackCount(connId, index, sourceContainer);
+                if (qiStackCount <= 0) qiStackCount = 1;
+                _server.FreeInventorySlots(connId, storedX, storedY, itemWidth, itemHeight, sourceContainer);
 
                 var questWriter = new LEWriter();
                 questWriter.WriteByte(0x07);
@@ -546,7 +558,7 @@ namespace DungeonRunners.Networking
                 questWriter.WriteUInt32(0x00);
                 questWriter.WriteByte(0x00);
                 questWriter.WriteByte(0x00);
-                questWriter.WriteByte(0x01);
+                questWriter.WriteByte((byte)(qiStackCount > 255 ? 255 : qiStackCount));
                 questWriter.WriteByte(0x01);
                 questWriter.WriteByte(0x00);
                 questWriter.WriteByte(0x00);
@@ -556,24 +568,27 @@ namespace DungeonRunners.Networking
                 _server.SendToClient(conn, questWriter.ToArray());
 
                 playerState.ActiveItem = item;
-                Debug.LogError($"[INVENTORY] ✅ Quest item picked up to cursor: {item.GCClass}");
+                // Cursor stack count — same temp key the consumable branch and
+                // HandlePlaceItemInInventory + HandleDropItem read.
+                _server.SetStackCount(connId, 0xFFFFFFFF, qiStackCount);
+                Debug.LogError($"[INVENTORY] ✅ Quest item picked up to cursor: {item.GCClass} x{qiStackCount}");
                 return;
             }
 
             if (gcLower.Contains("townportal"))
             {
-                int tpCount = _server.GetStackCount(connId, index);
+                int tpCount = _server.GetStackCount(connId, index, sourceContainer);
                 int remaining = tpCount - 1;
                 if (remaining > 0)
                 {
                     var tpItem = new GCObject { GCClass = item.GCClass, NativeClass = "Item" };
-                    _server.TrackInventoryItem(connId, index, tpItem, storedX, storedY);
-                    _server.SetStackCount(connId, index, remaining);
+                    _server.TrackInventoryItem(connId, index, tpItem, storedX, storedY, sourceContainer);
+                    _server.SetStackCount(connId, index, remaining, sourceContainer);
                 }
                 else
                 {
-                    _server.FreeInventorySlots(connId, storedX, storedY, itemWidth, itemHeight);
-                    _server.RemoveInventoryItemBySlot(connId, index);
+                    _server.FreeInventorySlots(connId, storedX, storedY, itemWidth, itemHeight, sourceContainer);
+                    _server.RemoveInventoryItemBySlot(connId, index, sourceContainer);
                 }
                 _server.SpawnTownPortalWithRemoval(conn, "dungeon00_level01", componentId, index,
                     playerState, gcLower, storedX, storedY, remaining);
@@ -586,8 +601,8 @@ namespace DungeonRunners.Networking
             if (gcLower.Contains("consumable") || gcLower.Contains("potion")
                 || gcLower.Contains("skillbook") || gcLower.Contains("voucher"))
             {
-                int stackCount = _server.GetStackCount(connId, index);
-                _server.FreeInventorySlots(connId, storedX, storedY, itemWidth, itemHeight);
+                int stackCount = _server.GetStackCount(connId, index, sourceContainer);
+                _server.FreeInventorySlots(connId, storedX, storedY, itemWidth, itemHeight, sourceContainer);
 
                 var consWriter = new LEWriter();
                 consWriter.WriteByte(0x07);
@@ -625,7 +640,7 @@ namespace DungeonRunners.Networking
             }
 
             // Regular equipment - pick up to cursor
-            _server.FreeInventorySlots(connId, storedX, storedY, itemWidth, itemHeight);
+            _server.FreeInventorySlots(connId, storedX, storedY, itemWidth, itemHeight, sourceContainer);
 
             var writer = new LEWriter();
             writer.WriteByte(0x07);
@@ -846,6 +861,17 @@ namespace DungeonRunners.Networking
             int fx = (int)(playerX * 256);
             int fy = (int)(playerY * 256);
 
+            // Z offset: player Z is foot-level which on slopes/stairs sits AT the
+            // sloped surface — items spawned at exactly that Z clip through the
+            // geometry and disappear "under the map" (Kubjas 2026-05-19). The
+            // wishing-well/Token-Master quest drops side-step this by anchoring
+            // to a known flat-floor NPC Z; player-initiated drops have no such
+            // anchor. Bias the drop a few units upward so the FlipController
+            // animation lands the item ON the surface, not inside it. The bias
+            // is small enough that flat-ground drops still settle visually next
+            // to the player.
+            float dropZ = conn.PlayerPosZ + 4.0f;
+
             var body = new LEWriter();
 
             body.WriteByte(0x35);
@@ -863,7 +889,7 @@ namespace DungeonRunners.Networking
             body.WriteUInt32(0x00000006);
             body.WriteInt32(fx);
             body.WriteInt32(fy);
-            int fz = (int)(conn.PlayerPosZ * 256);
+            int fz = (int)(dropZ * 256);
             body.WriteInt32(fz);
             body.WriteInt32(0);
             body.WriteByte(0xF7);

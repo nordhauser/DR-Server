@@ -400,11 +400,28 @@ namespace DungeonRunners.Data
             Debug.LogError("[EQUIP-CHAR] ═══════════════════════════════════════════════════════════");
             int count = 0;
 
+            // Pull persisted rarity / level so the new GCObjects carry the same StoredRarity
+            // and StoredLevel as character_equipment.rarity / stored_level. Default sentinel
+            // is -1 (matches DB column default + GCObject default). Without this, first-login
+            // construction strips the rarity → next save overwrites DB rarity with 0 → equipped
+            // Token Master items render white-trash + Path B picks wrong-quality mods. This
+            // dict-backed lookup is exactly the same shape SavePlayerInventory writes to.
+            int RarityOf(string slot) {
+                if (character.equipment?.slotRarity != null
+                    && character.equipment.slotRarity.TryGetValue(slot, out int r)) return r;
+                return -1;
+            }
+            int LevelOf(string slot) {
+                if (character.equipment?.slotLevel != null
+                    && character.equipment.slotLevel.TryGetValue(slot, out int l)) return l;
+                return -1;
+            }
+
             // WEAPON - BOTH Equipment AND Manipulators
             if (!string.IsNullOrEmpty(character.equipment.weapon))
             {
                 Debug.LogError($"[EQUIP-CHAR] Creating weapon: {character.equipment.weapon}");
-                var weapon = CreateEquipmentItem(character.equipment.weapon);
+                var weapon = CreateEquipmentItem(character.equipment.weapon, RarityOf("weapon"), LevelOf("weapon"));
                 if (weapon != null)
                 {
                     // Set Manipulator ID property → writes to Item+0x68 (slot assignment for renderer)
@@ -421,7 +438,7 @@ namespace DungeonRunners.Data
             if (!string.IsNullOrEmpty(character.equipment.armor))
             {
                 Debug.LogError($"[EQUIP-CHAR] Creating armor: {character.equipment.armor}");
-                var armor = CreateEquipmentItem(character.equipment.armor);
+                var armor = CreateEquipmentItem(character.equipment.armor, RarityOf("armor"), LevelOf("armor"));
                 if (armor != null)
                 {
                     armor.Properties.Add(new UInt32Property { Name = "ID", Value = 6 });
@@ -436,7 +453,7 @@ namespace DungeonRunners.Data
             if (!string.IsNullOrEmpty(character.equipment.helmet))
             {
                 Debug.LogError($"[EQUIP-CHAR] Creating helmet: {character.equipment.helmet}");
-                var helmet = CreateEquipmentItem(character.equipment.helmet);
+                var helmet = CreateEquipmentItem(character.equipment.helmet, RarityOf("helmet"), LevelOf("helmet"));
                 if (helmet != null)
                 {
                     helmet.Properties.Add(new UInt32Property { Name = "ID", Value = 5 });
@@ -451,7 +468,7 @@ namespace DungeonRunners.Data
             if (!string.IsNullOrEmpty(character.equipment.gloves))
             {
                 Debug.LogError($"[EQUIP-CHAR] Creating gloves: {character.equipment.gloves}");
-                var gloves = CreateEquipmentItem(character.equipment.gloves);
+                var gloves = CreateEquipmentItem(character.equipment.gloves, RarityOf("gloves"), LevelOf("gloves"));
                 if (gloves != null)
                 {
                     gloves.Properties.Add(new UInt32Property { Name = "ID", Value = 2 });
@@ -466,7 +483,7 @@ namespace DungeonRunners.Data
             if (!string.IsNullOrEmpty(character.equipment.boots))
             {
                 Debug.LogError($"[EQUIP-CHAR] Creating boots: {character.equipment.boots}");
-                var boots = CreateEquipmentItem(character.equipment.boots);
+                var boots = CreateEquipmentItem(character.equipment.boots, RarityOf("boots"), LevelOf("boots"));
                 if (boots != null)
                 {
                     boots.Properties.Add(new UInt32Property { Name = "ID", Value = 7 });
@@ -481,7 +498,7 @@ namespace DungeonRunners.Data
             if (!string.IsNullOrEmpty(character.equipment.shoulders))
             {
                 Debug.LogError($"[EQUIP-CHAR] Creating shoulders: {character.equipment.shoulders}");
-                var shoulders = CreateEquipmentItem(character.equipment.shoulders);
+                var shoulders = CreateEquipmentItem(character.equipment.shoulders, RarityOf("shoulders"), LevelOf("shoulders"));
                 if (shoulders != null)
                 {
                     shoulders.Properties.Add(new UInt32Property { Name = "ID", Value = 12 });
@@ -496,7 +513,7 @@ namespace DungeonRunners.Data
             if (!string.IsNullOrEmpty(character.equipment.shield))
             {
                 Debug.LogError($"[EQUIP-CHAR] Creating shield: {character.equipment.shield}");
-                var shield = CreateEquipmentItem(character.equipment.shield);
+                var shield = CreateEquipmentItem(character.equipment.shield, RarityOf("shield"), LevelOf("shield"));
                 if (shield != null)
                 {
                     // Dual-wield: weapon in shield slot needs TargetSlot=11 for in-game spawn (OP4/OP5)
@@ -519,8 +536,8 @@ namespace DungeonRunners.Data
             if (!string.IsNullOrEmpty(character.equipment.ring1))
             {
                 Debug.LogError($"[EQUIP-CHAR] Creating ring1: {character.equipment.ring1}");
-                var ring1ForEquip = CreateEquipmentItem(character.equipment.ring1);
-                var ring1ForManip = CreateEquipmentItem(character.equipment.ring1);
+                var ring1ForEquip = CreateEquipmentItem(character.equipment.ring1, RarityOf("ring1"), LevelOf("ring1"));
+                var ring1ForManip = CreateEquipmentItem(character.equipment.ring1, RarityOf("ring1"), LevelOf("ring1"));
                 if (ring1ForEquip != null && ring1ForManip != null)
                 {
                     ring1ForEquip.Properties.Add(new UInt32Property { Name = "ID", Value = 3 });
@@ -536,8 +553,8 @@ namespace DungeonRunners.Data
             if (!string.IsNullOrEmpty(character.equipment.ring2))
             {
                 Debug.LogError($"[EQUIP-CHAR] Creating ring2: {character.equipment.ring2}");
-                var ring2ForEquip = CreateEquipmentItem(character.equipment.ring2);
-                var ring2ForManip = CreateEquipmentItem(character.equipment.ring2);
+                var ring2ForEquip = CreateEquipmentItem(character.equipment.ring2, RarityOf("ring2"), LevelOf("ring2"));
+                var ring2ForManip = CreateEquipmentItem(character.equipment.ring2, RarityOf("ring2"), LevelOf("ring2"));
                 if (ring2ForEquip != null && ring2ForManip != null)
                 {
                     ring2ForEquip.TargetSlot = 4;
@@ -556,8 +573,8 @@ namespace DungeonRunners.Data
             if (!string.IsNullOrEmpty(character.equipment.amulet))
             {
                 Debug.LogError($"[EQUIP-CHAR] Creating amulet: {character.equipment.amulet}");
-                var amuletForEquip = CreateEquipmentItem(character.equipment.amulet);
-                var amuletForManip = CreateEquipmentItem(character.equipment.amulet);
+                var amuletForEquip = CreateEquipmentItem(character.equipment.amulet, RarityOf("amulet"), LevelOf("amulet"));
+                var amuletForManip = CreateEquipmentItem(character.equipment.amulet, RarityOf("amulet"), LevelOf("amulet"));
                 if (amuletForEquip != null && amuletForManip != null)
                 {
                     amuletForEquip.Properties.Add(new UInt32Property { Name = "ID", Value = 1 });
@@ -619,9 +636,18 @@ namespace DungeonRunners.Data
 
         // ════════════════════════════════════════════════════════════════════════════════
         // CreateEquipmentItem
-        // Creates a GCObject for an equipment item with proper NativeClass detection
+        // Creates a GCObject for an equipment item with proper NativeClass detection.
+        // storedRarity / storedLevel come from character_equipment.rarity / stored_level
+        // (LoadEquipment reads them into StartingEquipment.slotRarity / slotLevel). Without
+        // them, the first-login spawn re-creates equipment GCObjects with StoredRarity=-1,
+        // then GetEffectiveRarity falls through to DetectRarityFromGCClass which returns 0
+        // for items whose name doesn't contain "rare"/"unique"/"mythic" (e.g.
+        // LeatherPAL.LeatherArmor2 from Token Master). The next save overwrites the DB
+        // rarity with 0 — locking in "white trash" rendering forever across sessions.
+        // Path B (mod injection) also keys its mod selection on rarity, so a -1 store also
+        // produces the wrong-quality mods on equipped tooltips.
         // ════════════════════════════════════════════════════════════════════════════════
-        private static GCObject CreateEquipmentItem(string gcClass)
+        private static GCObject CreateEquipmentItem(string gcClass, int storedRarity = -1, int storedLevel = -1)
         {
             if (string.IsNullOrEmpty(gcClass))
             {
@@ -693,9 +719,11 @@ namespace DungeonRunners.Data
                 NativeClass = nativeClass,
                 GCClass = gcClass,
                 Name = null,
-                Properties = new List<GCObjectProperty>()
+                Properties = new List<GCObjectProperty>(),
+                StoredRarity = storedRarity,
+                StoredLevel = storedLevel
             };
-            Debug.LogError($"[CREATE-ITEM] ✅ Created GCObject: {result.GCClass} as {result.NativeClass}");
+            Debug.LogError($"[CREATE-ITEM] ✅ Created GCObject: {result.GCClass} as {result.NativeClass} storedRarity={storedRarity} storedLevel={storedLevel}");
             return result;
         }
 
@@ -762,11 +790,11 @@ namespace DungeonRunners.Data
                 Name = null
             };
 
-            // Add the 7 inventory children
-            var childNames = new[] { "Inventory", "TradeInventory", "Bank1", "Bank2", "Bank3", "Bank4", "Bank5" };
-            var childGCClasses = new[] { "avatar.base.Inventory", "avatar.base.TradeInventory", "avatar.base.Bank", "avatar.base.Bank2", "avatar.base.Bank3", "avatar.base.Bank4", "avatar.base.Bank5" };
+            // Add the 9 inventory children (Inventory + Trade + 7 bank pages, matching avatar.gc DefaultBankObject..DefaultBankObject7)
+            var childNames = new[] { "Inventory", "TradeInventory", "Bank1", "Bank2", "Bank3", "Bank4", "Bank5", "Bank6", "Bank7" };
+            var childGCClasses = new[] { "avatar.base.Inventory", "avatar.base.TradeInventory", "avatar.base.Bank", "avatar.base.Bank2", "avatar.base.Bank3", "avatar.base.Bank4", "avatar.base.Bank5", "avatar.base.Bank6", "avatar.base.Bank7" };
 
-            for (int i = 0; i < 7; i++)
+            for (int i = 0; i < 9; i++)
             {
                 var child = new GCObject
                 {

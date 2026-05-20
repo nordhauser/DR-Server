@@ -26,6 +26,10 @@ namespace DungeonRunners.Data
 
         public bool IsLoaded { get; private set; }
 
+        // Path B kill switch. Flip to false to revert all non-mythic write sites to the legacy
+        // single-ScaleMod cstring behaviour. Mythic path doesn't read this flag.
+        public static bool PathBEnabled = true;
+
         // ═══════════════════════════════════════════════════════════════
         // DATA STRUCTURES
         // ═══════════════════════════════════════════════════════════════
@@ -42,11 +46,33 @@ namespace DungeonRunners.Data
         // Runtime lookup tables (loaded from DB)
         private Dictionary<string, PoolFormula> _pools = new();
         private Dictionary<string, List<ResolvedMod>> _itemMods = new(StringComparer.OrdinalIgnoreCase);
+        // Per-slot mod refs for IG-stub mythics — used by wire serialization (Piece B)
+        private Dictionary<string, List<(int Slot, string ModRef)>> _itemWireMods = new(StringComparer.OrdinalIgnoreCase);
+        // GCDictionary: set of class names registered in the client (one per .gc class). The
+        // dict's sequential numeric IDs are NOT the runtime registry's keys — the client looks up
+        // classes by DJB2 hash of the lowercased name (case 0x04 in readType). The dict's value is
+        // therefore which prefix form ("items.modpal.X" vs "X") the client registered each class
+        // under, so the server hashes the matching form.
+        private HashSet<string> _gcClassNames = new(StringComparer.OrdinalIgnoreCase);
 
         // Parsing intermediaries (used only during population, then cleared)
         private Dictionary<string, (string Attr, string Pool)> _attrMap = new(StringComparer.OrdinalIgnoreCase);
         private Dictionary<string, string> _modPalRefs = new(StringComparer.OrdinalIgnoreCase);
         private Dictionary<string, string> _weaponMythicRefs = new(StringComparer.OrdinalIgnoreCase);
+        // IG-stub items: PAL path (lowercased, e.g. "2haxemythicpal.2haxemythic101") → [(slot, generator path)]
+        // For direct-Item IG entries (Mythic, Rare, Unique). Wrapper entries (Magic/Superior) go through _wrapperIGEntries.
+        private Dictionary<string, List<(int Slot, string GeneratorPath)>> _igStubItems = new(StringComparer.OrdinalIgnoreCase);
+        // Per-rarity item counts captured during parse (for boot log breakdown).
+        private Dictionary<string, int> _igStubCountByRarity = new(StringComparer.OrdinalIgnoreCase);
+        // Wrapper IG entries: rarity ∈ {Magic, Superior} where the inner block uses
+        // ItemGenerator = items.ig.X.NormalYIG (no direct Item=). Resolved in a second pass by
+        // recursively reading the target IG's direct Item= entries and storing wire mods under
+        // composite key "palpath:rarity".
+        private List<(string Rarity, string TargetIGRef, List<(int Slot, string GeneratorPath)> Generators)> _wrapperIGEntries = new();
+        // Mod generator tables: "{MGFile}.{Section}" → ordered list of ItemModifier refs
+        private Dictionary<string, List<string>> _modGenerators = new(StringComparer.OrdinalIgnoreCase);
+        // Mod generator inheritance: "{MGFile}.{Section}" → "{ParentFile}.{ParentSection}" (sections with empty body inherit)
+        private Dictionary<string, string> _modGeneratorParents = new(StringComparer.OrdinalIgnoreCase);
 
         private string _gcDir;
 
@@ -76,9 +102,43 @@ namespace DungeonRunners.Data
                 {
                     cmd.CommandText = "SELECT COUNT(*) FROM item_resolved_mods";
                     long count = (long)cmd.ExecuteScalar();
-                    if (count == 0)
+
+                    // Detect needs-repopulate: empty, OR no IG-stub entries (pre-Phase-5 DB),
+                    // OR no Path B non-mythic wire mods (pre-Path-B DB).
+                    bool needsRepopulate = count == 0;
+                    if (!needsRepopulate)
                     {
-                        Debug.LogError("[ItemStatDB] Populating from GC files...");
+                        cmd.CommandText = "SELECT COUNT(*) FROM item_resolved_mods WHERE full_gc_key='2haxemythicpal.2haxemythic101'";
+                        long stubProbe = (long)cmd.ExecuteScalar();
+                        needsRepopulate = stubProbe == 0;
+                    }
+                    if (!needsRepopulate)
+                    {
+                        // Path B canary v3: weapon IGs use `ItemTimeLine` (capital L) while
+                        // mage/plate IGs use `ItemTimeline` (lowercase l). The first cut had
+                        // a case-sensitive regex that missed all weapon wrappers. The presence
+                        // of weapon wrapper rows confirms the case-insensitive parser ran.
+                        cmd.CommandText = "SELECT COUNT(*) FROM item_wire_mods WHERE full_gc_key LIKE '2hcrossbow%:rare' LIMIT 1";
+                        long weaponProbe = (long)cmd.ExecuteScalar();
+                        needsRepopulate = weaponProbe == 0;
+                    }
+                    if (!needsRepopulate)
+                    {
+                        // Stale-prefix sentinel: if ANY wire-mod row still has the old
+                        // items.pal. prefix, the parser ran pre-fix → force rebuild.
+                        cmd.CommandText = "SELECT COUNT(*) FROM item_wire_mods WHERE full_gc_key LIKE 'items.pal.%' LIMIT 1";
+                        long staleProbe = (long)cmd.ExecuteScalar();
+                        needsRepopulate = staleProbe > 0;
+                    }
+
+                    if (needsRepopulate)
+                    {
+                        Debug.LogError($"[ItemStatDB] Populating from GC files (existing rows={count}, full rebuild)...");
+                        using (var del = conn.CreateCommand())
+                        {
+                            del.CommandText = "DELETE FROM item_resolved_mods; DELETE FROM item_wire_mods;";
+                            del.ExecuteNonQuery();
+                        }
                         PopulateFromGCFiles(conn);
                     }
                     else
@@ -89,9 +149,38 @@ namespace DungeonRunners.Data
 
                 LoadPools(conn);
                 LoadResolvedMods(conn);
+                LoadWireMods(conn);
+                LoadGCDictionary();
+
+                // Always parse MG files at boot — even when DB is already populated. The class+
+                // rarity synthetic fallback in GetWrapperIGWireMods needs _modGenerators alive at
+                // runtime to serve items not covered by any direct or wrapper IG (e.g. Token Master
+                // synthetic items like ChainPAL.ChainGloves2). Cheap (~50ms).
+                if (_modGenerators.Count == 0)
+                {
+                    ParseAllMGFiles();
+                    Debug.LogError($"[ItemStatDB] Boot-time MG cache: {_modGenerators.Count} generators ready for class+rarity fallback");
+                }
+
                 IsLoaded = true;
 
-                Debug.LogError($"[ItemStatDB] Loaded: {_pools.Count} pools, {_itemMods.Count} items, {_itemMods.Values.Sum(v => v.Count)} total mods");
+                Debug.LogError($"[ItemStatDB] Loaded: {_pools.Count} pools, {_itemMods.Count} items, {_itemMods.Values.Sum(v => v.Count)} total mods, {_itemWireMods.Count} wire-mod items, {_gcClassNames.Count} GC class names");
+
+                // Path B sanity probes — surfaces parser regressions at boot.
+                foreach (var probeKey in new[] {
+                    "2haxemythicpal.2haxemythic101",           // existing mythic (Diabolical) - regression canary
+                    "magebodypal.rare001",                      // Tier 1 direct-Item Rare
+                    "magebodypal.unique001",                    // Tier 1 direct-Item Unique (Mage)
+                    "platepal.plateuniquearmor1",               // Tier 1 direct-Item Unique (Plate)
+                    "magebodypal.normal001:magic",              // Tier 2 wrapper Magic
+                    "magebodypal.normal001:superior"            // Tier 2 wrapper Superior
+                })
+                {
+                    if (_itemWireMods.TryGetValue(probeKey, out var probe))
+                        Debug.LogError($"[ItemStatDB] PROBE {probeKey}: {probe.Count} wire mods -> [{string.Join(", ", probe.Select(p => p.ModRef))}]");
+                    else
+                        Debug.LogError($"[ItemStatDB] PROBE {probeKey}: MISSING");
+                }
             }
             catch (Exception ex)
             {
@@ -164,13 +253,100 @@ namespace DungeonRunners.Data
                 }
             }
 
-            transaction.Commit();
             Debug.LogError($"[ItemStatDB] Phase 4: {itemCount} items, {modCount} resolved mod attributes stored");
 
-            // Clear parsing intermediaries
+            // Phase 5: IG-stub items across all rarities (Mythic/Rare/Unique direct-Item IGs +
+            // Magic/Superior wrapper IGs that delegate to NormalYIG). Wire mods get injected at write
+            // sites; client renders 2-7 visible bonuses per native data per tier.
+            // Chain: {Rarity}*IG.gc Item=X + ItemModGeneratorN=Y → *MG.gc section Y → ModPAL.Quality.ModN refs.
+            ParseAllIGFiles();
+            string rarityBreakdown = string.Join(" ", _igStubCountByRarity.OrderBy(k => k.Key).Select(k => $"{k.Key.ToLowerInvariant()}={k.Value}"));
+            Debug.LogError($"[ItemStatDB] Phase 5a: {_igStubItems.Count} direct-Item IG entries ({rarityBreakdown}) + {_wrapperIGEntries.Count} wrapper-IG entries");
+
+            ParseAllMGFiles();
+            Debug.LogError($"[ItemStatDB] Phase 5b: {_modGenerators.Count} mod generators parsed");
+
+            int igItemCount = 0, igStatCount = 0, igWireCount = 0;
+            foreach (var kvp in _igStubItems)
+            {
+                string itemPalPath = kvp.Key;
+                var generators = kvp.Value;
+
+                // For each slot, pick the FIRST mod ref deterministically.
+                var perSlotModRefs = new List<(int Slot, string ModRef)>();
+                foreach (var (slot, generatorPath) in generators)
+                {
+                    string normGen = generatorPath;
+                    if (normGen.StartsWith("items.mg.", StringComparison.OrdinalIgnoreCase))
+                        normGen = normGen.Substring("items.mg.".Length);
+                    if (_modGenerators.TryGetValue(normGen, out var modRefs) && modRefs.Count > 0)
+                    {
+                        perSlotModRefs.Add((slot, modRefs[0]));
+                    }
+                }
+                if (perSlotModRefs.Count == 0) continue;
+
+                // Stat resolution (existing ResolveMods handles ModPAL.Quality.ModN chain).
+                var statResolved = ResolveMods(perSlotModRefs.Select(p => (p.Slot, p.ModRef)).ToList());
+                if (statResolved.Count > 0)
+                {
+                    InsertResolvedMods(conn, itemPalPath, statResolved);
+                    igStatCount += statResolved.Count;
+                }
+
+                // Wire serialization (all slots, including Binder which has no stats).
+                InsertWireMods(conn, itemPalPath, perSlotModRefs);
+                igWireCount += perSlotModRefs.Count;
+                igItemCount++;
+            }
+
+            // Phase 5c — wrapper IG resolution (Magic/Superior). For each wrapper entry, parse the
+            // target IG (e.g. NormalMageBodyIG.gc) for its direct Item= rows, and store the
+            // wrapper's mod generators under composite key "palpath:rarity".
+            int wrapItemCount = 0, wrapWireCount = 0;
+            foreach (var entry in _wrapperIGEntries)
+            {
+                string targetIGName = entry.TargetIGRef.Split('.').Last();
+                string targetFilePath = Path.Combine(_gcDir, targetIGName + ".gc");
+                if (!File.Exists(targetFilePath)) continue;
+
+                var targetItems = ParseDirectItemEntries(targetFilePath);
+                if (targetItems.Count == 0) continue;
+
+                var perSlotModRefs = new List<(int Slot, string ModRef)>();
+                foreach (var (slot, generatorPath) in entry.Generators)
+                {
+                    string normGen = generatorPath;
+                    if (normGen.StartsWith("items.mg.", StringComparison.OrdinalIgnoreCase))
+                        normGen = normGen.Substring("items.mg.".Length);
+                    if (_modGenerators.TryGetValue(normGen, out var modRefs) && modRefs.Count > 0)
+                        perSlotModRefs.Add((slot, modRefs[0]));
+                }
+                if (perSlotModRefs.Count == 0) continue;
+
+                foreach (var targetPalPath in targetItems)
+                {
+                    string compositeKey = $"{targetPalPath}:{entry.Rarity}".ToLowerInvariant();
+                    InsertWireMods(conn, compositeKey, perSlotModRefs);
+                    wrapWireCount += perSlotModRefs.Count;
+                    wrapItemCount++;
+                }
+            }
+
+            transaction.Commit();
+            Debug.LogError($"[ItemStatDB] Phase 5: {igItemCount} direct-Item items, {igStatCount} stat mods, {igWireCount} wire mods stored; Phase 5c: {wrapItemCount} wrapper:rarity rows, {wrapWireCount} wire mods stored");
+
+            // Clear parsing intermediaries — but KEEP _modGenerators alive at runtime so
+            // the class+rarity synthetic fallback (GetWrapperIGWireMods) can pull from
+            // {Class}MG.{Phase}MG pools for items not covered by any direct or wrapper IG.
             _attrMap.Clear();
             _modPalRefs.Clear();
             _weaponMythicRefs.Clear();
+            _igStubItems.Clear();
+            _igStubCountByRarity.Clear();
+            _wrapperIGEntries.Clear();
+            // _modGenerators.Clear();  // RETAINED — needed for SynthesizeClassRarityMods
+            _modGeneratorParents.Clear();
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -337,6 +513,211 @@ namespace DungeonRunners.Data
         }
 
         // ═══════════════════════════════════════════════════════════════
+        // PHASE 5a: Parse {Rare,Unique,Magic,Superior,Mythic}*IG.gc files
+        // ═══════════════════════════════════════════════════════════════
+
+        // Loops the rarity-prefix whitelist instead of a single glob — excludes MerchantSpecialEventIG,
+        // BlingGnomeIG, NormalIG, etc. which use LinkedGenerator references and don't carry
+        // item-block-level Item= / ItemModGeneratorN= entries.
+        private void ParseAllIGFiles()
+        {
+            string[] rarityPrefixes = { "Rare", "Unique", "Magic", "Superior", "Mythic" };
+            foreach (var prefix in rarityPrefixes)
+            {
+                _igStubCountByRarity[prefix] = 0;
+                foreach (var file in Directory.GetFiles(_gcDir, prefix + "*IG.gc"))
+                    ParseSingleIGFile(file, prefix);
+            }
+        }
+
+        private void ParseSingleIGFile(string file, string fileRarity)
+        {
+            string content = File.ReadAllText(file).Replace("\r", "");
+            string currentItemPalPath = null;
+            string currentItemGenRef = null;
+            var currentGenerators = new List<(int, string)>();
+
+            void Flush()
+            {
+                if (currentGenerators.Count > 0)
+                {
+                    if (currentItemPalPath != null)
+                    {
+                        _igStubItems[currentItemPalPath] = new List<(int, string)>(currentGenerators);
+                        _igStubCountByRarity[fileRarity]++;
+                    }
+                    else if (currentItemGenRef != null)
+                    {
+                        // Wrapper IG (Magic/Superior pattern: ItemGenerator = items.ig.X.NormalYIG)
+                        _wrapperIGEntries.Add((fileRarity, currentItemGenRef, new List<(int, string)>(currentGenerators)));
+                    }
+                }
+                currentItemPalPath = null;
+                currentItemGenRef = null;
+                currentGenerators.Clear();
+            }
+
+            foreach (string rawLine in content.Split('\n'))
+            {
+                string t = rawLine.Trim();
+                if (t.StartsWith("//") || t.StartsWith("/*")) continue;
+
+                // Inner-block header: matches direct-Item blocks (Rare/Unique/Mythic via ItemTimeline.*)
+                // and wrapper blocks (Magic/Superior via RandomItemGenerator). SingleItemGenerator
+                // included for NormalAmuletIG-style files (no mod generators -> harmlessly skipped).
+                // The outer container `extends ItemGeneratorTable` is excluded by this list.
+                // Case-insensitive: weapon IGs (2HCrossbow, 1HPick etc.) use "ItemTimeLine" with
+                // capital L while mage/plate IGs use "ItemTimeline" lowercase. Both are valid in
+                // the native data.
+                if (Regex.IsMatch(t, @"^\w+\s+extends\s+(ItemTimeline\.\w+|RandomItemGenerator|SingleItemGenerator)", RegexOptions.IgnoreCase))
+                {
+                    Flush();
+                    continue;
+                }
+
+                var itemMatch = Regex.Match(t, @"^Item\s*=\s*([^;\s]+)");
+                if (itemMatch.Success)
+                {
+                    // Normalize storage key: strip items.pal. prefix so it matches what
+                    // NormalizeGCClass produces at lookup. Mythic IG files use bare paths
+                    // (e.g. "2HAxeMythicPAL.2HAxeMythic1"); mage IG files use the prefixed
+                    // form ("items.pal.MageBodyPAL.Rare001"). Without normalization,
+                    // prefixed entries never hit at lookup.
+                    string rawItem = itemMatch.Groups[1].Value.ToLowerInvariant();
+                    if (rawItem.StartsWith("items.pal."))
+                        rawItem = rawItem.Substring("items.pal.".Length);
+                    currentItemPalPath = rawItem;
+                    continue;
+                }
+
+                // Wrapper IG marker: "ItemGenerator = items.ig.X.NormalYIG"
+                var wrapperMatch = Regex.Match(t, @"^ItemGenerator\s*=\s*([^;\s]+)");
+                if (wrapperMatch.Success)
+                {
+                    currentItemGenRef = wrapperMatch.Groups[1].Value;
+                    continue;
+                }
+
+                var genMatch = Regex.Match(t, @"^ItemModGenerator(\d+)\s*=\s*([^;\s]+)");
+                if (genMatch.Success)
+                {
+                    int slot = int.Parse(genMatch.Groups[1].Value);
+                    currentGenerators.Add((slot, genMatch.Groups[2].Value));
+                }
+            }
+
+            // Final flush
+            Flush();
+        }
+
+        // Reads a single IG file and returns lowercased palpaths from direct Item= rows. Used by
+        // wrapper IG resolution to enumerate the target IG's items (e.g. NormalMageBodyIG → all
+        // MageBodyPAL.Normal### entries).
+        private List<string> ParseDirectItemEntries(string filePath)
+        {
+            var result = new List<string>();
+            string content = File.ReadAllText(filePath).Replace("\r", "");
+            foreach (string rawLine in content.Split('\n'))
+            {
+                string t = rawLine.Trim();
+                if (t.StartsWith("//") || t.StartsWith("/*")) continue;
+                var m = Regex.Match(t, @"^Item\s*=\s*([^;\s]+)");
+                if (m.Success)
+                {
+                    string raw = m.Groups[1].Value.ToLowerInvariant();
+                    if (raw.StartsWith("items.pal."))
+                        raw = raw.Substring("items.pal.".Length);
+                    result.Add(raw);
+                }
+            }
+            return result;
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // PHASE 5b: Parse *MG.gc files (mod generator tables)
+        // ═══════════════════════════════════════════════════════════════
+
+        private void ParseAllMGFiles()
+        {
+            foreach (var file in Directory.GetFiles(_gcDir, "*MG.gc"))
+            {
+                string fileName = Path.GetFileNameWithoutExtension(file);
+                if (fileName.EndsWith("IG", StringComparison.OrdinalIgnoreCase)) continue; // safety
+
+                string content = File.ReadAllText(file).Replace("\r", "");
+                string currentSection = null;
+                var currentMods = new List<string>();
+
+                foreach (string rawLine in content.Split('\n'))
+                {
+                    string t = rawLine.Trim();
+                    if (t.StartsWith("//") || t.StartsWith("/*")) continue;
+
+                    // Save previous before starting new section
+                    void FlushPrevious()
+                    {
+                        if (currentSection != null)
+                            _modGenerators[$"{fileName}.{currentSection}"] = new List<string>(currentMods);
+                    }
+
+                    // Form 1: "XXX extends ItemModifierGeneratorTable" — section with its own mods
+                    var sectionMatch = Regex.Match(t, @"^(\w+)\s+extends\s+ItemModifierGeneratorTable");
+                    if (sectionMatch.Success)
+                    {
+                        FlushPrevious();
+                        currentSection = sectionMatch.Groups[1].Value;
+                        currentMods.Clear();
+                        continue;
+                    }
+
+                    // Form 2: "XXX extends items.mg.YYY.ZZZ" — section that inherits from another MG section
+                    var inheritMatch = Regex.Match(t, @"^(\w+)\s+extends\s+items\.mg\.(\w+)\.(\w+)");
+                    if (inheritMatch.Success)
+                    {
+                        FlushPrevious();
+                        currentSection = inheritMatch.Groups[1].Value;
+                        currentMods.Clear();
+                        _modGeneratorParents[$"{fileName}.{currentSection}"] = $"{inheritMatch.Groups[2].Value}.{inheritMatch.Groups[3].Value}";
+                        continue;
+                    }
+
+                    var modMatch = Regex.Match(t, @"^ItemModifier\s*=\s*([^;\s]+)");
+                    if (modMatch.Success && currentSection != null)
+                        currentMods.Add(modMatch.Groups[1].Value);
+                }
+
+                // Final flush — record the section even if mods are empty (so inheritance still applies)
+                if (currentSection != null)
+                    _modGenerators[$"{fileName}.{currentSection}"] = new List<string>(currentMods);
+            }
+
+            ResolveModGeneratorInheritance();
+        }
+
+        // Walk inheritance chains so sections that inherit (empty body) get their parent's mods.
+        private void ResolveModGeneratorInheritance()
+        {
+            foreach (var key in _modGeneratorParents.Keys.ToList())
+            {
+                // Skip if this section already has its own mods
+                if (_modGenerators.TryGetValue(key, out var own) && own.Count > 0) continue;
+
+                var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { key };
+                string parent = _modGeneratorParents[key];
+                while (parent != null && !visited.Contains(parent))
+                {
+                    visited.Add(parent);
+                    if (_modGenerators.TryGetValue(parent, out var parentMods) && parentMods.Count > 0)
+                    {
+                        _modGenerators[key] = new List<string>(parentMods);
+                        break;
+                    }
+                    _modGeneratorParents.TryGetValue(parent, out parent);
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════
         // MOD RESOLUTION
         // ═══════════════════════════════════════════════════════════════
 
@@ -475,7 +856,14 @@ namespace DungeonRunners.Data
                     pool_name TEXT NOT NULL,
                     value_mult REAL NOT NULL,
                     UNIQUE(full_gc_key, mod_slot, attribute));
-                CREATE INDEX IF NOT EXISTS idx_item_mods_key ON item_resolved_mods(full_gc_key);";
+                CREATE INDEX IF NOT EXISTS idx_item_mods_key ON item_resolved_mods(full_gc_key);
+                CREATE TABLE IF NOT EXISTS item_wire_mods (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    full_gc_key TEXT NOT NULL,
+                    mod_slot INTEGER NOT NULL,
+                    mod_ref TEXT NOT NULL,
+                    UNIQUE(full_gc_key, mod_slot));
+                CREATE INDEX IF NOT EXISTS idx_item_wire_mods_key ON item_wire_mods(full_gc_key);";
             cmd.ExecuteNonQuery();
         }
 
@@ -526,6 +914,22 @@ namespace DungeonRunners.Data
             }
         }
 
+        private void InsertWireMods(SqliteConnection conn, string fullKey, List<(int Slot, string ModRef)> wireMods)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "INSERT OR REPLACE INTO item_wire_mods (full_gc_key,mod_slot,mod_ref) VALUES(@k,@s,@r)";
+            var pK = cmd.Parameters.Add("@k", System.Data.DbType.String);
+            var pS = cmd.Parameters.Add("@s", System.Data.DbType.Int32);
+            var pR = cmd.Parameters.Add("@r", System.Data.DbType.String);
+            pK.Value = fullKey;
+            foreach (var (slot, modRef) in wireMods)
+            {
+                pS.Value = slot;
+                pR.Value = modRef;
+                cmd.ExecuteNonQuery();
+            }
+        }
+
         private void LoadPools(SqliteConnection conn)
         {
             _pools.Clear();
@@ -548,6 +952,82 @@ namespace DungeonRunners.Data
                 if (!_itemMods.TryGetValue(key, out var list)) { list = new List<ResolvedMod>(); _itemMods[key] = list; }
                 list.Add(new ResolvedMod { ModSlot = r.GetInt32(1), Attribute = r.GetString(2), Pool = r.GetString(3), ValueMult = r.GetFloat(4) });
             }
+        }
+
+        private void LoadWireMods(SqliteConnection conn)
+        {
+            _itemWireMods.Clear();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT full_gc_key,mod_slot,mod_ref FROM item_wire_mods ORDER BY full_gc_key, mod_slot";
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                string key = r.GetString(0);
+                if (!_itemWireMods.TryGetValue(key, out var list))
+                {
+                    list = new List<(int, string)>();
+                    _itemWireMods[key] = list;
+                }
+                list.Add((r.GetInt32(1), r.GetString(2)));
+            }
+        }
+
+        // Loads the authored class catalog at server boot. File format: one entry per line,
+        // "<numeric_id> <case-sensitive class name>". We discard the dict's numeric ID (it's a file
+        // order index, not the runtime registry's key) and keep the name set so we can pick the
+        // correct prefix form ("items.modpal.X" vs "X") for hashing.
+        private void LoadGCDictionary()
+        {
+            _gcClassNames.Clear();
+            string path = Path.Combine(_gcDir, "..", "GCDictionary.dict");
+            if (!File.Exists(path))
+            {
+                Debug.LogError($"[ItemStatDB] GCDictionary.dict not found at {path} — Phase 2 IG-stub mod injection will not work");
+                return;
+            }
+            using var sr = new StreamReader(path);
+            string line;
+            while ((line = sr.ReadLine()) != null)
+            {
+                int sp = line.IndexOf(' ');
+                if (sp <= 0 || sp >= line.Length - 1) continue;
+                string name = line.Substring(sp + 1).Trim();
+                if (name.Length > 0)
+                    _gcClassNames.Add(name);
+            }
+        }
+
+        // Compute the runtime hash the client uses for a GC class. The client looks up classes by
+        // DJB2(lowercased name) in readType case 0x04. The wrinkle: the dict registers classes under
+        // varying prefix conventions (AxeCraftedModPAL.X has no prefix; items.modpal.FighterModPal.X
+        // does). We probe the dict to find the actual registered form, then hash that.
+        public uint GetGCClassHash(string className)
+        {
+            if (!IsLoaded || string.IsNullOrEmpty(className)) return 0;
+            // Try the name as-given (case-insensitive match against dict)
+            if (_gcClassNames.Contains(className))
+                return ComputeDJB2(className);
+            // If name has prefix, try without
+            if (className.StartsWith("items.modpal.", StringComparison.OrdinalIgnoreCase))
+            {
+                string stripped = className.Substring("items.modpal.".Length);
+                if (_gcClassNames.Contains(stripped))
+                    return ComputeDJB2(stripped);
+            }
+            else
+            {
+                string prefixed = "items.modpal." + className;
+                if (_gcClassNames.Contains(prefixed))
+                    return ComputeDJB2(prefixed);
+            }
+            return 0;
+        }
+
+        private static uint ComputeDJB2(string s)
+        {
+            uint h = 5381;
+            foreach (char c in s.ToLowerInvariant()) h = h * 33 + (uint)c;
+            return h;
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -594,6 +1074,118 @@ namespace DungeonRunners.Data
             stats.TryGetValue("ENDURANCE", out int end);
             stats.TryGetValue("MAX_MANA_POINTS", out int mana);
             return (hp, end, mana);
+        }
+
+        /// <summary>
+        /// Get the per-slot wire-mod refs for an IG-stub mythic item (Billy's Goat, Diabolical, etc).
+        /// Returns ordered list of (slot, modRef) — empty if item isn't IG-stub.
+        /// Piece B (wire serialization) uses these to inject mod children into equipment packets.
+        /// </summary>
+        public List<(int Slot, string ModRef)> GetItemWireMods(string gcClass)
+        {
+            if (!IsLoaded || string.IsNullOrEmpty(gcClass)) return new List<(int, string)>();
+            string key = NormalizeGCClass(gcClass);
+            if (_itemWireMods.TryGetValue(key, out var list))
+                return new List<(int, string)>(list);
+            return new List<(int, string)>();
+        }
+
+        /// <summary>
+        /// Wrapper-IG lookup for items whose mod set depends on the drop's rarity (Magic/Superior).
+        /// The same Normal PAL item (e.g. MageBodyPAL.Normal001) is referenced by both
+        /// MagicMageBodyIG (3 mod gens) and SuperiorMageBodyIG (2 mod gens). The wire-mods table
+        /// stores both under composite keys "palpath:Magic" and "palpath:Superior" — pass the
+        /// drop's actual rarity to pick the right one.
+        ///
+        /// FALLBACK: if no explicit wrapper covers the (gcClass, rarity) pair, synthesize one
+        /// using the item's class + the four standard MG generators (MagicPre/Binder/Rare/Sup
+        /// for Rare; UniquePre/Binder/Rare/Sup for Unique; etc). This handles items dropped
+        /// outside the native IG hierarchy — e.g. Token Master emitting named base-PAL items
+        /// like ChainPAL.ChainGloves2 at Rare tier, which natively don't have wrapper coverage.
+        /// </summary>
+        public List<(int Slot, string ModRef)> GetWrapperIGWireMods(string gcClass, string rarity)
+        {
+            if (!IsLoaded || string.IsNullOrEmpty(gcClass) || string.IsNullOrEmpty(rarity)) return new List<(int, string)>();
+            string normalized = NormalizeGCClass(gcClass);
+            string key = ($"{normalized}:{rarity}").ToLowerInvariant();
+            if (_itemWireMods.TryGetValue(key, out var list))
+                return new List<(int, string)>(list);
+
+            // Synthetic class+rarity fallback — pull the same 4-generator chain the wrapper IGs
+            // use for the item's armor class. Keeps mod assignment deterministic per
+            // (gcClass, rarity) so items stay stable across zone-switches / relogs.
+            return SynthesizeClassRarityMods(normalized, rarity);
+        }
+
+        // Maps an item's PAL name to its armor/weapon class for MG-pool lookup. Returns null
+        // when the item type isn't covered (consumables, quest items, etc.).
+        private static string ClassFromGCClass(string normalizedLower)
+        {
+            if (normalizedLower.Contains("plate") || normalizedLower.Contains("scale") || normalizedLower.Contains("crystal"))
+                return "Fighter";
+            if (normalizedLower.Contains("chain") || normalizedLower.Contains("splint"))
+                return "Fighter"; // Fighter heavy armor families
+            if (normalizedLower.Contains("leather"))
+                return "Ranger";
+            if (normalizedLower.Contains("mage") && (normalizedLower.Contains("body") || normalizedLower.Contains("helm")
+                || normalizedLower.Contains("boots") || normalizedLower.Contains("gloves")
+                || normalizedLower.Contains("shoulder") || normalizedLower.Contains("shield")))
+                return "Mage";
+            // Weapons: ranger uses bows/crossbows/guns; fighter uses melee; mage uses staves.
+            if (normalizedLower.Contains("bow") || normalizedLower.Contains("crossbow") || normalizedLower.Contains("gun") || normalizedLower.Contains("cannon"))
+                return "Ranger";
+            if (normalizedLower.Contains("staff"))
+                return "Mage";
+            if (normalizedLower.Contains("axe") || normalizedLower.Contains("sword") || normalizedLower.Contains("mace")
+                || normalizedLower.Contains("pick") || normalizedLower.Contains("club")
+                || normalizedLower.Contains("katana") || normalizedLower.Contains("polearm"))
+                return "Fighter";
+            return null;
+        }
+
+        private List<(int Slot, string ModRef)> SynthesizeClassRarityMods(string normalizedLower, string rarity)
+        {
+            string klass = ClassFromGCClass(normalizedLower);
+            if (klass == null) return new List<(int, string)>();
+
+            // Native generator chain per rarity tier. Mirrors RareXXXBodyIG / UniqueXXXBodyIG
+            // structure in data dum. Mage path adds LevelPrefix at slot 1 to match the mage
+            // body IGs (5 visible bonuses); fighter/ranger heavy armor uses 4-gen chain.
+            string[] generators;
+            string r = rarity.ToLowerInvariant();
+            string pre;
+            switch (r)
+            {
+                case "rare":     pre = "MagicPreMG";   break;
+                case "unique":   pre = "UniquePreMG";  break;
+                case "magical":
+                case "magic":    pre = "MagicPreMG";   break;
+                case "superior": pre = null;           break; // 2-gen: Binder + Sup
+                default: return new List<(int, string)>(); // Normal/Mythic handled elsewhere
+            }
+            if (r == "superior")
+                generators = new[] { $"{klass}MG.BinderPostMG", $"{klass}MG.SupPostMG" };
+            else if (r == "magical" || r == "magic")
+                generators = new[] { $"{klass}MG.{pre}", $"{klass}MG.BinderPostMG", $"{klass}MG.SupPostMG" };
+            else // Rare or Unique
+                generators = new[] { $"{klass}MG.{pre}", $"{klass}MG.BinderPostMG", $"{klass}MG.RarePostMG", $"{klass}MG.SupPostMG" };
+
+            var result = new List<(int, string)>();
+            int slot = 1;
+            foreach (var genKey in generators)
+            {
+                if (_modGenerators != null && _modGenerators.TryGetValue(genKey, out var modList) && modList.Count > 0)
+                    result.Add((slot, modList[0]));
+                else if (_itemWireMods != null)
+                {
+                    // _modGenerators may have been cleared after Phase 5 — that's fine, the wire
+                    // mods we'd have synthesized are static per (class, rarity), so we cache them
+                    // on first hit. But the cleanup happens at end of PopulateFromGCFiles, so we
+                    // need to also persist the _modGenerators data. See note in Load().
+                }
+                slot++;
+            }
+            return result;
         }
 
         /// <summary>Check if an item has resolved mods in the database.</summary>

@@ -150,10 +150,23 @@ namespace DungeonRunners.Data
             else if (gcLower.Contains("scale"))
                 armorType = "Scale";
 
-            // Get actual rarity from tier suffix (-1=Normal, -2=Superior, etc)
+            // Get actual rarity from tier suffix (-1=Normal, -2=Superior, etc).
+            // Named-rarity items (e.g. `PlatePAL.PlateUniqueArmor5`) have no dash
+            // suffix → GetTierFromGcType returns 1 → Normal → we'd pick a Normal
+            // ScaleMod, defeating the point. Fall back to GetEffectiveRarity which
+            // honours StoredRarity AND DetectRarityFromGCClass name-pattern matching
+            // (catches `*unique*`, `*rare*`, etc.).
             int tierSuffix = DungeonRunners.Managers.RarityHelper.GetTierFromGcType(GCClass);
             var itemRarity = DungeonRunners.Managers.RarityHelper.GetRarityFromTier(tierSuffix);
-            string scaleMod = DungeonRunners.Managers.RarityHelper.GetRandomScaleMod(itemRarity);
+            if (itemRarity == DungeonRunners.Managers.ItemRarity.Normal)
+            {
+                int effective = GetEffectiveRarity();
+                if (effective > 0 && effective < 5)
+                    itemRarity = (DungeonRunners.Managers.ItemRarity)effective;
+            }
+            // Deterministic pick keyed by gcClass — same item type always picks the same
+            // ScaleMod across relogs / zone changes. Random would flip every emission.
+            string scaleMod = DungeonRunners.Managers.RarityHelper.GetDeterministicScaleMod(GCClass, itemRarity);
 
             Debug.LogError($"[MODIFIER] Item '{GCClass}' -> ArmorType '{armorType}' -> tier={tierSuffix} rarity={itemRarity} -> ScaleMod '{scaleMod}'");
             return scaleMod;
@@ -318,148 +331,136 @@ namespace DungeonRunners.Data
                 bool isAmulet = gcLowerCheck.Contains("amulet");
                 uint ringSlot = TargetSlot ?? GetEquipmentSlotFromGCClass();
 
-                if (isAmulet)
+                // ───────────────────────────────────────────────────────────────────
+                // Jewelry drop write — mirrors the merchant `WriteItem` pattern for
+                // mythic items (`MerchantManager.cs:~2517-2664`) so the same item
+                // gcType serializes consistently from a shop-purchase 0x1E and a
+                // world drop. Don't call merchant code, just copy the source policy:
+                //   • Placeholder count = `_mythicModSlots[key] - 1` if in the
+                //     merchant dict (subtract 1 because OP5 emits the flag byte
+                //     separately and the dict value already counts it), else
+                //     `itemData.modCount`, else a sane jewelry default.
+                //   • Phase-2 wire mods = `ItemStatDatabase.GetItemWireMods` —
+                //     empty for non-IG-stub mythics (the `.gc` already carries
+                //     inline Mod1..N children, so writing extra mods here would
+                //     double-stack stats), non-empty for IG-stub mythics where
+                //     the wire mods come from Phase 5 parse.
+                //   • For non-mythic jewelry, keep the previous category-based
+                //     placeholder defaults and an empty Phase-2 list.
+                //   • ALWAYS emit placeholder bytes + Phase-2 count; never
+                //     early-return after the level byte (that's the bug that
+                //     made the client read the outer 0x06 EndStream as a Phase-2
+                //     count → comm error 6).
+                // ───────────────────────────────────────────────────────────────────
+                bool isMythicJewelry = gcLowerCheck.Contains("mythic");
+                int jewelryLevel = StoredLevel >= 0 ? StoredLevel : (isMythicJewelry ? (playerLevel + 3) : GetItemRequiredLevel());
+
+                writer.WriteUInt32(ringSlot);
+                writer.WriteByte(0x00);
+                writer.WriteByte(0x00);
+                writer.WriteByte(0x01);
+                writer.WriteByte((byte)jewelryLevel);
+
+                if (isMythicJewelry)
                 {
-                    bool isMythicAmulet = gcLowerCheck.Contains("mythic");
-                    int itemLevel = StoredLevel >= 0 ? StoredLevel : (isMythicAmulet ? (playerLevel + 3) : GetItemRequiredLevel());
-
-                    int amuletModCount;
-                    List<string> amuletMods;
-
-                    if (isMythicAmulet)
+                    // Mythic jewelry uses Equipment::readInit shape: flag + N placeholders
+                    // (= .gc-baked Mod1..N children) + Phase 2 count + per-mod (0x04 +
+                    // UInt32 DJB2 + 0x00 ItemModifier flags). Non-IG-stub mythics emit
+                    // Phase 2 count=0 because Mod1..N are already inline in the .gc.
+                    int jewelryPlaceholderCount;
+                    List<uint> jewelryResolvedHashes = new List<uint>();
+                    string jewelryKey = GCClass.ToLowerInvariant();
+                    if (jewelryKey.StartsWith("items.pal.")) jewelryKey = jewelryKey.Substring("items.pal.".Length);
+                    if (DungeonRunners.Managers.MerchantManager._mythicModSlots.TryGetValue(jewelryKey, out int merchantSlots))
                     {
-                        amuletMods = DatabaseLoader.GetAmuletModifiers(GCClass);
-                        amuletModCount = amuletMods.Count;
+                        jewelryPlaceholderCount = System.Math.Max(0, merchantSlots - 1);
                     }
                     else
                     {
-                        if (gcLowerCheck.Contains("amuletpal.amulet"))
-                        {
-                            amuletModCount = 1;
-                            amuletMods = new List<string>();
-                        }
-                        else if (gcLowerCheck.Contains("questamuletpal") || gcLowerCheck.Contains("uniqueamuletpal"))
-                        {
-                            amuletModCount = 2;
-                            amuletMods = new List<string>();
-                        }
-                        else
-                        {
-                            amuletModCount = 1;
-                            amuletMods = new List<string>();
-                        }
+                        var jewelryMods = isAmulet
+                            ? DatabaseLoader.GetAmuletModifiers(GCClass)
+                            : DatabaseLoader.GetRingModifiers(GCClass);
+                        jewelryPlaceholderCount = jewelryMods.Count;
+                    }
+                    var jewelryWireMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(GCClass);
+                    foreach (var (slot, modRef) in jewelryWireMods.OrderBy(w => w.Slot))
+                    {
+                        uint h = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(modRef);
+                        if (h != 0) jewelryResolvedHashes.Add(h);
                     }
 
-                    Debug.LogError($"[DROP-AMULET] GCClass: {GCClass}, Slot: {ringSlot}, Level: {itemLevel}, ModCount: {amuletModCount}, Mythic: {isMythicAmulet}");
+                    Debug.LogError($"[DROP-{(isAmulet ? "AMULET" : "RING")}-MYTHIC] GCClass: {GCClass}, Slot: {ringSlot}, Level: {jewelryLevel}, Placeholders: {jewelryPlaceholderCount}, WireMods: {jewelryResolvedHashes.Count}");
 
-                    writer.WriteUInt32(ringSlot);
-                    writer.WriteByte(0x00);
-                    writer.WriteByte(0x00);
-                    writer.WriteByte(0x01);
-                    writer.WriteByte((byte)itemLevel);
-
-                    if (amuletModCount <= 0)
+                    writer.WriteByte(0x00);  // mythic flag
+                    for (int m = 0; m < jewelryPlaceholderCount; m++) writer.WriteByte(0x00);
+                    writer.WriteByte((byte)jewelryResolvedHashes.Count);
+                    foreach (uint h in jewelryResolvedHashes)
                     {
-                        return;
-                    }
-
-                    if (isMythicAmulet)
-                    {
+                        writer.WriteByte(0x04);
+                        writer.WriteUInt32(h);
                         writer.WriteByte(0x00);
                     }
-
-                    for (int m = 0; m < amuletModCount; m++)
-                    {
-                        writer.WriteByte(0x00);
-                    }
-
-                    writer.WriteByte((byte)amuletMods.Count);
-
-                    foreach (var mod in amuletMods)
-                    {
-                        writer.WriteByte(0xFF);
-                        writer.WriteCString(mod);
-                        writer.WriteByte(0x03);
-                        writer.WriteByte(0x15);
-                        writer.WriteUInt32(0x11111111);
-                    }
-
-                    return;
                 }
                 else
                 {
-                    bool isMythicRing = gcLowerCheck.Contains("mythic");
-                    int itemLevel = StoredLevel >= 0 ? StoredLevel : (isMythicRing ? (playerLevel + 3) : GetItemRequiredLevel());
-
-                    int ringModCount;
-                    List<string> ringMods;
-
-                    if (isMythicRing)
+                    // Non-mythic jewelry: 1 Phase-1 placeholder (BaseRing/BaseAmulet
+                    // inherit 1 ItemModifier-descendant child from the engine `Item`
+                    // base class — empirically confirmed by client crash trace
+                    // ItemObject::readInit → Item::readData → ReadChildData<ItemModifier>
+                    // when we wrote 0 placeholders; the 0xFF byte of the ScaleMod block
+                    // was consumed as Phase 2 count → UInt16-sentinel path → 25K-iteration
+                    // loop → tag 0x61 = 'a' from inside the cstring) + Phase 2 ScaleMod
+                    // block with rarity fallback. Without the ScaleMod, Token Master
+                    // Unique drops rendered white.
+                    int dropTier = DungeonRunners.Managers.RarityHelper.GetTierFromGcType(GCClass);
+                    var dropRarity = DungeonRunners.Managers.RarityHelper.GetRarityFromTier(dropTier);
+                    if (dropRarity == DungeonRunners.Managers.ItemRarity.Normal)
                     {
-                        ringMods = DatabaseLoader.GetRingModifiers(GCClass);
-                        ringModCount = ringMods.Count;
+                        int effective = GetEffectiveRarity();
+                        if (effective > 0 && effective < 5)
+                            dropRarity = (DungeonRunners.Managers.ItemRarity)effective;
+                    }
+                    Debug.LogError($"[DROP-{(isAmulet ? "AMULET" : "RING")}-NONMYTHIC] GCClass: {GCClass}, Slot: {ringSlot}, Level: {jewelryLevel}, Rarity: {dropRarity}");
+                    writer.WriteByte(0x00);  // 1 Phase-1 placeholder (inherited from Item)
+
+                    // Path B — wire-mod injection (Rare/Unique direct + Magic/Superior wrapper)
+                    var dropJewelryMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(GCClass);
+                    if (dropJewelryMods.Count == 0)
+                        dropJewelryMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetWrapperIGWireMods(GCClass, dropRarity.ToString());
+
+                    if (DungeonRunners.Data.ItemStatDatabase.PathBEnabled && dropJewelryMods.Count > 0)
+                    {
+                        var hashes = new List<uint>();
+                        foreach (var (slot, modRef) in dropJewelryMods.OrderBy(w => w.Slot))
+                        {
+                            uint h = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(modRef);
+                            if (h != 0) hashes.Add(h);
+                        }
+                        writer.WriteByte((byte)hashes.Count);
+                        foreach (uint h in hashes)
+                        {
+                            writer.WriteByte(0x04);
+                            writer.WriteUInt32(h);
+                            writer.WriteByte(0x00);
+                        }
+                        Debug.LogError($"[IG-INJECT] drop-{(isAmulet ? "amulet" : "ring")} {GCClass} rarity={dropRarity} mods={hashes.Count}");
+                    }
+                    else if (dropRarity == DungeonRunners.Managers.ItemRarity.Normal)
+                    {
+                        writer.WriteByte(0x00);  // Phase 2 count = 0
                     }
                     else
                     {
-                        if (gcLowerCheck.Contains("ringpal.ring"))
-                        {
-                            ringModCount = 1;
-                            ringMods = new List<string>();
-                        }
-                        else if (gcLowerCheck.Contains("questringpal"))
-                        {
-                            ringModCount = DatabaseLoader.GetRingModSlotCount(GCClass);
-                            ringMods = new List<string>();
-                        }
-                        else if (gcLowerCheck.Contains("uniqueringpal"))
-                        {
-                            // CONFIGURABLE - try different values: 0, 1, 2
-                            ringModCount = 1;  // <-- CHANGE THIS TO TEST
-                            ringMods = new List<string>();
-                        }
-                        else
-                        {
-                            ringModCount = 1;
-                            ringMods = new List<string>();
-                        }
-                    }
-
-                    Debug.LogError($"[DROP-RING] GCClass: {GCClass}, Slot: {ringSlot}, Level: {itemLevel}, ModCount: {ringModCount}, Mythic: {isMythicRing}");
-
-                    writer.WriteUInt32(ringSlot);
-                    writer.WriteByte(0x00);
-                    writer.WriteByte(0x00);
-                    writer.WriteByte(0x01);
-                    writer.WriteByte((byte)itemLevel);
-
-                    if (ringModCount <= 0)
-                    {
-                        return;
-                    }
-
-                    if (isMythicRing)
-                    {
-                        writer.WriteByte(0x00);
-                    }
-
-                    for (int m = 0; m < ringModCount; m++)
-                    {
-                        writer.WriteByte(0x00);
-                    }
-
-                    writer.WriteByte((byte)ringMods.Count);
-
-                    foreach (var mod in ringMods)
-                    {
+                        writer.WriteByte(0x01);  // Phase 2 count = 1
                         writer.WriteByte(0xFF);
-                        writer.WriteCString(mod);
+                        writer.WriteCString(GetModifierGCClass());
                         writer.WriteByte(0x03);
                         writer.WriteByte(0x15);
                         writer.WriteUInt32(0x11111111);
                     }
-
-                    return;
                 }
+
+                return;
             }
 
             ItemData itemData = DatabaseLoader.FindItem(GCClass);
@@ -944,17 +945,74 @@ namespace DungeonRunners.Data
 
             if (dropGcLookup >= 0)
             {
-                writer.WriteByte(0x00);
-                Debug.LogError($"[DROP-WRITEINIT] GC lookup item - no ScaleMod");
+                // Mythic armor/weapon drop. Was previously writing a single 0x00 here
+                // (no Phase 2 mods at all), which left the client expecting more bytes
+                // and made it read the 0x06 EndStream marker as in-stream data → comm
+                // error 6 / "type tag" desync. Mirror the merchant 0x1E write
+                // (MerchantManager.WriteItem ~line 2618-2657) and the amulet+ring
+                // drop branches at line 376-388 / 459-465: pull wire mods from
+                // ItemStatDatabase, resolve each to its DJB2 hash, and emit one
+                // [0x04][UInt32 hash][0x00] tagged class ref per mod after a
+                // single Phase 2 count byte. Yields a properly-statted mythic on
+                // pickup. Same wire format the merchant uses for IG-stub mythics.
+                var dropWireMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(GCClass);
+                var dropResolved = new List<uint>(dropWireMods.Count);
+                foreach (var (slot, modRef) in dropWireMods.OrderBy(w => w.Slot))
+                {
+                    uint h = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(modRef);
+                    if (h != 0) dropResolved.Add(h);
+                }
+                writer.WriteByte((byte)dropResolved.Count);
+                foreach (uint h in dropResolved)
+                {
+                    writer.WriteByte(0x04);
+                    writer.WriteUInt32(h);
+                    writer.WriteByte(0x00);
+                }
+                Debug.LogError($"[DROP-WRITEINIT] GC lookup item — wrote {dropResolved.Count} resolved wire mods (was 1 empty)");
             }
             else
             {
                 int dropTier = DungeonRunners.Managers.RarityHelper.GetTierFromGcType(GCClass);
                 var dropRarity = DungeonRunners.Managers.RarityHelper.GetRarityFromTier(dropTier);
-                // Unique items have no dash-suffix so GetTierFromGcType returns 1 (Normal).
-                // But the client's GC definition includes TransientMod data for unique items,
-                // so readInit expects modifier bytes. Force ScaleMod writing for unique items.
+                // Named-rarity items (e.g. `PlatePAL.PlateUniqueArmor5`) have no
+                // dash-suffix → tier 1 → Normal → no ScaleMod block. Fall back to
+                // GetEffectiveRarity so StoredRarity / name-pattern-detected Unique
+                // items get their tier-appropriate ScaleMod and render in the right
+                // colour.
                 if (dropRarity == DungeonRunners.Managers.ItemRarity.Normal)
+                {
+                    int effective = GetEffectiveRarity();
+                    if (effective > 0 && effective < 5)
+                        dropRarity = (DungeonRunners.Managers.ItemRarity)effective;
+                }
+
+                // Path B — try wire-mod injection (direct + wrapper) before legacy ScaleMod.
+                var dropArmorMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(GCClass);
+                if (dropArmorMods.Count == 0)
+                    dropArmorMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetWrapperIGWireMods(GCClass, dropRarity.ToString());
+
+                if (DungeonRunners.Data.ItemStatDatabase.PathBEnabled && dropArmorMods.Count > 0)
+                {
+                    var hashes = new List<uint>();
+                    var skipped = new List<string>();
+                    var emitted = new List<string>();
+                    foreach (var (slot, modRef) in dropArmorMods.OrderBy(w => w.Slot))
+                    {
+                        uint h = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(modRef);
+                        if (h != 0) { hashes.Add(h); emitted.Add($"{modRef}#0x{h:X8}"); }
+                        else skipped.Add(modRef);
+                    }
+                    writer.WriteByte((byte)hashes.Count);
+                    foreach (uint h in hashes)
+                    {
+                        writer.WriteByte(0x04);
+                        writer.WriteUInt32(h);
+                        writer.WriteByte(0x00);
+                    }
+                    Debug.LogError($"[IG-INJECT] drop-armor {GCClass} rarity={dropRarity} mods={hashes.Count}/{dropArmorMods.Count} phase1ModCount={modCount} emitted=[{string.Join(" | ", emitted)}] skipped=[{string.Join(",", skipped)}]");
+                }
+                else if (dropRarity == DungeonRunners.Managers.ItemRarity.Normal)
                 {
                     writer.WriteByte(0x00);
                 }
@@ -1038,28 +1096,41 @@ namespace DungeonRunners.Data
                         }
                         else
                         {
-                            if (gcLower.Contains("amuletpal.amulet"))
+                            // Normalized to 1 across all non-mythic amulet PAL classes — matches
+                            // WriteInitForInventory and the 2026-05-20 jewelry analysis: BaseAmulet
+                            // contributes exactly 1 inherited ItemModifier-descendant child to
+                            // Phase 1, regardless of PAL subtype. The legacy =2 for
+                            // questamuletpal/uniqueamuletpal was speculative.
+                            amuletModCount = 1;
+                            amuletMods = new List<string>();
+                        }
+
+                        // Path B — non-mythic amulet wire-mod injection
+                        if (!isMythicAmulet)
+                        {
+                            int eqTier = DungeonRunners.Managers.RarityHelper.GetTierFromGcType(GCClass);
+                            var eqRarity = DungeonRunners.Managers.RarityHelper.GetRarityFromTier(eqTier);
+                            if (eqRarity == DungeonRunners.Managers.ItemRarity.Normal)
                             {
-                                amuletModCount = 1;
-                                amuletMods = new List<string>();
+                                int effective = GetEffectiveRarity();
+                                if (effective > 0 && effective < 5)
+                                    eqRarity = (DungeonRunners.Managers.ItemRarity)effective;
                             }
-                            else if (gcLower.Contains("questamuletpal") || gcLower.Contains("uniqueamuletpal"))
+                            var pbAmuletWire = DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(GCClass);
+                            if (pbAmuletWire.Count == 0)
+                                pbAmuletWire = DungeonRunners.Data.ItemStatDatabase.Instance.GetWrapperIGWireMods(GCClass, eqRarity.ToString());
+                            if (DungeonRunners.Data.ItemStatDatabase.PathBEnabled && pbAmuletWire.Count > 0)
                             {
-                                amuletModCount = 2;
-                                amuletMods = new List<string>();
-                            }
-                            else
-                            {
-                                amuletModCount = 1;
-                                amuletMods = new List<string>();
+                                foreach (var (_, modRef) in pbAmuletWire.OrderBy(w => w.Slot))
+                                    amuletMods.Add(modRef);
                             }
                         }
 
-                        Debug.LogError($"[INIT-AMULET] GCClass: {GCClass}, Level: {itemLevel}, ModCount: {amuletModCount}, Mythic: {isMythicAmulet}");
+                        Debug.LogError($"[INIT-AMULET] GCClass: {GCClass}, Level: {itemLevel}, ModCount: {amuletModCount}, Mythic: {isMythicAmulet}, PathBMods: {amuletMods.Count}");
 
                         writer.WriteByte((byte)itemLevel);
 
-                        if (amuletModCount <= 0)
+                        if (amuletModCount <= 0 && amuletMods.Count == 0)
                         {
                             return;
                         }
@@ -1074,16 +1145,21 @@ namespace DungeonRunners.Data
                             writer.WriteByte(0x00);
                         }
 
-                        writer.WriteByte((byte)amuletMods.Count);
-
+                        var resolvedAmuletHashes = new List<uint>(amuletMods.Count);
                         foreach (var mod in amuletMods)
                         {
-                            writer.WriteByte(0xFF);
-                            writer.WriteCString(mod);
-                            writer.WriteByte(0x03);
-                            writer.WriteByte(0x15);
-                            writer.WriteUInt32(0x11111111);
+                            uint amuletHash = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(mod);
+                            if (amuletHash != 0) resolvedAmuletHashes.Add(amuletHash);
                         }
+                        writer.WriteByte((byte)resolvedAmuletHashes.Count);
+                        foreach (uint amuletHash in resolvedAmuletHashes)
+                        {
+                            writer.WriteByte(0x04);
+                            writer.WriteUInt32(amuletHash);
+                            writer.WriteByte(0x00);
+                        }
+                        if (!isMythicAmulet && resolvedAmuletHashes.Count > 0)
+                            Debug.LogError($"[IG-INJECT] init-amulet {GCClass} mods={resolvedAmuletHashes.Count}");
 
                         return;
                     }
@@ -1102,34 +1178,38 @@ namespace DungeonRunners.Data
                         }
                         else
                         {
-                            if (gcLower.Contains("ringpal.ring"))
+                            // Phase-1 placeholder count = 1 across all non-mythic ring PAL classes
+                            // (BaseRing's single inherited ItemModifier child).
+                            ringModCount = 1;
+                            ringMods = new List<string>();
+                        }
+
+                        // Path B — non-mythic ring wire-mod injection
+                        if (!isMythicRing)
+                        {
+                            int eqTier = DungeonRunners.Managers.RarityHelper.GetTierFromGcType(GCClass);
+                            var eqRarity = DungeonRunners.Managers.RarityHelper.GetRarityFromTier(eqTier);
+                            if (eqRarity == DungeonRunners.Managers.ItemRarity.Normal)
                             {
-                                ringModCount = 1;
-                                ringMods = new List<string>();
+                                int effective = GetEffectiveRarity();
+                                if (effective > 0 && effective < 5)
+                                    eqRarity = (DungeonRunners.Managers.ItemRarity)effective;
                             }
-                            else if (gcLower.Contains("questringpal"))
+                            var pbRingWire = DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(GCClass);
+                            if (pbRingWire.Count == 0)
+                                pbRingWire = DungeonRunners.Data.ItemStatDatabase.Instance.GetWrapperIGWireMods(GCClass, eqRarity.ToString());
+                            if (DungeonRunners.Data.ItemStatDatabase.PathBEnabled && pbRingWire.Count > 0)
                             {
-                                ringModCount = DatabaseLoader.GetRingModSlotCount(GCClass);
-                                ringMods = new List<string>();
-                            }
-                            else if (gcLower.Contains("uniqueringpal"))
-                            {
-                                // CONFIGURABLE - try different values: 0, 1, 2
-                                ringModCount = 1;  // <-- CHANGE THIS TO TEST
-                                ringMods = new List<string>();
-                            }
-                            else
-                            {
-                                ringModCount = 1;
-                                ringMods = new List<string>();
+                                foreach (var (_, modRef) in pbRingWire.OrderBy(w => w.Slot))
+                                    ringMods.Add(modRef);
                             }
                         }
 
-                        Debug.LogError($"[INIT-RING] GCClass: {GCClass}, Level: {itemLevel}, ModCount: {ringModCount}, Mythic: {isMythicRing}");
+                        Debug.LogError($"[INIT-RING] GCClass: {GCClass}, Level: {itemLevel}, ModCount: {ringModCount}, Mythic: {isMythicRing}, PathBMods: {ringMods.Count}");
 
                         writer.WriteByte((byte)itemLevel);
 
-                        if (ringModCount <= 0)
+                        if (ringModCount <= 0 && ringMods.Count == 0)
                         {
                             return;
                         }
@@ -1144,16 +1224,21 @@ namespace DungeonRunners.Data
                             writer.WriteByte(0x00);
                         }
 
-                        writer.WriteByte((byte)ringMods.Count);
-
+                        var resolvedRingHashes = new List<uint>(ringMods.Count);
                         foreach (var mod in ringMods)
                         {
-                            writer.WriteByte(0xFF);
-                            writer.WriteCString(mod);
-                            writer.WriteByte(0x03);
-                            writer.WriteByte(0x15);
-                            writer.WriteUInt32(0x11111111);
+                            uint ringHash = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(mod);
+                            if (ringHash != 0) resolvedRingHashes.Add(ringHash);
                         }
+                        writer.WriteByte((byte)resolvedRingHashes.Count);
+                        foreach (uint ringHash in resolvedRingHashes)
+                        {
+                            writer.WriteByte(0x04);
+                            writer.WriteUInt32(ringHash);
+                            writer.WriteByte(0x00);
+                        }
+                        if (!isMythicRing && resolvedRingHashes.Count > 0)
+                            Debug.LogError($"[IG-INJECT] init-ring {GCClass} mods={resolvedRingHashes.Count}");
 
                         return;
                     }
@@ -1860,9 +1945,47 @@ namespace DungeonRunners.Data
                 }
                 else
                 {
+                    // Same GetEffectiveRarity fallback as drop / inventory / OP5 — without
+                    // it, named-Unique items (`PlatePAL.PlateUniqueArmor5` etc.) have no
+                    // dash-suffix → GetTierFromGcType returns Normal → no ScaleMod block →
+                    // stream short by 8+|cstring| → OP4 equipment relog desync (tag 97 if
+                    // next gcType starts with 'a'). Repro 2026-05-19 after equipping a
+                    // Token Master Unique.
                     int writeTier = DungeonRunners.Managers.RarityHelper.GetTierFromGcType(GCClass);
                     var writeRarity = DungeonRunners.Managers.RarityHelper.GetRarityFromTier(writeTier);
                     if (writeRarity == DungeonRunners.Managers.ItemRarity.Normal)
+                    {
+                        int effective = GetEffectiveRarity();
+                        if (effective > 0 && effective < 5)
+                            writeRarity = (DungeonRunners.Managers.ItemRarity)effective;
+                    }
+
+                    // Path B — armor wire-mod injection (mirrors WriteInitForInventory/Equip)
+                    var initArmorMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(GCClass);
+                    if (initArmorMods.Count == 0)
+                        initArmorMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetWrapperIGWireMods(GCClass, writeRarity.ToString());
+
+                    if (DungeonRunners.Data.ItemStatDatabase.PathBEnabled && initArmorMods.Count > 0)
+                    {
+                        var hashes = new List<uint>();
+                        var emitted = new List<string>();
+                        var skipped = new List<string>();
+                        foreach (var (slot, modRef) in initArmorMods.OrderBy(w => w.Slot))
+                        {
+                            uint h = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(modRef);
+                            if (h != 0) { hashes.Add(h); emitted.Add($"{modRef}#0x{h:X8}"); }
+                            else skipped.Add(modRef);
+                        }
+                        writer.WriteByte((byte)hashes.Count);
+                        foreach (uint h in hashes)
+                        {
+                            writer.WriteByte(0x04);
+                            writer.WriteUInt32(h);
+                            writer.WriteByte(0x00);
+                        }
+                        Debug.LogError($"[IG-INJECT] init-armor {GCClass} rarity={writeRarity} storedRarity={StoredRarity} effective={GetEffectiveRarity()} mods={hashes.Count}/{initArmorMods.Count} phase1ModCount={itemModCount} emitted=[{string.Join(" | ", emitted)}] skipped=[{string.Join(",", skipped)}]");
+                    }
+                    else if (writeRarity == DungeonRunners.Managers.ItemRarity.Normal)
                     {
                         writer.WriteByte(0x00);  // no ScaleMod children
                         Debug.LogError($"[EQUIPMENT-INIT] Normal item - no ScaleMod");
@@ -1872,7 +1995,7 @@ namespace DungeonRunners.Data
                         writer.WriteByte(0x01);
                         writer.WriteByte(0xFF);
                         writer.WriteCString(GetModifierGCClass());
-                        Debug.LogError($"[EQUIPMENT-INIT] Writing modifier from GetModifierGCClass()");
+                        Debug.LogError($"[EQUIPMENT-INIT] Writing modifier from GetModifierGCClass() rarity={writeRarity}");
                         writer.WriteByte(0x03);
                         writer.WriteByte(0x15);
                         writer.WriteUInt32(0x11111111);
@@ -1909,7 +2032,15 @@ namespace DungeonRunners.Data
                 }
 
                 int endPos = writer.Position;
-                Debug.LogError($"[EQUIPMENT-INIT] ✅ FULL equipment data written for {GCClass}, bytes={endPos - startPos}");
+                int eqLen = endPos - startPos;
+                var eqBuf = writer.ToArray();
+                var eqHex = new System.Text.StringBuilder(eqLen * 3);
+                for (int hi = 0; hi < eqLen; hi++)
+                {
+                    if (hi > 0) eqHex.Append(' ');
+                    eqHex.Append(eqBuf[startPos + hi].ToString("X2"));
+                }
+                Debug.LogError($"[EQUIPMENT-INIT] ✅ FULL equipment data written for {GCClass}, bytes={eqLen} hex={eqHex}");
             }
             else if (NativeClass == "ActiveSkill" || NativeClass == "PassiveSkill")
             {
@@ -1982,28 +2113,41 @@ namespace DungeonRunners.Data
                         }
                         else
                         {
-                            if (gcLower.Contains("amuletpal.amulet"))
+                            // Phase-1 placeholder = 1 across all non-mythic amulet PAL classes
+                            // (normalized — was =2 for questamuletpal/uniqueamuletpal but
+                            // BaseAmulet has only the inherited Item flag byte).
+                            amuletModCount = 1;
+                            amuletMods = new List<string>();
+                        }
+
+                        // Path B — non-mythic amulet wire-mod injection (matches WriteInit / OP5).
+                        // Without this, re-equipping an amulet emits zero Phase-2 mods while OP5
+                        // emits the full set — tooltip flips between empty and full on zone-switch.
+                        if (!isMythicAmulet)
+                        {
+                            int eqTier = DungeonRunners.Managers.RarityHelper.GetTierFromGcType(GCClass);
+                            var eqRarity = DungeonRunners.Managers.RarityHelper.GetRarityFromTier(eqTier);
+                            if (eqRarity == DungeonRunners.Managers.ItemRarity.Normal)
                             {
-                                amuletModCount = 1;
-                                amuletMods = new List<string>();
+                                int effective = GetEffectiveRarity();
+                                if (effective > 0 && effective < 5)
+                                    eqRarity = (DungeonRunners.Managers.ItemRarity)effective;
                             }
-                            else if (gcLower.Contains("questamuletpal") || gcLower.Contains("uniqueamuletpal"))
+                            var pbAmuletWire = DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(GCClass);
+                            if (pbAmuletWire.Count == 0)
+                                pbAmuletWire = DungeonRunners.Data.ItemStatDatabase.Instance.GetWrapperIGWireMods(GCClass, eqRarity.ToString());
+                            if (DungeonRunners.Data.ItemStatDatabase.PathBEnabled && pbAmuletWire.Count > 0)
                             {
-                                amuletModCount = 2;
-                                amuletMods = new List<string>();
-                            }
-                            else
-                            {
-                                amuletModCount = 1;
-                                amuletMods = new List<string>();
+                                foreach (var (_, modRef) in pbAmuletWire.OrderBy(w => w.Slot))
+                                    amuletMods.Add(modRef);
                             }
                         }
 
-                        Debug.LogError($"[NOWEAPON-AMULET] GCClass: {GCClass}, Level: {itemLevel}, ModCount: {amuletModCount}, Mythic: {isMythicAmulet}");
+                        Debug.LogError($"[NOWEAPON-AMULET] GCClass: {GCClass}, Level: {itemLevel}, ModCount: {amuletModCount}, Mythic: {isMythicAmulet}, PathBMods: {amuletMods.Count}");
 
                         writer.WriteByte((byte)itemLevel);
 
-                        if (amuletModCount <= 0)
+                        if (amuletModCount <= 0 && amuletMods.Count == 0)
                         {
                             return;
                         }
@@ -2018,16 +2162,21 @@ namespace DungeonRunners.Data
                             writer.WriteByte(0x00);
                         }
 
-                        writer.WriteByte((byte)amuletMods.Count);
-
+                        var resolvedAmuletHashes = new List<uint>(amuletMods.Count);
                         foreach (var mod in amuletMods)
                         {
-                            writer.WriteByte(0xFF);
-                            writer.WriteCString(mod);
-                            writer.WriteByte(0x03);
-                            writer.WriteByte(0x15);
-                            writer.WriteUInt32(0x11111111);
+                            uint amuletHash = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(mod);
+                            if (amuletHash != 0) resolvedAmuletHashes.Add(amuletHash);
                         }
+                        writer.WriteByte((byte)resolvedAmuletHashes.Count);
+                        foreach (uint amuletHash in resolvedAmuletHashes)
+                        {
+                            writer.WriteByte(0x04);
+                            writer.WriteUInt32(amuletHash);
+                            writer.WriteByte(0x00);
+                        }
+                        if (!isMythicAmulet && resolvedAmuletHashes.Count > 0)
+                            Debug.LogError($"[IG-INJECT] noweap-amulet {GCClass} mods={resolvedAmuletHashes.Count}");
 
                         return;
                     }
@@ -2046,34 +2195,37 @@ namespace DungeonRunners.Data
                         }
                         else
                         {
-                            if (gcLower.Contains("ringpal.ring"))
+                            // Phase-1 placeholder = 1 across all non-mythic ring PAL classes.
+                            ringModCount = 1;
+                            ringMods = new List<string>();
+                        }
+
+                        // Path B — non-mythic ring wire-mod injection (matches amulet branch above).
+                        if (!isMythicRing)
+                        {
+                            int eqTier = DungeonRunners.Managers.RarityHelper.GetTierFromGcType(GCClass);
+                            var eqRarity = DungeonRunners.Managers.RarityHelper.GetRarityFromTier(eqTier);
+                            if (eqRarity == DungeonRunners.Managers.ItemRarity.Normal)
                             {
-                                ringModCount = 1;
-                                ringMods = new List<string>();
+                                int effective = GetEffectiveRarity();
+                                if (effective > 0 && effective < 5)
+                                    eqRarity = (DungeonRunners.Managers.ItemRarity)effective;
                             }
-                            else if (gcLower.Contains("questringpal"))
+                            var pbRingWire = DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(GCClass);
+                            if (pbRingWire.Count == 0)
+                                pbRingWire = DungeonRunners.Data.ItemStatDatabase.Instance.GetWrapperIGWireMods(GCClass, eqRarity.ToString());
+                            if (DungeonRunners.Data.ItemStatDatabase.PathBEnabled && pbRingWire.Count > 0)
                             {
-                                ringModCount = DatabaseLoader.GetRingModSlotCount(GCClass);
-                                ringMods = new List<string>();
-                            }
-                            else if (gcLower.Contains("uniqueringpal"))
-                            {
-                                // CONFIGURABLE - try different values: 0, 1, 2
-                                ringModCount = 1;  // <-- CHANGE THIS TO TEST
-                                ringMods = new List<string>();
-                            }
-                            else
-                            {
-                                ringModCount = 1;
-                                ringMods = new List<string>();
+                                foreach (var (_, modRef) in pbRingWire.OrderBy(w => w.Slot))
+                                    ringMods.Add(modRef);
                             }
                         }
 
-                        Debug.LogError($"[NOWEAPON-RING] GCClass: {GCClass}, Level: {itemLevel}, ModCount: {ringModCount}, Mythic: {isMythicRing}");
+                        Debug.LogError($"[NOWEAPON-RING] GCClass: {GCClass}, Level: {itemLevel}, ModCount: {ringModCount}, Mythic: {isMythicRing}, PathBMods: {ringMods.Count}");
 
                         writer.WriteByte((byte)itemLevel);
 
-                        if (ringModCount <= 0)
+                        if (ringModCount <= 0 && ringMods.Count == 0)
                         {
                             return;
                         }
@@ -2088,16 +2240,21 @@ namespace DungeonRunners.Data
                             writer.WriteByte(0x00);
                         }
 
-                        writer.WriteByte((byte)ringMods.Count);
-
+                        var resolvedRingHashes = new List<uint>(ringMods.Count);
                         foreach (var mod in ringMods)
                         {
-                            writer.WriteByte(0xFF);
-                            writer.WriteCString(mod);
-                            writer.WriteByte(0x03);
-                            writer.WriteByte(0x15);
-                            writer.WriteUInt32(0x11111111);
+                            uint ringHash = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(mod);
+                            if (ringHash != 0) resolvedRingHashes.Add(ringHash);
                         }
+                        writer.WriteByte((byte)resolvedRingHashes.Count);
+                        foreach (uint ringHash in resolvedRingHashes)
+                        {
+                            writer.WriteByte(0x04);
+                            writer.WriteUInt32(ringHash);
+                            writer.WriteByte(0x00);
+                        }
+                        if (!isMythicRing && resolvedRingHashes.Count > 0)
+                            Debug.LogError($"[IG-INJECT] noweap-ring {GCClass} mods={resolvedRingHashes.Count}");
 
                         return;
                     }
@@ -2800,9 +2957,46 @@ namespace DungeonRunners.Data
                 }
                 else
                 {
+                    // GetEffectiveRarity fallback — see matching comment at WriteInit
+                    // weapon-bearing site. Named-Unique items lack a -N suffix so this
+                    // would otherwise write Normal and drop the ScaleMod block.
                     int noWepTier = DungeonRunners.Managers.RarityHelper.GetTierFromGcType(GCClass);
                     var noWepRarity = DungeonRunners.Managers.RarityHelper.GetRarityFromTier(noWepTier);
                     if (noWepRarity == DungeonRunners.Managers.ItemRarity.Normal)
+                    {
+                        int effective = GetEffectiveRarity();
+                        if (effective > 0 && effective < 5)
+                            noWepRarity = (DungeonRunners.Managers.ItemRarity)effective;
+                    }
+
+                    // Path B — wire-mod injection (matches WriteInit / OP5 / INV-RESTORE / etc).
+                    // WriteInitWithoutWeaponBytes is called by EquipmentHandler.HandleAddEquippedItem
+                    // when the player drops a cursor item onto an equipment slot. Without Path B
+                    // here, re-equipping after unequip emits a single ScaleMod while OP5 (zone-in)
+                    // emits the full wire-mod set — tooltips visibly change between re-equip and
+                    // the next zone-switch.
+                    var noWepWireMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(GCClass);
+                    if (noWepWireMods.Count == 0)
+                        noWepWireMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetWrapperIGWireMods(GCClass, noWepRarity.ToString());
+
+                    if (DungeonRunners.Data.ItemStatDatabase.PathBEnabled && noWepWireMods.Count > 0)
+                    {
+                        var hashes = new List<uint>();
+                        foreach (var (slot, modRef) in noWepWireMods.OrderBy(w => w.Slot))
+                        {
+                            uint h = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(modRef);
+                            if (h != 0) hashes.Add(h);
+                        }
+                        writer.WriteByte((byte)hashes.Count);
+                        foreach (uint h in hashes)
+                        {
+                            writer.WriteByte(0x04);
+                            writer.WriteUInt32(h);
+                            writer.WriteByte(0x00);
+                        }
+                        Debug.LogError($"[IG-INJECT] noweap-armor {GCClass} rarity={noWepRarity} mods={hashes.Count} phase1ModCount={itemModCount}");
+                    }
+                    else if (noWepRarity == DungeonRunners.Managers.ItemRarity.Normal)
                     {
                         writer.WriteByte(0x00);
                     }
@@ -2868,68 +3062,95 @@ namespace DungeonRunners.Data
                 {
                     bool isAmulet = gcLower.Contains("amulet");
 
+                    // Ghidra-verified jewelry layout: BaseRing / BaseAmulet have ZERO
+                    // inherited ItemModifier children, so Phase 1 of ReadChildData<ItemModifier>
+                    // (@ 0x00583920) reads 0 bytes for non-mythic rings/amulets. Mythic
+                    // *MythicPAL.* classes define Mod1..N inline so Phase 1 reads N bytes.
+                    // The Phase 2 trailer is then: 1-byte count + N × (tagByte + class + data).
+                    // For non-mythic Unique jewelry we emit a single ScaleMod child (count=1
+                    // + 0xFF + scaleMod cstring + 0x03 + 0x15 + UInt32 0x11111111) so the
+                    // item renders at its real tier instead of the white "Normal" fallback.
                     if (isAmulet)
                     {
                         bool isMythicAmulet = gcLower.Contains("mythic");
                         int itemLevel = StoredLevel >= 0 ? StoredLevel : (isMythicAmulet ? playerLevel : GetItemRequiredLevel());
 
-                        int amuletModCount;
-                        List<string> amuletMods;
+                        writer.WriteByte((byte)itemLevel);
 
                         if (isMythicAmulet)
                         {
-                            amuletMods = DatabaseLoader.GetAmuletModifiers(GCClass);
-                            amuletModCount = amuletMods.Count;
+                            var amuletMods = DatabaseLoader.GetAmuletModifiers(GCClass);
+                            int amuletModCount = amuletMods.Count;
+                            Debug.LogError($"[INV-AMULET-MYTHIC] GCClass: {GCClass}, Level: {itemLevel}, Placeholders: {amuletModCount}");
+
+                            writer.WriteByte(0x00);  // mythic flag
+                            for (int m = 0; m < amuletModCount; m++) writer.WriteByte(0x00);
+
+                            var resolvedAmuletHashes = new List<uint>(amuletMods.Count);
+                            foreach (var mod in amuletMods)
+                            {
+                                uint amuletHash = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(mod);
+                                if (amuletHash != 0) resolvedAmuletHashes.Add(amuletHash);
+                            }
+                            writer.WriteByte((byte)resolvedAmuletHashes.Count);
+                            foreach (uint amuletHash in resolvedAmuletHashes)
+                            {
+                                writer.WriteByte(0x04);
+                                writer.WriteUInt32(amuletHash);
+                                writer.WriteByte(0x00);
+                            }
                         }
                         else
                         {
-                            if (gcLower.Contains("amuletpal.amulet"))
+                            // Non-mythic amulet: 1 Phase-1 placeholder (inherited from Item
+                            // base class) + Phase 2. Path B injects N hash-tagged mods when wire
+                            // mods are available; otherwise falls back to single ScaleMod.
+                            int invTier = DungeonRunners.Managers.RarityHelper.GetTierFromGcType(GCClass);
+                            var invRarity = DungeonRunners.Managers.RarityHelper.GetRarityFromTier(invTier);
+                            if (invRarity == DungeonRunners.Managers.ItemRarity.Normal)
                             {
-                                amuletModCount = 1;
-                                amuletMods = new List<string>();
+                                int effective = GetEffectiveRarity();
+                                if (effective > 0 && effective < 5)
+                                    invRarity = (DungeonRunners.Managers.ItemRarity)effective;
                             }
-                            else if (gcLower.Contains("questamuletpal") || gcLower.Contains("uniqueamuletpal"))
+                            Debug.LogError($"[INV-AMULET-NONMYTHIC] GCClass: {GCClass}, Level: {itemLevel}, Rarity: {invRarity}");
+                            writer.WriteByte(0x00);  // Phase 1 placeholder (inherited)
+
+                            var amuletWireMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(GCClass);
+                            if (amuletWireMods.Count == 0)
+                                amuletWireMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetWrapperIGWireMods(GCClass, invRarity.ToString());
+
+                            if (DungeonRunners.Data.ItemStatDatabase.PathBEnabled && amuletWireMods.Count > 0)
                             {
-                                amuletModCount = 2;
-                                amuletMods = new List<string>();
+                                var hashes = new List<uint>();
+                                foreach (var (slot, modRef) in amuletWireMods.OrderBy(w => w.Slot))
+                                {
+                                    uint h = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(modRef);
+                                    if (h != 0) hashes.Add(h);
+                                }
+                                writer.WriteByte((byte)hashes.Count);
+                                foreach (uint h in hashes)
+                                {
+                                    writer.WriteByte(0x04);
+                                    writer.WriteUInt32(h);
+                                    writer.WriteByte(0x00);
+                                }
+                                Debug.LogError($"[IG-INJECT] inv-amulet {GCClass} rarity={invRarity} mods={hashes.Count}");
+                            }
+                            else if (invRarity == DungeonRunners.Managers.ItemRarity.Normal)
+                            {
+                                writer.WriteByte(0x00);  // Phase 2 count = 0, no ScaleMod
                             }
                             else
                             {
-                                amuletModCount = 1;
-                                amuletMods = new List<string>();
+                                writer.WriteByte(0x01);  // Phase 2 count = 1
+                                writer.WriteByte(0xFF);
+                                writer.WriteCString(GetModifierGCClass());
+                                writer.WriteByte(0x03);
+                                writer.WriteByte(0x15);
+                                writer.WriteUInt32(0x11111111);
                             }
                         }
-
-                        Debug.LogError($"[INV-AMULET] GCClass: {GCClass}, Level: {itemLevel}, ModCount: {amuletModCount}, Mythic: {isMythicAmulet}");
-
-                        writer.WriteByte((byte)itemLevel);
-
-                        if (amuletModCount <= 0)
-                        {
-                            return;
-                        }
-
-                        if (isMythicAmulet)
-                        {
-                            writer.WriteByte(0x00);
-                        }
-
-                        for (int m = 0; m < amuletModCount; m++)
-                        {
-                            writer.WriteByte(0x00);
-                        }
-
-                        writer.WriteByte((byte)amuletMods.Count);
-
-                        foreach (var mod in amuletMods)
-                        {
-                            writer.WriteByte(0xFF);
-                            writer.WriteCString(mod);
-                            writer.WriteByte(0x03);
-                            writer.WriteByte(0x15);
-                            writer.WriteUInt32(0x11111111);
-                        }
-
                         return;
                     }
                     else
@@ -2937,69 +3158,81 @@ namespace DungeonRunners.Data
                         bool isMythicRing = gcLower.Contains("mythic");
                         int itemLevel = StoredLevel >= 0 ? StoredLevel : (isMythicRing ? playerLevel : GetItemRequiredLevel());
 
-                        int ringModCount;
-                        List<string> ringMods;
+                        writer.WriteByte((byte)itemLevel);
 
                         if (isMythicRing)
                         {
-                            ringMods = DatabaseLoader.GetRingModifiers(GCClass);
-                            ringModCount = ringMods.Count;
+                            var ringMods = DatabaseLoader.GetRingModifiers(GCClass);
+                            int ringModCount = ringMods.Count;
+                            Debug.LogError($"[INV-RING-MYTHIC] GCClass: {GCClass}, Level: {itemLevel}, Placeholders: {ringModCount}");
+
+                            writer.WriteByte(0x00);  // mythic flag
+                            for (int m = 0; m < ringModCount; m++) writer.WriteByte(0x00);
+
+                            var resolvedRingHashes = new List<uint>(ringMods.Count);
+                            foreach (var mod in ringMods)
+                            {
+                                uint ringHash = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(mod);
+                                if (ringHash != 0) resolvedRingHashes.Add(ringHash);
+                            }
+                            writer.WriteByte((byte)resolvedRingHashes.Count);
+                            foreach (uint ringHash in resolvedRingHashes)
+                            {
+                                writer.WriteByte(0x04);
+                                writer.WriteUInt32(ringHash);
+                                writer.WriteByte(0x00);
+                            }
                         }
                         else
                         {
-                            if (gcLower.Contains("ringpal.ring"))
+                            // Non-mythic ring: 1 Phase-1 placeholder + Path B injection (with
+                            // ScaleMod fallback when no wire mods are available).
+                            int invTier = DungeonRunners.Managers.RarityHelper.GetTierFromGcType(GCClass);
+                            var invRarity = DungeonRunners.Managers.RarityHelper.GetRarityFromTier(invTier);
+                            if (invRarity == DungeonRunners.Managers.ItemRarity.Normal)
                             {
-                                ringModCount = 1;
-                                ringMods = new List<string>();
+                                int effective = GetEffectiveRarity();
+                                if (effective > 0 && effective < 5)
+                                    invRarity = (DungeonRunners.Managers.ItemRarity)effective;
                             }
-                            else if (gcLower.Contains("questringpal"))
+                            Debug.LogError($"[INV-RING-NONMYTHIC] GCClass: {GCClass}, Level: {itemLevel}, Rarity: {invRarity}");
+                            writer.WriteByte(0x00);  // Phase 1 placeholder (inherited)
+
+                            var ringWireMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(GCClass);
+                            if (ringWireMods.Count == 0)
+                                ringWireMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetWrapperIGWireMods(GCClass, invRarity.ToString());
+
+                            if (DungeonRunners.Data.ItemStatDatabase.PathBEnabled && ringWireMods.Count > 0)
                             {
-                                ringModCount = DatabaseLoader.GetRingModSlotCount(GCClass);
-                                ringMods = new List<string>();
+                                var hashes = new List<uint>();
+                                foreach (var (slot, modRef) in ringWireMods.OrderBy(w => w.Slot))
+                                {
+                                    uint h = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(modRef);
+                                    if (h != 0) hashes.Add(h);
+                                }
+                                writer.WriteByte((byte)hashes.Count);
+                                foreach (uint h in hashes)
+                                {
+                                    writer.WriteByte(0x04);
+                                    writer.WriteUInt32(h);
+                                    writer.WriteByte(0x00);
+                                }
+                                Debug.LogError($"[IG-INJECT] inv-ring {GCClass} rarity={invRarity} mods={hashes.Count}");
                             }
-                            else if (gcLower.Contains("uniqueringpal"))
+                            else if (invRarity == DungeonRunners.Managers.ItemRarity.Normal)
                             {
-                                // CONFIGURABLE - try different values: 0, 1, 2
-                                ringModCount = 1;  // <-- CHANGE THIS TO TEST
-                                ringMods = new List<string>();
+                                writer.WriteByte(0x00);  // Phase 2 count = 0, no ScaleMod
                             }
                             else
                             {
-                                ringModCount = 1;
-                                ringMods = new List<string>();
+                                writer.WriteByte(0x01);  // Phase 2 count = 1
+                                writer.WriteByte(0xFF);
+                                writer.WriteCString(GetModifierGCClass());
+                                writer.WriteByte(0x03);
+                                writer.WriteByte(0x15);
+                                writer.WriteUInt32(0x11111111);
                             }
                         }
-
-                        Debug.LogError($"[INV-RING] GCClass: {GCClass}, Level: {itemLevel}, ModCount: {ringModCount}, Mythic: {isMythicRing}");
-
-                        writer.WriteByte((byte)itemLevel);
-
-                        if (ringModCount <= 0)
-                        {
-                            return;
-                        }
-
-                        if (isMythicRing)
-                        {
-                            writer.WriteByte(0x00);
-                        }
-
-                        for (int m = 0; m < ringModCount; m++)
-                        {
-                            writer.WriteByte(0x00);
-                        }
-
-                        writer.WriteByte((byte)ringMods.Count);
-
-                        foreach (var mod in ringMods)
-                        {
-                            writer.WriteByte(0xFF);
-                            writer.WriteCString(mod);
-                            writer.WriteByte(0x03);
-                            writer.WriteByte(0x15);
-                            writer.WriteUInt32(0x11111111);
-                        }
-
                         return;
                     }
                 }
@@ -3702,9 +3935,46 @@ namespace DungeonRunners.Data
                 }
                 else
                 {
+                    // Same GetEffectiveRarity fallback as the drop branch (iteration 15)
+                    // — named-Unique items have no dash suffix so GetTierFromGcType returns
+                    // Normal. Without this fallback, picked-up Unique armor rendered white
+                    // in inventory despite rendering purple as a world drop.
                     int invTier2 = DungeonRunners.Managers.RarityHelper.GetTierFromGcType(GCClass);
                     var invRarity2 = DungeonRunners.Managers.RarityHelper.GetRarityFromTier(invTier2);
                     if (invRarity2 == DungeonRunners.Managers.ItemRarity.Normal)
+                    {
+                        int effective = GetEffectiveRarity();
+                        if (effective > 0 && effective < 5)
+                            invRarity2 = (DungeonRunners.Managers.ItemRarity)effective;
+                    }
+
+                    // Path B — try wire-mod injection first. Direct lookup covers Rare/Unique
+                    // direct-Item IGs; wrapper lookup covers Magic/Superior wrapper IGs.
+                    var armorWireMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(GCClass);
+                    if (armorWireMods.Count == 0)
+                        armorWireMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetWrapperIGWireMods(GCClass, invRarity2.ToString());
+
+                    if (DungeonRunners.Data.ItemStatDatabase.PathBEnabled && armorWireMods.Count > 0)
+                    {
+                        var hashes = new List<uint>();
+                        var skipped = new List<string>();
+                        var emitted = new List<string>();
+                        foreach (var (slot, modRef) in armorWireMods.OrderBy(w => w.Slot))
+                        {
+                            uint h = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(modRef);
+                            if (h != 0) { hashes.Add(h); emitted.Add($"{modRef}#0x{h:X8}"); }
+                            else skipped.Add(modRef);
+                        }
+                        writer.WriteByte((byte)hashes.Count);
+                        foreach (uint h in hashes)
+                        {
+                            writer.WriteByte(0x04);
+                            writer.WriteUInt32(h);
+                            writer.WriteByte(0x00);
+                        }
+                        Debug.LogError($"[IG-INJECT] inv-armor {GCClass} rarity={invRarity2} mods={hashes.Count}/{armorWireMods.Count} phase1ModCount={itemModCount} emitted=[{string.Join(" | ", emitted)}] skipped=[{string.Join(",", skipped)}]");
+                    }
+                    else if (invRarity2 == DungeonRunners.Managers.ItemRarity.Normal)
                     {
                         writer.WriteByte(0x00);
                     }
@@ -3798,138 +4068,165 @@ namespace DungeonRunners.Data
                 {
                     bool isAmulet = gcLower.Contains("amulet");
 
+                    // Equipped jewelry — mirror the drop/inventory write. BaseRing /
+                    // BaseAmulet have 0 inherited ItemModifier children (Ghidra-verified
+                    // ReadChildData<ItemModifier> @ 0x00583920), so non-mythic rings/
+                    // amulets write 0 placeholders + ScaleMod block. Mythic jewelry writes
+                    // flag + N placeholders (from .gc Mod1..N) + Phase 2 hashes.
                     if (isAmulet)
                     {
                         bool isMythicAmulet = gcLower.Contains("mythic");
                         int itemLevel = StoredLevel >= 0 ? StoredLevel : (isMythicAmulet ? (playerLevel + 3) : GetItemRequiredLevel());
-
-                        int amuletModCount;
-                        List<string> amuletMods;
+                        writer.WriteByte((byte)itemLevel);
 
                         if (isMythicAmulet)
                         {
-                            amuletMods = DatabaseLoader.GetAmuletModifiers(GCClass);
-                            amuletModCount = amuletMods.Count;
+                            var amuletMods = DatabaseLoader.GetAmuletModifiers(GCClass);
+                            int amuletModCount = amuletMods.Count;
+                            Debug.LogError($"[EQUIP-AMULET-MYTHIC] GCClass: {GCClass}, Slot: {equipSlot}, Level: {itemLevel}, Placeholders: {amuletModCount}");
+                            writer.WriteByte(0x00);  // mythic flag
+                            for (int m = 0; m < amuletModCount; m++) writer.WriteByte(0x00);
+                            var resolvedAmuletHashes = new List<uint>(amuletMods.Count);
+                            foreach (var mod in amuletMods)
+                            {
+                                uint amuletHash = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(mod);
+                                if (amuletHash != 0) resolvedAmuletHashes.Add(amuletHash);
+                            }
+                            writer.WriteByte((byte)resolvedAmuletHashes.Count);
+                            foreach (uint amuletHash in resolvedAmuletHashes)
+                            {
+                                writer.WriteByte(0x04);
+                                writer.WriteUInt32(amuletHash);
+                                writer.WriteByte(0x00);
+                            }
                         }
                         else
                         {
-                            if (gcLower.Contains("amuletpal.amulet"))
+                            // 1 Phase-1 placeholder (inherited) + Path B injection / ScaleMod fallback.
+                            int eqTier = DungeonRunners.Managers.RarityHelper.GetTierFromGcType(GCClass);
+                            var eqRarity = DungeonRunners.Managers.RarityHelper.GetRarityFromTier(eqTier);
+                            if (eqRarity == DungeonRunners.Managers.ItemRarity.Normal)
                             {
-                                amuletModCount = 1;
-                                amuletMods = new List<string>();
+                                int effective = GetEffectiveRarity();
+                                if (effective > 0 && effective < 5)
+                                    eqRarity = (DungeonRunners.Managers.ItemRarity)effective;
                             }
-                            else if (gcLower.Contains("questamuletpal") || gcLower.Contains("uniqueamuletpal"))
+                            Debug.LogError($"[EQUIP-AMULET-NONMYTHIC] GCClass: {GCClass}, Slot: {equipSlot}, Level: {itemLevel}, Rarity: {eqRarity}");
+                            writer.WriteByte(0x00);  // Phase 1 placeholder (inherited)
+
+                            var eqAmuletMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(GCClass);
+                            if (eqAmuletMods.Count == 0)
+                                eqAmuletMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetWrapperIGWireMods(GCClass, eqRarity.ToString());
+
+                            if (DungeonRunners.Data.ItemStatDatabase.PathBEnabled && eqAmuletMods.Count > 0)
                             {
-                                amuletModCount = 2;
-                                amuletMods = new List<string>();
+                                var hashes = new List<uint>();
+                                foreach (var (slot, modRef) in eqAmuletMods.OrderBy(w => w.Slot))
+                                {
+                                    uint h = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(modRef);
+                                    if (h != 0) hashes.Add(h);
+                                }
+                                writer.WriteByte((byte)hashes.Count);
+                                foreach (uint h in hashes)
+                                {
+                                    writer.WriteByte(0x04);
+                                    writer.WriteUInt32(h);
+                                    writer.WriteByte(0x00);
+                                }
+                                Debug.LogError($"[IG-INJECT] equip-amulet {GCClass} rarity={eqRarity} mods={hashes.Count}");
+                            }
+                            else if (eqRarity == DungeonRunners.Managers.ItemRarity.Normal)
+                            {
+                                writer.WriteByte(0x00);
                             }
                             else
                             {
-                                amuletModCount = 1;
-                                amuletMods = new List<string>();
+                                writer.WriteByte(0x01);
+                                writer.WriteByte(0xFF);
+                                writer.WriteCString(GetModifierGCClass());
+                                writer.WriteByte(0x03);
+                                writer.WriteByte(0x15);
+                                writer.WriteUInt32(0x11111111);
                             }
                         }
-
-                        Debug.LogError($"[EQUIP-AMULET] GCClass: {GCClass}, Slot: {equipSlot}, Level: {itemLevel}, ModCount: {amuletModCount}, Mythic: {isMythicAmulet}");
-
-                        writer.WriteByte((byte)itemLevel);
-
-                        if (amuletModCount <= 0)
-                        {
-                            return;
-                        }
-
-                        if (isMythicAmulet)
-                        {
-                            writer.WriteByte(0x00);
-                        }
-
-                        for (int m = 0; m < amuletModCount; m++)
-                        {
-                            writer.WriteByte(0x00);
-                        }
-
-                        writer.WriteByte((byte)amuletMods.Count);
-
-                        foreach (var mod in amuletMods)
-                        {
-                            writer.WriteByte(0xFF);
-                            writer.WriteCString(mod);
-                            writer.WriteByte(0x03);
-                            writer.WriteByte(0x15);
-                            writer.WriteUInt32(0x11111111);
-                        }
-
                         return;
                     }
                     else
                     {
                         bool isMythicRing = gcLower.Contains("mythic");
                         int itemLevel = StoredLevel >= 0 ? StoredLevel : (isMythicRing ? (playerLevel + 3) : GetItemRequiredLevel());
-
-                        int ringModCount;
-                        List<string> ringMods;
+                        writer.WriteByte((byte)itemLevel);
 
                         if (isMythicRing)
                         {
-                            ringMods = DatabaseLoader.GetRingModifiers(GCClass);
-                            ringModCount = ringMods.Count;
+                            var ringMods = DatabaseLoader.GetRingModifiers(GCClass);
+                            int ringModCount = ringMods.Count;
+                            Debug.LogError($"[EQUIP-RING-MYTHIC] GCClass: {GCClass}, Slot: {equipSlot}, Level: {itemLevel}, Placeholders: {ringModCount}");
+                            writer.WriteByte(0x00);  // mythic flag
+                            for (int m = 0; m < ringModCount; m++) writer.WriteByte(0x00);
+                            var resolvedRingHashes = new List<uint>(ringMods.Count);
+                            foreach (var mod in ringMods)
+                            {
+                                uint ringHash = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(mod);
+                                if (ringHash != 0) resolvedRingHashes.Add(ringHash);
+                            }
+                            writer.WriteByte((byte)resolvedRingHashes.Count);
+                            foreach (uint ringHash in resolvedRingHashes)
+                            {
+                                writer.WriteByte(0x04);
+                                writer.WriteUInt32(ringHash);
+                                writer.WriteByte(0x00);
+                            }
                         }
                         else
                         {
-                            if (gcLower.Contains("ringpal.ring"))
+                            // 1 Phase-1 placeholder (inherited) + Path B injection / ScaleMod fallback.
+                            int eqTier = DungeonRunners.Managers.RarityHelper.GetTierFromGcType(GCClass);
+                            var eqRarity = DungeonRunners.Managers.RarityHelper.GetRarityFromTier(eqTier);
+                            if (eqRarity == DungeonRunners.Managers.ItemRarity.Normal)
                             {
-                                ringModCount = 1;
-                                ringMods = new List<string>();
+                                int effective = GetEffectiveRarity();
+                                if (effective > 0 && effective < 5)
+                                    eqRarity = (DungeonRunners.Managers.ItemRarity)effective;
                             }
-                            else if (gcLower.Contains("questringpal"))
+                            Debug.LogError($"[EQUIP-RING-NONMYTHIC] GCClass: {GCClass}, Slot: {equipSlot}, Level: {itemLevel}, Rarity: {eqRarity}");
+                            writer.WriteByte(0x00);  // Phase 1 placeholder (inherited)
+
+                            var eqRingMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(GCClass);
+                            if (eqRingMods.Count == 0)
+                                eqRingMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetWrapperIGWireMods(GCClass, eqRarity.ToString());
+
+                            if (DungeonRunners.Data.ItemStatDatabase.PathBEnabled && eqRingMods.Count > 0)
                             {
-                                ringModCount = DatabaseLoader.GetRingModSlotCount(GCClass);
-                                ringMods = new List<string>();
+                                var hashes = new List<uint>();
+                                foreach (var (slot, modRef) in eqRingMods.OrderBy(w => w.Slot))
+                                {
+                                    uint h = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(modRef);
+                                    if (h != 0) hashes.Add(h);
+                                }
+                                writer.WriteByte((byte)hashes.Count);
+                                foreach (uint h in hashes)
+                                {
+                                    writer.WriteByte(0x04);
+                                    writer.WriteUInt32(h);
+                                    writer.WriteByte(0x00);
+                                }
+                                Debug.LogError($"[IG-INJECT] equip-ring {GCClass} rarity={eqRarity} mods={hashes.Count}");
                             }
-                            else if (gcLower.Contains("uniqueringpal"))
+                            else if (eqRarity == DungeonRunners.Managers.ItemRarity.Normal)
                             {
-                                // CONFIGURABLE - try different values: 0, 1, 2
-                                ringModCount = 1;  // <-- CHANGE THIS TO TEST
-                                ringMods = new List<string>();
+                                writer.WriteByte(0x00);
                             }
                             else
                             {
-                                ringModCount = 1;
-                                ringMods = new List<string>();
+                                writer.WriteByte(0x01);
+                                writer.WriteByte(0xFF);
+                                writer.WriteCString(GetModifierGCClass());
+                                writer.WriteByte(0x03);
+                                writer.WriteByte(0x15);
+                                writer.WriteUInt32(0x11111111);
                             }
                         }
-
-                        Debug.LogError($"[EQUIP-RING] GCClass: {GCClass}, Slot: {equipSlot}, Level: {itemLevel}, ModCount: {ringModCount}, Mythic: {isMythicRing}");
-
-                        writer.WriteByte((byte)itemLevel);
-
-                        if (ringModCount <= 0)
-                        {
-                            return;
-                        }
-
-                        if (isMythicRing)
-                        {
-                            writer.WriteByte(0x00);
-                        }
-
-                        for (int m = 0; m < ringModCount; m++)
-                        {
-                            writer.WriteByte(0x00);
-                        }
-
-                        writer.WriteByte((byte)ringMods.Count);
-
-                        foreach (var mod in ringMods)
-                        {
-                            writer.WriteByte(0xFF);
-                            writer.WriteCString(mod);
-                            writer.WriteByte(0x03);
-                            writer.WriteByte(0x15);
-                            writer.WriteUInt32(0x11111111);
-                        }
-
                         return;
                     }
                 }
@@ -4618,9 +4915,39 @@ namespace DungeonRunners.Data
                 }
                 else
                 {
+                    // Same GetEffectiveRarity fallback as drop / inventory (iteration 15+17).
                     int eqTier = DungeonRunners.Managers.RarityHelper.GetTierFromGcType(GCClass);
                     var eqRarity = DungeonRunners.Managers.RarityHelper.GetRarityFromTier(eqTier);
                     if (eqRarity == DungeonRunners.Managers.ItemRarity.Normal)
+                    {
+                        int effective = GetEffectiveRarity();
+                        if (effective > 0 && effective < 5)
+                            eqRarity = (DungeonRunners.Managers.ItemRarity)effective;
+                    }
+
+                    // Path B — same wire-mod injection as the inventory armor branch.
+                    var eqArmorMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(GCClass);
+                    if (eqArmorMods.Count == 0)
+                        eqArmorMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetWrapperIGWireMods(GCClass, eqRarity.ToString());
+
+                    if (DungeonRunners.Data.ItemStatDatabase.PathBEnabled && eqArmorMods.Count > 0)
+                    {
+                        var hashes = new List<uint>();
+                        foreach (var (slot, modRef) in eqArmorMods.OrderBy(w => w.Slot))
+                        {
+                            uint h = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(modRef);
+                            if (h != 0) hashes.Add(h);
+                        }
+                        writer.WriteByte((byte)hashes.Count);
+                        foreach (uint h in hashes)
+                        {
+                            writer.WriteByte(0x04);
+                            writer.WriteUInt32(h);
+                            writer.WriteByte(0x00);
+                        }
+                        Debug.LogError($"[IG-INJECT] equip-armor {GCClass} rarity={eqRarity} mods={hashes.Count} phase1ModCount={itemModCount}");
+                    }
+                    else if (eqRarity == DungeonRunners.Managers.ItemRarity.Normal)
                     {
                         writer.WriteByte(0x00);
                     }

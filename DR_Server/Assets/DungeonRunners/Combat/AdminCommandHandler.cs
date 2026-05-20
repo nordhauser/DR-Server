@@ -369,8 +369,11 @@ namespace DungeonRunners.Combat
 
                 // ═══════════ LOCATION ═══════════
                 case "Location":
-                    onStatusMessage?.Invoke(conn,
-                        $"Admin: Pos=({conn.PlayerPosX:F1}, {conn.PlayerPosY:F1})");
+                    {
+                        string locMsg = $"Pos=({conn.PlayerPosX:F1}, {conn.PlayerPosY:F1}, {conn.PlayerPosZ:F1}) heading={conn.PlayerHeading:F0} zone={conn.CurrentZoneName ?? "?"}";
+                        onStatusMessage?.Invoke(conn, "Admin: " + locMsg);
+                        Debug.LogError($"[LOC] {conn.LoginName ?? conn.ConnId.ToString()} {locMsg}");
+                    }
                     break;
 
                 default:

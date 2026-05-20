@@ -151,6 +151,10 @@ namespace DungeonRunners.Database
                 // Add stored_level columns for fixed item levels (mythic items don't scale)
                 // -1 = legacy (compute from GCClass), >= 0 = permanent fixed level
                 try { ExecuteNonQuery(conn, "ALTER TABLE character_inventory ADD COLUMN stored_level INTEGER DEFAULT -1"); } catch { }
+
+                // Container ID for bank persistence: 11 (0x0B) = main inventory (default for all existing rows).
+                // 12 (0x0C) = bank page 1; 14-19 (0x0E-0x13) = bank pages 2-7. Trade container 13 (0x0D) not persisted.
+                try { ExecuteNonQuery(conn, "ALTER TABLE character_inventory ADD COLUMN container_id INTEGER DEFAULT 11"); } catch { }
                 try { ExecuteNonQuery(conn, "ALTER TABLE character_equipment ADD COLUMN stored_level INTEGER DEFAULT -1"); } catch { }
                 try { ExecuteNonQuery(conn, "ALTER TABLE dropped_items ADD COLUMN stored_level INTEGER DEFAULT -1"); } catch { }
 
@@ -183,6 +187,23 @@ namespace DungeonRunners.Database
                     rarity INTEGER DEFAULT 1,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )");
+
+                // Posses: created via /posse create, one row per posse. Member→posse link
+                // lives on characters.posse_id.
+                ExecuteNonQuery(conn, @"CREATE TABLE IF NOT EXISTS posses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    founder_character_id INTEGER NOT NULL,
+                    founded_at TEXT DEFAULT (datetime('now')),
+                    gold_paid INTEGER DEFAULT 0,
+                    FOREIGN KEY (founder_character_id) REFERENCES characters(id))");
+                try { ExecuteNonQuery(conn, "ALTER TABLE characters ADD COLUMN posse_id INTEGER DEFAULT 0"); Debug.LogError("[DB-MIGRATE] Added posse_id"); } catch { }
+                try { ExecuteNonQuery(conn, "ALTER TABLE characters ADD COLUMN posse_join_cooldown INTEGER DEFAULT 0"); Debug.LogError("[DB-MIGRATE] Added posse_join_cooldown"); } catch { }
+                try { ExecuteNonQuery(conn, "ALTER TABLE characters ADD COLUMN posse_rank_id INTEGER DEFAULT 1"); Debug.LogError("[DB-MIGRATE] Added posse_rank_id"); } catch { }
+                // Native posse rank scale is 1..10. Server explicitly stamps 10 for founders on /posse create
+                // and 1 for new joiners on accept-invite. Don't blanket-rewrite existing rows.
+                try { ExecuteNonQuery(conn, "ALTER TABLE posses ADD COLUMN motd TEXT DEFAULT ''"); Debug.LogError("[DB-MIGRATE] Added posses.motd"); } catch { }
+                try { ExecuteNonQuery(conn, "ALTER TABLE posses ADD COLUMN description TEXT DEFAULT ''"); Debug.LogError("[DB-MIGRATE] Added posses.description"); } catch { }
             }
         }
 

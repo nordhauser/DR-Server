@@ -590,6 +590,78 @@ namespace DungeonRunners.Networking
             return null;
         }
 
+        // Yields every currently-connected RRConnection (used by PosseManager when it needs to
+        // find a target player by character id, e.g., kick/invite recipients).
+        public IEnumerable<RRConnection> AllConnectedConnections()
+        {
+            foreach (var conn in _connections.Values)
+            {
+                if (!conn.IsConnected || string.IsNullOrEmpty(conn.LoginName)) continue;
+                yield return conn;
+            }
+        }
+
+        // Yields each online RRConnection whose selected character belongs to the given posse.
+        // Used by PosseManager to push CachedPosseFull updates to every member when posse state
+        // changes (rename, MOTD, member kick/promote/demote etc.).
+        public IEnumerable<RRConnection> GetConnectedMemberConnsForPosse(uint posseId)
+        {
+            if (posseId == 0) yield break;
+            foreach (var conn in _connections.Values)
+            {
+                if (!conn.IsConnected || string.IsNullOrEmpty(conn.LoginName)) continue;
+                if (!_selectedCharacter.TryGetValue(conn.LoginName, out var gcObj) || gcObj == null) continue;
+                var sc = CharacterRepository.GetCharacter(gcObj.Id);
+                if (sc != null && sc.posseId == posseId) yield return conn;
+            }
+        }
+
+        // Pushes the right CachedPosseInfo state to the client based on whether the
+        // character is in a posse. Called on login (HandleCharacterPlay) and the
+        // queue-bridge resend path.
+        private void SendPosseStateForCharacter(RRConnection conn, uint characterId,
+            Action<RRConnection, byte, byte, byte[]> sendCompressed)
+        {
+            try
+            {
+                var savedChar = CharacterRepository.GetCharacter(characterId);
+                if (savedChar != null && savedChar.posseId != 0)
+                {
+                    var posse = PosseRepository.GetPosse(savedChar.posseId);
+                    if (posse != null)
+                    {
+                        var memberNames = PosseRepository.MemberNames(posse.Id);
+                        var members = new List<(uint, string, bool)>(memberNames.Count);
+                        using (var dbConn = GameDatabase.GetConnection())
+                        using (var r = GameDatabase.ExecuteReader(dbConn,
+                            "SELECT id, name FROM characters WHERE posse_id = @pid ORDER BY id",
+                            ("@pid", (int)posse.Id)))
+                        {
+                            while (r.Read())
+                            {
+                                uint cid = (uint)r.GetInt32(0);
+                                string cname = r.GetString(1);
+                                members.Add((cid, cname, cid == posse.FounderCharacterId));
+                            }
+                        }
+                        Debug.LogError($"[POSSE-LOGIN] Restoring posse '{posse.Name}' id={posse.Id} ({members.Count} members) for {savedChar.name}");
+                        PosseManager.Instance.SendCachedPosseFull(conn, characterId, posse, members, sendCompressed, this);
+                        return;
+                    }
+                    Debug.LogError($"[POSSE-LOGIN] character id={characterId} has posse_id={savedChar.posseId} but row missing — falling back to no-posse state");
+                }
+                // No posse: do NOT send UpdateCachedPosse(0,0). Any UpdateCachedPosse sets bit 0
+                // of [PosseClient+0x128] ("have cached posse info"), which Tad's button check
+                // reads as "Already in a Posse!". ConnectionNotification alone (sent before this
+                // helper runs) is enough to unlock the Posse tab and /posse chat verbs.
+                Debug.LogError($"[POSSE-LOGIN] character id={characterId} has no posse — skipping cache push so Tad button reads 'eligible'");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[POSSE-LOGIN] SendPosseStateForCharacter error: {ex.Message}");
+            }
+        }
+
         // ═══════════════════════════════════════════════════════════════════
         // COMBAT SYSTEM METHODS
         // ═══════════════════════════════════════════════════════════════════
@@ -2301,24 +2373,36 @@ namespace DungeonRunners.Networking
         // INVENTORY ITEM TRACKING
         // ═══════════════════════════════════════════════════════════════════════════════
 
-        public void TrackInventoryItem(string connId, uint index, GCObject item, byte x, byte y)
+        // Container keys: 0x0B (main inv) maps to the raw connId to preserve all existing
+        // dict accesses across the codebase. Bank containers (0x0C, 0x0E-0x13) get suffixed keys.
+        // Bank pages are 10x14 (per Bank.gc); main inv is 10x8.
+        private static string InvKey(string connId, byte containerId)
+            => containerId == 0x0B ? connId : $"{connId}:0x{containerId:X2}";
+
+        private static bool IsBankContainer(byte containerId)
+            => containerId == 0x0C || (containerId >= 0x0E && containerId <= 0x13);
+
+        private static int ContainerHeight(byte containerId) => IsBankContainer(containerId) ? 14 : 8;
+        private const int CONTAINER_WIDTH = 10;
+
+        public void TrackInventoryItem(string connId, uint index, GCObject item, byte x, byte y, byte containerId = 0x0B)
         {
-            if (!_playerInventoryItems.ContainsKey(connId))
-                _playerInventoryItems[connId] = new Dictionary<uint, (GCObject, byte, byte)>();
-            _playerInventoryItems[connId][index] = (item, x, y);
-            Debug.LogError($"[INV-TRACK] Player {connId}: Index {index} = {item.GCClass} at ({x}, {y})");
+            string key = InvKey(connId, containerId);
+            if (!_playerInventoryItems.ContainsKey(key))
+                _playerInventoryItems[key] = new Dictionary<uint, (GCObject, byte, byte)>();
+            _playerInventoryItems[key][index] = (item, x, y);
+            Debug.LogError($"[INV-TRACK] Player {connId} container=0x{containerId:X2}: Index {index} = {item.GCClass} at ({x}, {y})");
         }
 
-        public (int x, int y) FindNextFreeInventorySlot(string connId, int width, int height)
+        public (int x, int y) FindNextFreeInventorySlot(string connId, int width, int height, byte containerId = 0x0B)
         {
-            const int INV_WIDTH = 10;
-            const int INV_HEIGHT = 8;
+            int invHeight = ContainerHeight(containerId);
 
-            for (byte y = 0; y <= INV_HEIGHT - height; y++)
+            for (byte y = 0; y <= invHeight - height; y++)
             {
-                for (byte x = 0; x <= INV_WIDTH - width; x++)
+                for (byte x = 0; x <= CONTAINER_WIDTH - width; x++)
                 {
-                    if (!IsInventorySlotOccupied(connId, x, y, width, height))
+                    if (!IsInventorySlotOccupied(connId, x, y, width, height, containerId))
                     {
                         return (x, y);
                     }
@@ -2330,18 +2414,20 @@ namespace DungeonRunners.Networking
 
         private Dictionary<string, Dictionary<uint, int>> _inventoryStackCounts = new Dictionary<string, Dictionary<uint, int>>();
 
-        public int GetStackCount(string connId, uint slot)
+        public int GetStackCount(string connId, uint slot, byte containerId = 0x0B)
         {
-            if (_inventoryStackCounts.ContainsKey(connId) && _inventoryStackCounts[connId].ContainsKey(slot))
-                return _inventoryStackCounts[connId][slot];
+            string key = InvKey(connId, containerId);
+            if (_inventoryStackCounts.ContainsKey(key) && _inventoryStackCounts[key].ContainsKey(slot))
+                return _inventoryStackCounts[key][slot];
             return 1;
         }
 
-        public void SetStackCount(string connId, uint slot, int count)
+        public void SetStackCount(string connId, uint slot, int count, byte containerId = 0x0B)
         {
-            if (!_inventoryStackCounts.ContainsKey(connId))
-                _inventoryStackCounts[connId] = new Dictionary<uint, int>();
-            _inventoryStackCounts[connId][slot] = count;
+            string key = InvKey(connId, containerId);
+            if (!_inventoryStackCounts.ContainsKey(key))
+                _inventoryStackCounts[key] = new Dictionary<uint, int>();
+            _inventoryStackCounts[key][slot] = count;
         }
 
         public void RemoveEquippedItem(string connId, uint slot)
@@ -2373,12 +2459,13 @@ namespace DungeonRunners.Networking
 
 
 
-        public (GCObject item, byte x, byte y)? GetAndRemoveInventoryItem(string connId, uint index)
+        public (GCObject item, byte x, byte y)? GetAndRemoveInventoryItem(string connId, uint index, byte containerId = 0x0B)
         {
-            if (_playerInventoryItems.ContainsKey(connId) && _playerInventoryItems[connId].ContainsKey(index))
+            string key = InvKey(connId, containerId);
+            if (_playerInventoryItems.ContainsKey(key) && _playerInventoryItems[key].ContainsKey(index))
             {
-                var data = _playerInventoryItems[connId][index];
-                _playerInventoryItems[connId].Remove(index);
+                var data = _playerInventoryItems[key][index];
+                _playerInventoryItems[key].Remove(index);
 
                 // Get item dimensions from database
                 ItemData itemData = DatabaseLoader.FindItem(data.item.GCClass);
@@ -2386,10 +2473,10 @@ namespace DungeonRunners.Networking
                 int height = itemData?.inventoryHeight ?? 1;
 
                 // Free ALL slots this item occupied
-                FreeInventorySlots(connId, data.x, data.y, width, height);
+                FreeInventorySlots(connId, data.x, data.y, width, height, containerId);
                 return data;
             }
-            Debug.LogError($"[INV-TRACK] ❌ No item at index {index}!");
+            Debug.LogError($"[INV-TRACK] ❌ No item at index {index} in container 0x{containerId:X2}!");
             return null;
         }
 
@@ -2397,13 +2484,15 @@ namespace DungeonRunners.Networking
 
 
 
-        public bool IsInventorySlotOccupied(string connId, byte x, byte y, int width, int height)
+        public bool IsInventorySlotOccupied(string connId, byte x, byte y, int width, int height, byte containerId = 0x0B)
         {
-            // Bounds check: item must fit within 10x6 grid
-            if (x + width > 10 || y + height > 8)
+            int invHeight = ContainerHeight(containerId);
+            // Bounds check
+            if (x + width > CONTAINER_WIDTH || y + height > invHeight)
                 return true;  // treat out-of-bounds as occupied
 
-            if (!_occupiedInventorySlots.ContainsKey(connId))
+            string key = InvKey(connId, containerId);
+            if (!_occupiedInventorySlots.ContainsKey(key))
                 return false;
 
             // Check ALL cells the item would occupy
@@ -2411,10 +2500,10 @@ namespace DungeonRunners.Networking
             {
                 for (int dy = 0; dy < height; dy++)
                 {
-                    int slotIndex = (y + dy) * 10 + (x + dx);
-                    if (_occupiedInventorySlots[connId].Contains(slotIndex))
+                    int slotIndex = (y + dy) * CONTAINER_WIDTH + (x + dx);
+                    if (_occupiedInventorySlots[key].Contains(slotIndex))
                     {
-                        Debug.LogError($"[INV-TRACK] ❌ Cell ({x + dx}, {y + dy}) is already occupied!");
+                        Debug.LogError($"[INV-TRACK] ❌ Cell ({x + dx}, {y + dy}) in container 0x{containerId:X2} is already occupied!");
                         return true;
                     }
                 }
@@ -2422,43 +2511,46 @@ namespace DungeonRunners.Networking
             return false;
         }
 
-        public void OccupyInventorySlots(string connId, byte x, byte y, int width, int height)
+        public void OccupyInventorySlots(string connId, byte x, byte y, int width, int height, byte containerId = 0x0B)
         {
-            if (!_occupiedInventorySlots.ContainsKey(connId))
-                _occupiedInventorySlots[connId] = new HashSet<int>();
+            string key = InvKey(connId, containerId);
+            if (!_occupiedInventorySlots.ContainsKey(key))
+                _occupiedInventorySlots[key] = new HashSet<int>();
 
             for (int dx = 0; dx < width; dx++)
             {
                 for (int dy = 0; dy < height; dy++)
                 {
-                    int slotIndex = (y + dy) * 10 + (x + dx);
-                    _occupiedInventorySlots[connId].Add(slotIndex);
+                    int slotIndex = (y + dy) * CONTAINER_WIDTH + (x + dx);
+                    _occupiedInventorySlots[key].Add(slotIndex);
                 }
             }
-            Debug.LogError($"[INV-TRACK] ✅ Occupied {width}x{height} slots starting at ({x}, {y})");
+            Debug.LogError($"[INV-TRACK] ✅ Occupied {width}x{height} slots starting at ({x}, {y}) in container 0x{containerId:X2}");
         }
 
-        public void FreeInventorySlots(string connId, byte x, byte y, int width, int height)
+        public void FreeInventorySlots(string connId, byte x, byte y, int width, int height, byte containerId = 0x0B)
         {
-            if (!_occupiedInventorySlots.ContainsKey(connId))
+            string key = InvKey(connId, containerId);
+            if (!_occupiedInventorySlots.ContainsKey(key))
                 return;
 
             for (int dx = 0; dx < width; dx++)
             {
                 for (int dy = 0; dy < height; dy++)
                 {
-                    int slotIndex = (y + dy) * 10 + (x + dx);
-                    _occupiedInventorySlots[connId].Remove(slotIndex);
+                    int slotIndex = (y + dy) * CONTAINER_WIDTH + (x + dx);
+                    _occupiedInventorySlots[key].Remove(slotIndex);
                 }
             }
-            Debug.LogError($"[INV-TRACK] ✅ Freed {width}x{height} slots starting at ({x}, {y})");
+            Debug.LogError($"[INV-TRACK] ✅ Freed {width}x{height} slots starting at ({x}, {y}) in container 0x{containerId:X2}");
         }
 
-        public (uint slot, GCObject item, byte x, byte y)? FindInventoryItemByGCClass(string connId, string gcClass)
+        public (uint slot, GCObject item, byte x, byte y)? FindInventoryItemByGCClass(string connId, string gcClass, byte containerId = 0x0B)
         {
-            if (!_playerInventoryItems.ContainsKey(connId)) return null;
+            string key = InvKey(connId, containerId);
+            if (!_playerInventoryItems.ContainsKey(key)) return null;
             string gcLower = gcClass.ToLower();
-            foreach (var kvp in _playerInventoryItems[connId])
+            foreach (var kvp in _playerInventoryItems[key])
             {
                 if (kvp.Value.Item1.GCClass.ToLower() == gcLower)
                     return (kvp.Key, kvp.Value.Item1, kvp.Value.Item2, kvp.Value.Item3);
@@ -2472,12 +2564,20 @@ namespace DungeonRunners.Networking
             var savedChar = CharacterRepository.GetCharacter(_selectedCharacter[conn.LoginName].Id);
             if (savedChar == null) return;
             savedChar.inventory.Clear();
-            if (_playerInventoryItems.ContainsKey(connId))
+
+            // Iterate every container: main inv (0x0B) and the 7 bank pages.
+            // Items are tagged with containerId so LoadInventory restores them to the right container.
+            byte[] saveContainers = { 0x0B, 0x0C, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13 };
+            foreach (byte cid in saveContainers)
             {
-                foreach (var kvp in _playerInventoryItems[connId])
+                string dictKey = InvKey(connId, cid);
+                if (!_playerInventoryItems.ContainsKey(dictKey)) continue;
+                foreach (var kvp in _playerInventoryItems[dictKey])
                 {
-                    int count = GetStackCount(connId, kvp.Key);
+                    int count = GetStackCount(connId, kvp.Key, cid);
+                    // Position conflicts only apply within the same container.
                     var posConflict = savedChar.inventory.Find(i =>
+                        i.containerId == cid &&
                         i.x == kvp.Value.Item2 &&
                         i.y == kvp.Value.Item3);
                     if (posConflict != null)
@@ -2487,7 +2587,6 @@ namespace DungeonRunners.Networking
                             posConflict.gcClass = kvp.Value.Item1.GCClass;
                             posConflict.count = count;
                         }
-                        // Preserve buy price
                         uint bpConflict = DungeonRunners.Managers.MerchantManager.GetBuyPrice(connId, kvp.Value.Item1.GCClass);
                         if (bpConflict > 0) posConflict.buyPrice = bpConflict;
                     }
@@ -2503,7 +2602,8 @@ namespace DungeonRunners.Networking
                             count = count,
                             buyPrice = bp,
                             rarity = kvp.Value.Item1.GetEffectiveRarity(),
-                            storedLevel = kvp.Value.Item1.StoredLevel
+                            storedLevel = kvp.Value.Item1.StoredLevel,
+                            containerId = cid
                         });
                     }
                 }
@@ -2595,8 +2695,15 @@ namespace DungeonRunners.Networking
 
         /// <summary>
         /// Removes quest item objectives from inventory on turn-in.
-        /// Uses UnitContainer submsg 0x1F — same packet as merchant shift+click sell.
-        /// Call BEFORE HandleTurnInConfirmed (which removes the quest from active list).
+        /// Stackable handling: decrements stack by obj.Required via 0x22 UpdateQuantity
+        /// when the remaining count is > 0, falls back to 0x1F full-row remove when the
+        /// stack hits zero (or for non-stackables). Crosses multiple stacks if the
+        /// requirement exceeds any one stack's count. Call BEFORE HandleTurnInConfirmed
+        /// (which drops the quest from the active list).
+        ///
+        /// Previously this used `GetAndRemoveInventoryItem` against the first matching
+        /// slot, which nuked a 50-stack of QuestItemPAL.Token when the wishing-well
+        /// objective only asked for 1 — see CHANGELOG_WISHING_WELL_2026-05-19.md.
         /// </summary>
         private void RemoveQuestItemsFromInventory(RRConnection conn, ActiveQuest completingQuest)
         {
@@ -2610,7 +2717,8 @@ namespace DungeonRunners.Networking
                 if (string.IsNullOrEmpty(obj.Target))
                     continue;
 
-                Debug.LogError($"[QUEST-ITEM-REMOVE] Looking for: {obj.Target} ({obj.Label})");
+                int remainingToRemove = Math.Max(1, obj.Required);
+                Debug.LogError($"[QUEST-ITEM-REMOVE] Looking for: {obj.Target} ({obj.Label}) ×{remainingToRemove}");
 
                 if (!_playerInventoryItems.ContainsKey(connId))
                 {
@@ -2618,20 +2726,19 @@ namespace DungeonRunners.Networking
                     continue;
                 }
 
-                uint? foundSlot = null;
+                // Snapshot slot ids first so we can mutate _playerInventoryItems during iteration.
+                var matchingSlots = new List<uint>();
                 foreach (var kvp in _playerInventoryItems[connId])
                 {
                     if (kvp.Value.item != null &&
                         kvp.Value.item.GCClass != null &&
                         kvp.Value.item.GCClass.Equals(obj.Target, StringComparison.OrdinalIgnoreCase))
                     {
-                        foundSlot = kvp.Key;
-                        Debug.LogError($"[QUEST-ITEM-REMOVE] FOUND '{kvp.Value.item.GCClass}' at slot {kvp.Key}");
-                        break;
+                        matchingSlots.Add(kvp.Key);
                     }
                 }
 
-                if (!foundSlot.HasValue)
+                if (matchingSlots.Count == 0)
                 {
                     Debug.LogError($"[QUEST-ITEM-REMOVE] NOT FOUND in inventory! Dumping all slots:");
                     foreach (var kvp in _playerInventoryItems[connId])
@@ -2639,34 +2746,64 @@ namespace DungeonRunners.Networking
                     continue;
                 }
 
-                // Remove from server tracking (frees grid slots too)
-                var removed = GetAndRemoveInventoryItem(connId, foundSlot.Value);
-                Debug.LogError($"[QUEST-ITEM-REMOVE] Server tracking removed: {removed.HasValue}");
-
-                // Persist to DB
-                SavePlayerInventory(conn);
-
-                // Send 0x1F packet to client — visually removes item from inventory
-                if (conn.UnitContainerId != 0)
+                foreach (uint slotId in matchingSlots)
                 {
-                    var writer = new LEWriter();
-                    writer.WriteByte(0x07);
+                    if (remainingToRemove <= 0) break;
 
-                    writer.WriteByte(0x35);
-                    writer.WriteUInt16(conn.UnitContainerId);
-                    writer.WriteByte(0x1F);
-                    writer.WriteUInt32(foundSlot.Value);
-                    writer.WriteByte(0x02);
-                    writer.WriteUInt32(0x00000000);
+                    int stack = GetStackCount(connId, slotId);
+                    if (stack <= 0) stack = 1;
 
-                    writer.WriteByte(0x06);
+                    if (stack > remainingToRemove)
+                    {
+                        // Stack survives — decrement count, send 0x22 UpdateQuantity.
+                        int newCount = stack - remainingToRemove;
+                        SetStackCount(connId, slotId, newCount);
+                        remainingToRemove = 0;
 
-                    byte[] packet = writer.ToArray();
-                    Debug.LogError($"[QUEST-ITEM-REMOVE] Sending 0x1F for slot {foundSlot.Value}: {BitConverter.ToString(packet)}");
-                    SendCompressedA(conn, 0x01, 0x0F, packet);
+                        if (conn.UnitContainerId != 0)
+                        {
+                            var qWriter = new LEWriter();
+                            qWriter.WriteByte(0x07);
+                            qWriter.WriteByte(0x35);
+                            qWriter.WriteUInt16(conn.UnitContainerId);
+                            qWriter.WriteByte(0x22);
+                            qWriter.WriteUInt32(slotId);
+                            qWriter.WriteByte((byte)(newCount > 255 ? 255 : newCount));
+                            WritePlayerEntitySynch(conn, qWriter);
+                            qWriter.WriteByte(0x06);
+                            SendCompressedA(conn, 0x01, 0x0F, qWriter.ToArray());
+                        }
+                        Debug.LogError($"[QUEST-ITEM-REMOVE] decremented slot {slotId}: {stack} → {newCount}");
+                    }
+                    else
+                    {
+                        // Stack consumed entirely — full-row remove via 0x1F.
+                        remainingToRemove -= stack;
+                        GetAndRemoveInventoryItem(connId, slotId);
+
+                        if (conn.UnitContainerId != 0)
+                        {
+                            var writer = new LEWriter();
+                            writer.WriteByte(0x07);
+                            writer.WriteByte(0x35);
+                            writer.WriteUInt16(conn.UnitContainerId);
+                            writer.WriteByte(0x1F);
+                            writer.WriteUInt32(slotId);
+                            writer.WriteByte(0x02);
+                            writer.WriteUInt32(0x00000000);
+                            writer.WriteByte(0x06);
+                            SendCompressedA(conn, 0x01, 0x0F, writer.ToArray());
+                        }
+                        Debug.LogError($"[QUEST-ITEM-REMOVE] consumed full stack at slot {slotId} (was {stack})");
+                    }
                 }
 
-                Debug.LogError($"[QUEST-ITEM-REMOVE] ✅ Removed {obj.Target} from slot {foundSlot.Value}");
+                if (remainingToRemove > 0)
+                {
+                    Debug.LogError($"[QUEST-ITEM-REMOVE] ⚠️ underflowed: {remainingToRemove}× {obj.Target} still needed but inventory exhausted");
+                }
+                SavePlayerInventory(conn);
+                Debug.LogError($"[QUEST-ITEM-REMOVE] ✅ done for {obj.Target}");
             }
         }
 
@@ -2731,6 +2868,365 @@ namespace DungeonRunners.Networking
             public readonly int Range;
             public GotoGCData(string zone, string entity, int range)
             { TargetZone = zone; TargetEntity = entity; Range = range; }
+        }
+
+        /// <summary>
+        /// Token Master reward picker. Maps (class, slot, tier) → a single
+        /// curated gcType drawn from the WishingWell* and TokenReward* IG
+        /// families authored in `Database/gc/`. Every gcType returned here
+        /// is verified bare in `Database/GCDictionary.dict` (no `items.pal.`
+        /// prefix — those are emitted by `GCObject.GetPacketGCClassFor`).
+        /// Returns "" when no mapping exists — caller skips the reward.
+        ///
+        ///   classKey: "fi" | "ma" | "rg" | "jewelry"
+        ///   slotKey:  "helm" | "boots" | "gloves" | "shoulders" | "shield"
+        ///             | "body" | "ring" | "amulet" | "1hweapon" | "2hweapon"
+        ///             | "jewelry"
+        ///   tier:     "rare" | "unique" | "mythic"
+        /// </summary>
+        private static string PickTokenRewardGcType(string classKey, string slotKey, string tier)
+        {
+            // Class-correct equipment per native TokenReward{Rare,Unique,Mythic}{Fighter,Mage,Ranger}IG.gc.
+            // Fighter wears Plate (Crystal/Scale also fighter armor per native);
+            // Ranger wears Leather (Chain/Splint also ranger per native);
+            // Mage uses MagePAL palettes (items.pal.MageHelmPAL.PrebuiltMythic001 etc.).
+            // Iteration 3 (2026-05-20): previous pass routed Mage→Crystal/Scale —
+            // those are FIGHTER armor per TokenRewardMythicFighterIG.gc. Native
+            // mage IGs (items.ig.mage.MythicMageBodyIG etc.) use MageBodyPAL /
+            // MageHelmPAL / MageGlovesPAL / MageBootsPAL / MageShouldersPAL /
+            // MageShieldPAL. The items.pal. prefix is added on-wire by
+            // GCObject.GetPacketGCClassFor (Mage* namespaces are in _itemsPalNamespaces).
+            // Rings/amulets are class-routed at Mythic tier per
+            // TokenRewardMythicRingIG / TokenRewardMythicAmuletIG. Unique/Rare
+            // jewelry stays class-agnostic — RingPAL/AmuletPAL base items carry
+            // no inherent class restriction (the binder came from MGs).
+
+            switch (slotKey)
+            {
+                case "ring":
+                    // Handcrafted Mythic ring routing per TokenRewardMythicRingIG.gc:
+                    //   Fighter active: Ring1, 2, 4, 6, 8, 9
+                    //   Mage active:    Ring3, 5, 11
+                    //   Ranger active:  Ring1, 7, 10
+                    // RingMythic12-17 are not in any class IG (handcrafted extras with
+                    // inline mods). Route by stat affinity:
+                    //   12 Shadow Queen (Intellect+ShadowDamage)  → mage
+                    //   13 Icicle Pop   (mixed+IceDamage)         → mage
+                    //   14 Won the Game (Agility+RangeDamage)     → ranger
+                    //   15 Balzack's    (Agility/Endurance+Range) → ranger
+                    //   16 Ratsputin's  (Agility/Endurance+Range) → ranger
+                    //   17 Manglefeet's (Intellect/Strength)      → fighter (hybrid)
+                    if (tier == "mythic") return classKey switch {
+                        "fi" => PickRandom("RingMythicPAL.RingMythic1","RingMythicPAL.RingMythic2","RingMythicPAL.RingMythic4","RingMythicPAL.RingMythic6","RingMythicPAL.RingMythic8","RingMythicPAL.RingMythic9","RingMythicPAL.RingMythic17"),
+                        "ma" => PickRandom("RingMythicPAL.RingMythic3","RingMythicPAL.RingMythic5","RingMythicPAL.RingMythic11","RingMythicPAL.RingMythic12","RingMythicPAL.RingMythic13"),
+                        "rg" => PickRandom("RingMythicPAL.RingMythic1","RingMythicPAL.RingMythic7","RingMythicPAL.RingMythic10","RingMythicPAL.RingMythic14","RingMythicPAL.RingMythic15","RingMythicPAL.RingMythic16"),
+                        _    => "RingMythicPAL.RingMythic1",
+                    };
+                    if (tier == "unique") return PickRandom("RingPAL.RingUnique1","RingPAL.RingUnique2","RingPAL.RingUnique3","RingPAL.RingUnique4","RingPAL.RingUnique5");
+                    return "RingPAL.Ring1";
+
+                case "amulet":
+                    // Handcrafted Mythic amulet routing per TokenRewardMythicAmuletIG.gc:
+                    //   Fighter active: Amulet4 (The Found One) — Agility/Strength
+                    //   Mage active:    Amulet2 (Country Fried), Amulet6 (Un-Holy Hand Grenade — Intellect/ManaRegen)
+                    //   Ranger active:  Amulet2 (Country Fried), Amulet5 (Glowstick — MaxMana/Poison)
+                    // Amulet1/3/7 commented out as "lame for mythic" in all native IGs;
+                    // include where stat affinity fits.
+                    if (tier == "mythic") return classKey switch {
+                        "fi" => PickRandom("AmuletMythicPAL.AmuletMythic4","AmuletMythicPAL.AmuletMythic7"),
+                        "ma" => PickRandom("AmuletMythicPAL.AmuletMythic2","AmuletMythicPAL.AmuletMythic6"),
+                        "rg" => PickRandom("AmuletMythicPAL.AmuletMythic2","AmuletMythicPAL.AmuletMythic5"),
+                        _    => "AmuletMythicPAL.AmuletMythic7",
+                    };
+                    if (tier == "unique") return PickRandom("AmuletPAL.AmuletUnique1","AmuletPAL.AmuletUnique2","AmuletPAL.AmuletUnique3","AmuletPAL.AmuletUnique4");
+                    return "AmuletPAL.Amulet1";
+
+                case "jewelry":
+                    return _lootRng.NextDouble() < 0.5
+                        ? PickTokenRewardGcType(classKey, "ring", tier)
+                        : PickTokenRewardGcType(classKey, "amulet", tier);
+
+                // Fighter armor: Plate + Scale + Crystal per TokenReward*FighterIG.gc.
+                // Ranger armor: Leather + Chain + Splint per TokenReward*RangerIG.gc.
+                // Mage armor: Mage*PAL palettes per items.ig.mage.*IG.gc.
+                // Items marked "MODS" carry inline mods (or inherit from a parent with
+                // inline mods). Items extending a Unique IG-stub parent (e.g.
+                // CrystalMythic*1000, SplintMythic*100/101) are excluded from Mythic
+                // pools because they wouldn't deliver mod stats.
+
+                case "helm":
+                    if (tier == "mythic") return classKey switch {
+                        "fi" => PickRandom("PlateMythicPAL.PlateMythicHelm1","PlateMythicPAL.PlateMythicHelm3","PlateMythicPAL.PlateMythicHelm4","PlateMythicPAL.PlateMythicHelm5","PlateMythicPAL.PlateMythicHelm6","PlateMythicPAL.PlateMythicHelm7","ScaleMythicPAL.ScaleMythicHelm1","ScaleMythicPAL.ScaleMythicHelm2","CrystalMythicPAL.CrystalMythicHelm1","CrystalMythicPAL.CrystalMythicHelm2"),
+                        "rg" => PickRandom("LeatherMythicPAL.LeatherMythicHelm1","LeatherMythicPAL.LeatherMythicHelm3","ChainMythicPAL.ChainMythicHelm1","SplintMythicPAL.SplintMythicHelm1"),
+                        _    => PickRandom("MageHelmPAL.PrebuiltMythic001","MageHelmPAL.PrebuiltMythic002","MageHelmPAL.PrebuiltMythic003","MageHelmPAL.PrebuiltMythic004","MageHelmPAL.PrebuiltMythic005"),
+                    };
+                    if (tier == "unique") return classKey switch {
+                        "fi" => PickRandom("PlatePAL.PlateUniqueHelm1","PlatePAL.PlateUniqueHelm2","PlatePAL.PlateUniqueHelm3","PlatePAL.PlateUniqueHelm4","PlatePAL.PlateUniqueHelm5","PlatePAL.PlateUniqueHelm6","PlatePAL.PlateUniqueHelm7","ScalePAL.ScaleUniqueHelm1","ScalePAL.ScaleUniqueHelm2","CrystalPAL.CrystalUniqueHelm1","CrystalPAL.CrystalUniqueHelm2","CrystalPAL.CrystalUniqueHelm3","CrystalPAL.CrystalUniqueHelm4"),
+                        "rg" => PickRandom("LeatherPAL.LeatherUniqueHelm1","LeatherPAL.LeatherUniqueHelm3","ChainPAL.ChainUniqueHelm1","ChainPAL.ChainUniqueHelm3","SplintPAL.SplintUniqueHelm1","SplintPAL.SplintUniqueHelm2","SplintPAL.SplintUniqueHelm3"),
+                        _    => PickRandom("MageHelmPAL.Unique001","MageHelmPAL.Unique002","MageHelmPAL.Unique003","MageHelmPAL.Unique004","MageHelmPAL.Unique005","MageHelmPAL.Unique006"),
+                    };
+                    return classKey switch {
+                        "fi" => PickRandom("PlatePAL.PlateHelm0","PlatePAL.PlateHelm1","PlatePAL.PlateHelm2","PlatePAL.PlateHelm3","ScalePAL.ScaleHelm1","ScalePAL.ScaleHelm2","CrystalPAL.CrystalHelm1"),
+                        "rg" => PickRandom("LeatherPAL.LeatherHelm1","LeatherPAL.LeatherHelm5","ChainPAL.ChainHelm1","ChainPAL.ChainHelm2","ChainPAL.ChainHelm3","SplintPAL.SplintHelm1","SplintPAL.SplintHelm2"),
+                        _    => PickRandom("MageHelmPAL.Rare001","MageHelmPAL.Rare002","MageHelmPAL.Rare003"),
+                    };
+
+                case "boots":
+                    if (tier == "mythic") return classKey switch {
+                        "fi" => PickRandom("PlateMythicPAL.PlateMythicBoots1","PlateMythicPAL.PlateMythicBoots3","PlateMythicPAL.PlateMythicBoots5","ScaleMythicPAL.ScaleMythicBoots1","CrystalMythicPAL.CrystalMythicBoots1","CrystalMythicPAL.CrystalMythicBoots2"),
+                        "rg" => PickRandom("LeatherMythicPAL.LeatherMythicBoots1","LeatherMythicPAL.LeatherMythicBoots2","LeatherMythicPAL.LeatherMythicBoots3","ChainMythicPAL.ChainMythicBoots1","SplintMythicPAL.SplintMythicBoots1"),
+                        _    => PickRandom("MageBootsPAL.PrebuiltMythic001","MageBootsPAL.PrebuiltMythic002","MageBootsPAL.PrebuiltMythic003","MageBootsPAL.PrebuiltMythic004","MageBootsPAL.PrebuiltMythic005"),
+                    };
+                    if (tier == "unique") return classKey switch {
+                        "fi" => PickRandom("PlatePAL.PlateUniqueBoots1","PlatePAL.PlateUniqueBoots2","PlatePAL.PlateUniqueBoots3","PlatePAL.PlateUniqueBoots4","PlatePAL.PlateUniqueBoots5","ScalePAL.ScaleUniqueBoots1","CrystalPAL.CrystalUniqueBoots1","CrystalPAL.CrystalUniqueBoots2","CrystalPAL.CrystalUniqueBoots3","CrystalPAL.CrystalUniqueBoots4"),
+                        "rg" => PickRandom("LeatherPAL.LeatherUniqueBoots1","LeatherPAL.LeatherUniqueBoots3","ChainPAL.ChainUniqueBoots1","ChainPAL.ChainUniqueBoots3","SplintPAL.SplintUniqueBoots1","SplintPAL.SplintUniqueBoots2","SplintPAL.SplintUniqueBoots3"),
+                        _    => PickRandom("MageBootsPAL.Unique001","MageBootsPAL.Unique002","MageBootsPAL.Unique003","MageBootsPAL.Unique004","MageBootsPAL.Unique005","MageBootsPAL.Unique006"),
+                    };
+                    return classKey switch {
+                        "fi" => PickRandom("PlatePAL.PlateBoots0","PlatePAL.PlateBoots1","PlatePAL.PlateBoots2","PlatePAL.PlateBoots3","ScalePAL.ScaleBoots1","ScalePAL.ScaleBoots2","CrystalPAL.CrystalBoots1"),
+                        "rg" => PickRandom("LeatherPAL.LeatherBoots1","LeatherPAL.LeatherBoots5","ChainPAL.ChainBoots1","ChainPAL.ChainBoots2","ChainPAL.ChainBoots3","SplintPAL.SplintBoots1","SplintPAL.SplintBoots2"),
+                        _    => PickRandom("MageBootsPAL.Rare001","MageBootsPAL.Rare002","MageBootsPAL.Rare003"),
+                    };
+
+                case "gloves":
+                    if (tier == "mythic") return classKey switch {
+                        "fi" => PickRandom("PlateMythicPAL.PlateMythicGloves1","PlateMythicPAL.PlateMythicGloves3","PlateMythicPAL.PlateMythicGloves5","ScaleMythicPAL.ScaleMythicGloves1","CrystalMythicPAL.CrystalMythicGloves1","CrystalMythicPAL.CrystalMythicGloves2"),
+                        "rg" => PickRandom("LeatherMythicPAL.LeatherMythicGloves1","LeatherMythicPAL.LeatherMythicGloves3","LeatherMythicPAL.LeatherMythicGloves4","ChainMythicPAL.ChainMythicGloves1","SplintMythicPAL.SplintMythicGloves1"),
+                        _    => PickRandom("MageGlovesPAL.PrebuiltMythic001","MageGlovesPAL.PrebuiltMythic002","MageGlovesPAL.PrebuiltMythic003","MageGlovesPAL.PrebuiltMythic004"),
+                    };
+                    if (tier == "unique") return classKey switch {
+                        "fi" => PickRandom("PlatePAL.PlateUniqueGloves1","PlatePAL.PlateUniqueGloves3","PlatePAL.PlateUniqueGloves4","PlatePAL.PlateUniqueGloves5","ScalePAL.ScaleUniqueGloves1","CrystalPAL.CrystalUniqueGloves1","CrystalPAL.CrystalUniqueGloves2","CrystalPAL.CrystalUniqueGloves3","CrystalPAL.CrystalUniqueGloves4"),
+                        "rg" => PickRandom("LeatherPAL.LeatherUniqueGloves1","LeatherPAL.LeatherUniqueGloves3","ChainPAL.ChainUniqueGloves1","ChainPAL.ChainUniqueGloves3","SplintPAL.SplintUniqueGloves1","SplintPAL.SplintUniqueGloves2","SplintPAL.SplintUniqueGloves3"),
+                        _    => PickRandom("MageGlovesPAL.Unique001","MageGlovesPAL.Unique002","MageGlovesPAL.Unique003","MageGlovesPAL.Unique004","MageGlovesPAL.Unique005","MageGlovesPAL.Unique006","MageGlovesPAL.Unique007"),
+                    };
+                    return classKey switch {
+                        "fi" => PickRandom("PlatePAL.PlateGloves0","PlatePAL.PlateGloves1","PlatePAL.PlateGloves2","PlatePAL.PlateGloves3","ScalePAL.ScaleGloves1","ScalePAL.ScaleGloves2","CrystalPAL.CrystalGloves1"),
+                        "rg" => PickRandom("LeatherPAL.LeatherGloves1","LeatherPAL.LeatherGloves5","ChainPAL.ChainGloves1","ChainPAL.ChainGloves2","ChainPAL.ChainGloves3","SplintPAL.SplintGloves1","SplintPAL.SplintGloves2"),
+                        _    => PickRandom("MageGlovesPAL.Rare001","MageGlovesPAL.Rare002","MageGlovesPAL.Rare003"),
+                    };
+
+                case "shoulders":
+                    if (tier == "mythic") return classKey switch {
+                        "fi" => PickRandom("PlateMythicPAL.PlateMythicShoulders1","PlateMythicPAL.PlateMythicShoulders3","PlateMythicPAL.PlateMythicShoulders5","ScaleMythicPAL.ScaleMythicShoulders1","CrystalMythicPAL.CrystalMythicShoulders1","CrystalMythicPAL.CrystalMythicShoulders2"),
+                        "rg" => PickRandom("LeatherMythicPAL.LeatherMythicShoulders1","LeatherMythicPAL.LeatherMythicShoulders3","ChainMythicPAL.ChainMythicShoulders1","SplintMythicPAL.SplintMythicShoulders1"),
+                        _    => PickRandom("MageShouldersPAL.PrebuiltMythic001","MageShouldersPAL.PrebuiltMythic002","MageShouldersPAL.PrebuiltMythic003"),
+                    };
+                    if (tier == "unique") return classKey switch {
+                        "fi" => PickRandom("PlatePAL.PlateUniqueShoulders1","PlatePAL.PlateUniqueShoulders2","PlatePAL.PlateUniqueShoulders3","PlatePAL.PlateUniqueShoulders4","PlatePAL.PlateUniqueShoulders5","ScalePAL.ScaleUniqueShoulders1","CrystalPAL.CrystalUniqueShoulders1","CrystalPAL.CrystalUniqueShoulders2","CrystalPAL.CrystalUniqueShoulders3","CrystalPAL.CrystalUniqueShoulders4"),
+                        "rg" => PickRandom("LeatherPAL.LeatherUniqueShoulders1","LeatherPAL.LeatherUniqueShoulders3","ChainPAL.ChainUniqueShoulders1","ChainPAL.ChainUniqueShoulders3","SplintPAL.SplintUniqueShoulders1","SplintPAL.SplintUniqueShoulders2","SplintPAL.SplintUniqueShoulders3"),
+                        _    => PickRandom("MageShouldersPAL.Unique001","MageShouldersPAL.Unique002","MageShouldersPAL.Unique003","MageShouldersPAL.Unique004","MageShouldersPAL.Unique005"),
+                    };
+                    return classKey switch {
+                        "fi" => PickRandom("PlatePAL.PlateShoulders0","PlatePAL.PlateShoulders1","PlatePAL.PlateShoulders2","PlatePAL.PlateShoulders3","ScalePAL.ScaleShoulders1","ScalePAL.ScaleShoulders2","CrystalPAL.CrystalShoulders1"),
+                        "rg" => PickRandom("LeatherPAL.LeatherShoulders1","LeatherPAL.LeatherShoulders5","ChainPAL.ChainShoulders1","ChainPAL.ChainShoulders2","ChainPAL.ChainShoulders3","SplintPAL.SplintShoulders1","SplintPAL.SplintShoulders2"),
+                        _    => PickRandom("MageShouldersPAL.Rare001","MageShouldersPAL.Rare002"),
+                    };
+
+                case "shield":
+                    if (tier == "mythic") return classKey switch {
+                        "fi" => PickRandom("PlateMythicPAL.PlateMythicShield1","PlateMythicPAL.PlateMythicShield2","PlateMythicPAL.PlateMythicShield3","ScaleMythicPAL.ScaleMythicShield1","CrystalMythicPAL.CrystalMythicShield1"),
+                        // Native TokenRewardMythicRangerIG comments out Shield "until 1H
+                        // ranged weapons are in", but the items exist with inline mods.
+                        "rg" => PickRandom("LeatherMythicPAL.LeatherMythicShield1","ChainMythicPAL.ChainMythicShield1","SplintMythicPAL.SplintMythicShield1"),
+                        _    => PickRandom("MageShieldPAL.PrebuiltMythic001","MageShieldPAL.PrebuiltMythic002","MageShieldPAL.PrebuiltMythic003"),
+                    };
+                    if (tier == "unique") return classKey switch {
+                        "fi" => PickRandom("PlatePAL.PlateUniqueShield1","PlatePAL.PlateUniqueShield2","PlatePAL.PlateUniqueShield3","PlatePAL.PlateUniqueShield4","ScalePAL.ScaleUniqueShield1","CrystalPAL.CrystalUniqueShield1","CrystalPAL.CrystalUniqueShield2","CrystalPAL.CrystalUniqueShield3"),
+                        "rg" => PickRandom("LeatherPAL.LeatherUniqueShield1","ChainPAL.ChainUniqueShield1","SplintPAL.SplintUniqueShield1"),
+                        _    => PickRandom("MageShieldPAL.Unique001","MageShieldPAL.Unique002","MageShieldPAL.Unique003"),
+                    };
+                    return classKey switch {
+                        "fi" => PickRandom("PlatePAL.PlateShield1","ScalePAL.ScaleShield1","CrystalPAL.CrystalShield1"),
+                        "rg" => PickRandom("LeatherPAL.LeatherShield1","ChainPAL.ChainShield1","ChainPAL.ChainShield2","ChainPAL.ChainShield3","ChainPAL.ChainShield4","SplintPAL.SplintShield1"),
+                        // MageShieldPAL has no Rare00N entries (RareMageShieldIG only chains
+                        // to NormalMageShieldIG). Use Normal001-003 for rare-tier mage shield.
+                        _    => PickRandom("MageShieldPAL.Normal001","MageShieldPAL.Normal002","MageShieldPAL.Normal003"),
+                    };
+
+                case "body":
+                    if (tier == "mythic") return classKey switch {
+                        "fi" => PickRandom("PlateMythicPAL.PlateMythicArmor1","PlateMythicPAL.PlateMythicArmor3","PlateMythicPAL.PlateMythicArmor4","PlateMythicPAL.PlateMythicArmor5","ScaleMythicPAL.ScaleMythicArmor1","CrystalMythicPAL.CrystalMythicArmor1","CrystalMythicPAL.CrystalMythicArmor2"),
+                        "rg" => PickRandom("LeatherMythicPAL.LeatherMythicArmor1","LeatherMythicPAL.LeatherMythicArmor3","ChainMythicPAL.ChainMythicArmor1","SplintMythicPAL.SplintMythicArmor1"),
+                        _    => PickRandom("MageBodyPAL.PrebuiltMythic001","MageBodyPAL.PrebuiltMythic002","MageBodyPAL.PrebuiltMythic003","MageBodyPAL.PrebuiltMythic004"),
+                    };
+                    if (tier == "unique") return classKey switch {
+                        "fi" => PickRandom("PlatePAL.PlateUniqueArmor1","PlatePAL.PlateUniqueArmor3","PlatePAL.PlateUniqueArmor4","PlatePAL.PlateUniqueArmor5","ScalePAL.ScaleUniqueArmor1","CrystalPAL.CrystalUniqueArmor1","CrystalPAL.CrystalUniqueArmor2","CrystalPAL.CrystalUniqueArmor3","CrystalPAL.CrystalUniqueArmor4"),
+                        "rg" => PickRandom("LeatherPAL.LeatherUniqueArmor1","LeatherPAL.LeatherUniqueArmor2","LeatherPAL.LeatherUniqueArmor3","ChainPAL.ChainUniqueArmor1","ChainPAL.ChainUniqueArmor2","ChainPAL.ChainUniqueArmor3","SplintPAL.SplintUniqueArmor1","SplintPAL.SplintUniqueArmor2","SplintPAL.SplintUniqueArmor3"),
+                        _    => PickRandom("MageBodyPAL.Unique001","MageBodyPAL.Unique002","MageBodyPAL.Unique003","MageBodyPAL.Unique004","MageBodyPAL.Unique005","MageBodyPAL.Unique006"),
+                    };
+                    return classKey switch {
+                        "fi" => PickRandom("PlatePAL.PlateArmor0","PlatePAL.PlateArmor1","PlatePAL.PlateArmor2","PlatePAL.PlateArmor3","ScalePAL.ScaleArmor1","ScalePAL.ScaleArmor2","CrystalPAL.CrystalArmor1"),
+                        "rg" => PickRandom("LeatherPAL.LeatherArmor1","LeatherPAL.LeatherArmor2","LeatherPAL.LeatherArmor3","LeatherPAL.LeatherArmor5","ChainPAL.ChainArmor1","ChainPAL.ChainArmor2","ChainPAL.ChainArmor3","SplintPAL.SplintArmor1","SplintPAL.SplintArmor2"),
+                        _    => PickRandom("MageBodyPAL.Rare001","MageBodyPAL.Rare002","MageBodyPAL.Rare003"),
+                    };
+
+                case "1hweapon":
+                    // Per TokenRewardMythicFighterIG (1HAxe/Mace/Sword/Pick) and
+                    // TokenRewardMythicMageIG (1HStaff). Native ranger IG has no 1H
+                    // entry (1H ranged weapons don't exist in DR), so ranger 1H falls
+                    // back to its native 2H pool — Crossbow/Gun/Cannon.
+                    // 1HGunMythic1-2 are IG-stubs (no inline mods), excluded.
+                    if (tier == "mythic") return classKey switch {
+                        "fi" => PickRandom("1HAxeMythicPAL.1HAxeMythic1","1HAxeMythicPAL.1HAxeMythic2","1HAxeMythicPAL.1HAxeMythic3","1HAxeMythicPAL.1HAxeMythic4","1HAxeMythicPAL.1HAxeMythic5","1HMaceMythicPAL.1HMaceMythic1","1HMaceMythicPAL.1HMaceMythic2","1HMaceMythicPAL.1HMaceMythic3","1HMaceMythicPAL.1HMaceMythic4","1HMaceMythicPAL.1HMaceMythic5","1HMaceMythicPAL.1HMaceMythic6","1HMaceMythicPAL.1HMaceMythic7","1HMaceMythicPAL.1HMaceMythic8","1HSwordMythicPAL.1HSwordMythic1","1HSwordMythicPAL.1HSwordMythic2","1HSwordMythicPAL.1HSwordMythic3","1HSwordMythicPAL.1HSwordMythic4","1HSwordMythicPAL.1HSwordMythic5","1HSwordMythicPAL.1HSwordMythic6","1HSwordMythicPAL.1HSwordMythic7","1HSwordMythicPAL.1HSwordMythic8","1HPickMythicPAL.1HPickMythic1","1HPickMythicPAL.1HPickMythic2","1HPickMythicPAL.1HPickMythic3","1HPickMythicPAL.1HPickMythic4"),
+                        "ma" => PickRandom("1HStaffMythicPAL.1HStaffMythic1","1HStaffMythicPAL.1HStaffMythic2","1HStaffMythicPAL.1HStaffMythic3","1HStaffMythicPAL.1HStaffMythic4","1HStaffMythicPAL.1HStaffMythic5","1HStaffMythicPAL.1HStaffMythic6"),
+                        // Ranger has no 1H weapons — fall back to 2H ranged.
+                        "rg" => PickRandom("2HCrossbowMythicPAL.2HCrossbowMythic1","2HCrossbowMythicPAL.2HCrossbowMythic2","2HCrossbowMythicPAL.2HCrossbowMythic3","2HCrossbowMythicPAL.2HCrossbowMythic4","2HCrossbowMythicPAL.2HCrossbowMythic5","2HGunMythicPAL.2HGunMythic1","2HGunMythicPAL.2HGunMythic2","2HGunMythicPAL.2HGunMythic3","2HGunMythicPAL.2HGunMythic4","2HGunMythicPAL.2HGunMythic5","2HGunMythicPAL.2HGunMythic6","2HCannonMythicPAL.2HCannonMythic1","2HCannonMythicPAL.2HCannonMythic2","2HCannonMythicPAL.2HCannonMythic3"),
+                        _    => "1HSwordMythicPAL.1HSwordMythic1",
+                    };
+                    if (tier == "unique") return classKey switch {
+                        "fi" => PickRandom("1HAxe3PAL.1HAxe3-5","1HMace3PAL.1HMace3-5","1HSword3PAL.1HSword3-5"),
+                        "ma" => "1HStaff3PAL.1HStaff3-5",
+                        // Ranger has no 1H — fall back to 2H ranged.
+                        "rg" => PickRandom("2HCrossbow3PAL.2HCrossbow3-5","2HGun2PAL.2HGun2-5","2HCannon3PAL.2HCannon3-5"),
+                        _    => "1HSword3PAL.1HSword3-5",
+                    };
+                    return classKey switch {
+                        "fi" => PickRandom("1HAxe3PAL.1HAxe3-4","1HMace3PAL.1HMace3-4","1HSword3PAL.1HSword3-4"),
+                        "ma" => "1HStaff3PAL.1HStaff3-4",
+                        "rg" => PickRandom("2HCrossbow3PAL.2HCrossbow3-4","2HGun2PAL.2HGun2-4","2HCannon3PAL.2HCannon3-4"),
+                        _    => "1HSword3PAL.1HSword3-4",
+                    };
+
+                case "2hweapon":
+                    // 2H Mythic per TokenRewardMythicFighterIG (Axe/Mace/Sword/Pick),
+                    // MythicMageIG (Staff), MythicRangerIG (Crossbow/Gun/Cannon).
+                    // 2HAxeMythic100-107, 2HSwordMythic100, 2HPickMythic100-104,
+                    // 2HStaffMythic1000, 2HGunMythic1000 are IG-stubs — excluded.
+                    if (tier == "mythic") return classKey switch {
+                        // 2HAxeMythic7/8 exist in .gc but not in GCDictionary.dict — excluded.
+                        "fi" => PickRandom("2HAxeMythicPAL.2HAxeMythic1","2HAxeMythicPAL.2HAxeMythic2","2HAxeMythicPAL.2HAxeMythic3","2HAxeMythicPAL.2HAxeMythic4","2HAxeMythicPAL.2HAxeMythic5","2HAxeMythicPAL.2HAxeMythic6","2HMaceMythicPAL.2HMaceMythic1","2HMaceMythicPAL.2HMaceMythic2","2HMaceMythicPAL.2HMaceMythic3","2HMaceMythicPAL.2HMaceMythic4","2HMaceMythicPAL.2HMaceMythic5","2HMaceMythicPAL.2HMaceMythic6","2HSwordMythicPAL.2HSwordMythic1","2HSwordMythicPAL.2HSwordMythic2","2HSwordMythicPAL.2HSwordMythic3","2HSwordMythicPAL.2HSwordMythic4","2HPickMythicPAL.2HPickMythic1","2HPickMythicPAL.2HPickMythic2","2HPickMythicPAL.2HPickMythic3"),
+                        "ma" => PickRandom("2HStaffMythicPAL.2HStaffMythic1","2HStaffMythicPAL.2HStaffMythic2","2HStaffMythicPAL.2HStaffMythic3"),
+                        "rg" => PickRandom("2HCrossbowMythicPAL.2HCrossbowMythic1","2HCrossbowMythicPAL.2HCrossbowMythic2","2HCrossbowMythicPAL.2HCrossbowMythic3","2HCrossbowMythicPAL.2HCrossbowMythic4","2HCrossbowMythicPAL.2HCrossbowMythic5","2HGunMythicPAL.2HGunMythic1","2HGunMythicPAL.2HGunMythic2","2HGunMythicPAL.2HGunMythic3","2HGunMythicPAL.2HGunMythic4","2HGunMythicPAL.2HGunMythic5","2HGunMythicPAL.2HGunMythic6","2HCannonMythicPAL.2HCannonMythic1","2HCannonMythicPAL.2HCannonMythic2","2HCannonMythicPAL.2HCannonMythic3"),
+                        _    => "2HSwordMythicPAL.2HSwordMythic1",
+                    };
+                    if (tier == "unique") return classKey switch {
+                        "fi" => PickRandom("2HAxe3PAL.2HAxe3-5","2HMace3PAL.2HMace3-5","2HSword3PAL.2HSword3-5","2HPick3PAL.2HPick3-5"),
+                        "ma" => "2HStaff3PAL.2HStaff3-5",
+                        "rg" => PickRandom("2HCrossbow3PAL.2HCrossbow3-5","2HGun2PAL.2HGun2-5","2HCannon3PAL.2HCannon3-5"),
+                        _    => "2HSword3PAL.2HSword3-5",
+                    };
+                    return classKey switch {
+                        "fi" => PickRandom("2HAxe3PAL.2HAxe3-4","2HMace3PAL.2HMace3-4","2HSword3PAL.2HSword3-4","2HPick3PAL.2HPick3-4"),
+                        "ma" => "2HStaff3PAL.2HStaff3-4",
+                        "rg" => PickRandom("2HCrossbow3PAL.2HCrossbow3-4","2HGun2PAL.2HGun2-4","2HCannon3PAL.2HCannon3-4"),
+                        _    => "2HSword3PAL.2HSword3-4",
+                    };
+            }
+            return "";
+        }
+
+        private static string PickRandom(params string[] items)
+        {
+            if (items == null || items.Length == 0) return "";
+            return items[_lootRng.Next(items.Length)];
+        }
+
+        /// <summary>
+        /// Auto-complete-on-accept for King's-Coin trade quests.
+        ///
+        /// Covers two retail mechanics that share the same shape (click NPC → pick
+        /// quest → coin consumed → reward dropped on the same click):
+        ///   - Townstone Wishing Well (`world.town.quest.well.*`) — toss-a-coin,
+        ///     random multi-tier reward roll.
+        ///   - Token Masters (`world.town.quest.token.{fi,ma,rg,jewelry}.*`) —
+        ///     specific slot+class trade, more coins per click.
+        ///
+        /// Standard accept flow doesn't fit either: zero-objective quests stick on
+        /// the dummy "Read: 0/1" SendAddPacket insert, and item objectives only
+        /// tick via OnItemPickedUp (doesn't see existing inventory).
+        ///
+        /// After HandleAcceptConfirmed we run this: scan inventory, tick item
+        /// objectives by current count, then immediately invoke the full turn-in
+        /// pipeline (consume + rewards). If the player can't complete (not enough
+        /// coins), roll back the accept cleanly so the quest doesn't get stuck.
+        /// </summary>
+        private void TryAutoCompleteWishingWellQuest(RRConnection conn, uint questHash)
+        {
+            if (!DatabaseLoader.QuestsByHash.TryGetValue(questHash, out var questData)) return;
+            if (string.IsNullOrEmpty(questData.id)) return;
+            bool isWell = questData.id.StartsWith("world.town.quest.well", StringComparison.OrdinalIgnoreCase);
+            bool isToken = questData.id.StartsWith("world.town.quest.token.", StringComparison.OrdinalIgnoreCase)
+                           && !questData.id.EndsWith(".Debug_TokenGive", StringComparison.OrdinalIgnoreCase);
+            if (!isWell && !isToken)
+                return;
+
+            string connId = conn.ConnId.ToString();
+            var playerState = QuestManager.Instance.GetPlayerState(connId);
+            if (playerState == null) return;
+            var activeQuest = playerState.ActiveQuests.FirstOrDefault(q =>
+                q.QuestId.Equals(questData.id, StringComparison.OrdinalIgnoreCase));
+            if (activeQuest == null)
+            {
+                Debug.LogError($"[WELL] AcceptConfirmed but no active quest entry for {questData.id} — skip auto-complete");
+                return;
+            }
+
+            Debug.LogError($"[WELL] Auto-complete check for {questData.id} (objCount={activeQuest.Objectives?.Count ?? 0})");
+
+            // Tick item objectives by scanning current inventory.
+            if (activeQuest.Objectives != null && activeQuest.Objectives.Count > 0 &&
+                _playerInventoryItems.ContainsKey(connId))
+            {
+                foreach (var obj in activeQuest.Objectives)
+                {
+                    if (obj.Type == null || !obj.Type.Equals("item", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    if (string.IsNullOrEmpty(obj.Target)) continue;
+                    int found = 0;
+                    foreach (var kvp in _playerInventoryItems[connId])
+                    {
+                        if (kvp.Value.item?.GCClass == null) continue;
+                        if (!kvp.Value.item.GCClass.Equals(obj.Target, StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        int sc = GetStackCount(connId, kvp.Key);
+                        found += sc > 0 ? sc : 1;
+                    }
+                    obj.Current = Math.Min(obj.Required, found);
+                    Debug.LogError($"[WELL]   objective '{obj.Label}' {obj.Current}/{obj.Required} (inventory has {found} of {obj.Target})");
+                }
+                QuestManager.Instance.SendProgressPacket(conn, activeQuest.InstanceId, activeQuest);
+            }
+
+            bool allDone = activeQuest.Objectives == null
+                || activeQuest.Objectives.Count == 0
+                || activeQuest.Objectives.All(o => o.IsComplete);
+
+            if (!allDone)
+            {
+                // Can't complete (no King's Coin). Roll back the accept so the player
+                // doesn't end up with a stuck quest in the log. Re-broadcast the
+                // available list so the Well NPC's ! marker comes back — HandleAcceptConfirmed
+                // already fired one SendAvailableQuestUpdateForZone with the quest in
+                // ActiveQuests (so it was filtered out); we need to fire another now that
+                // we've removed it from ActiveQuests.
+                Debug.LogError($"[WELL] {questData.id} cannot auto-complete — removing from active");
+                uint instId = activeQuest.InstanceId;
+                QuestManager.Instance.RemoveQuestByInstanceId(connId, instId);
+                QuestManager.Instance.SendRemovePacket(conn, instId);
+                SavePlayerQuests(conn);
+                QuestManager.Instance.SendAvailableQuestUpdateForZone(conn);
+                return;
+            }
+
+            uint instanceId = activeQuest.InstanceId;
+            RemoveQuestItemsFromInventory(conn, activeQuest);
+            QuestManager.Instance.HandleTurnInConfirmed(conn, instanceId);
+            // Repeatable: drop from CompletedQuests so the next click can re-accept.
+            // HandleTurnInConfirmed already fired SendAvailableQuestUpdateForZone
+            // INSIDE itself, but at that point the quest was still in CompletedQuests
+            // (we hadn't removed it yet) so it got filtered out — that's why the
+            // Well NPC's ! marker stayed hidden until a zone change. Re-fire the
+            // available update AFTER the CompletedQuests cleanup so the client sees
+            // the quest is available again immediately.
+            if (questData.repeatable)
+            {
+                playerState.CompletedQuests.RemoveAll(c =>
+                    c.Equals(questData.id, StringComparison.OrdinalIgnoreCase));
+                QuestManager.Instance.SendAvailableQuestUpdateForZone(conn);
+            }
+            SavePlayerQuests(conn);
+            ApplyQuestRewards(conn, questData);
+            Debug.LogError($"[WELL] ✅ {questData.id} auto-completed");
         }
 
         /// <summary>
@@ -3365,6 +3861,349 @@ namespace DungeonRunners.Networking
                 {
                     rewardItems = new[] { "potionpal.healthpotion_itempack", "potionpal.manapotion_itempack" };
                 }
+                else if (gen.Equals("TokenMaster", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Token Master trade quest. Quest id encodes class + slot:
+                    //   world.town.quest.token.fi.Helm     → fi (Fighter), Helm
+                    //   world.town.quest.token.ma.2HWeapon → ma (Mage),    2HWeapon
+                    //   world.town.quest.token.rg.Ring     → rg (Ranger),  Ring
+                    //   world.town.quest.token.jewelry.Jewelry → jewelry,  Jewelry
+                    // Original authored weights (TokenRewardRareFighterIG.gc) were
+                    // Rare 3 / Unique 30 / Mythic 100 — heavily mythic-favoured.
+                    // 2026-05-20 (Kubjas): Mythic should be the rarest drop, not the
+                    // common one. Inverted to 100 / 30 / 3 → ~75.2% Rare (yellow),
+                    // ~22.6% Unique (purple), ~2.3% Mythic (rainbow).
+                    rewardItems = null;
+                    string qid = questData.id ?? "";
+                    string qLower = qid.ToLowerInvariant();
+                    string classKey = "fi";
+                    if (qLower.Contains(".ma.")) classKey = "ma";
+                    else if (qLower.Contains(".rg.")) classKey = "rg";
+                    else if (qLower.Contains(".jewelry.")) classKey = "jewelry";
+
+                    int lastDot = qid.LastIndexOf('.');
+                    string slotKey = lastDot > 0 ? qid.Substring(lastDot + 1).ToLowerInvariant() : "ring";
+
+                    double tierRoll = _lootRng.NextDouble() * 133.0;
+                    string tier;
+                    int storedRarity;
+                    if (tierRoll < 100.0)      { tier = "rare";   storedRarity = 3; }
+                    else if (tierRoll < 130.0) { tier = "unique"; storedRarity = 4; }
+                    else                       { tier = "mythic"; storedRarity = 5; }
+
+                    string tokenGcType = PickTokenRewardGcType(classKey, slotKey, tier);
+                    if (string.IsNullOrEmpty(tokenGcType))
+                    {
+                        // No mapping → fall back to a safe default (one of the existing
+                        // wishing-well mythics in the matching slot family).
+                        Debug.LogError($"[QUEST-REWARDS] ⚠️ TokenMaster: no item for class={classKey} slot={slotKey} tier={tier}, skipping reward");
+                        return;
+                    }
+
+                    string tokenLower = tokenGcType.ToLowerInvariant();
+                    string tokenNative = "Armor";
+                    if (tokenLower.Contains("crossbow") || tokenLower.Contains("gun") ||
+                        tokenLower.Contains("cannon") || tokenLower.Contains("bow"))
+                        tokenNative = "RangedWeapon";
+                    else if (tokenLower.Contains("sword") || tokenLower.Contains("axe") ||
+                             tokenLower.Contains("mace") || tokenLower.Contains("staff") ||
+                             tokenLower.Contains("pick"))
+                        tokenNative = "MeleeWeapon";
+                    else if (tokenLower.Contains("ring") || tokenLower.Contains("amulet"))
+                        tokenNative = "Item";
+
+                    PlayerState tokenPS = GetPlayerState(conn.ConnId.ToString());
+                    int tokenLvl = tokenPS?.Level ?? 1;
+                    var tokenItem = new GCObject
+                    {
+                        GCClass = tokenGcType,
+                        NativeClass = tokenNative,
+                        StoredRarity = storedRarity,
+                        // Mythic items get player-level + 3 (matches wishing-well + other
+                        // *MythicPAL.* convention). Rare and Unique used to fall through to
+                        // GetItemRequiredLevel() which returned 1 for named items without
+                        // a `-N` suffix → purple/yellow drops were stuck at level 1 with
+                        // tiny bonuses (Kubjas 2026-05-20: "purple gear has less bonuses
+                        // than yellow"). Give them the player's level so stat scaling is
+                        // meaningful.
+                        StoredLevel = storedRarity == 5 ? (tokenLvl + 3) : tokenLvl,
+                    };
+
+                    // Anchor the drop to the Token NPC's canonical position from
+                    // DatabaseLoader.TownNPCs (same fix the wishing well uses) — the
+                    // player's PlayerPosZ can be off-floor near these NPCs and was
+                    // sending drops under the map. Fall back to player position if
+                    // the NPC lookup somehow misses.
+                    float tokenAnchorX = conn.PlayerPosX;
+                    float tokenAnchorY = conn.PlayerPosY;
+                    float tokenAnchorZ = conn.PlayerPosZ;
+                    if (!string.IsNullOrEmpty(questData.npc))
+                    {
+                        var tokenNpc = DatabaseLoader.TownNPCs?.FirstOrDefault(n =>
+                            n.gcType != null && n.gcType.Equals(questData.npc, StringComparison.OrdinalIgnoreCase));
+                        if (tokenNpc != null)
+                        {
+                            tokenAnchorX = tokenNpc.posX;
+                            tokenAnchorY = tokenNpc.posY;
+                            tokenAnchorZ = tokenNpc.posZ;
+                        }
+                    }
+                    float tox = (float)(_lootRng.NextDouble() * 4.0 - 2.0);
+                    float toy = (float)(_lootRng.NextDouble() * 4.0 - 2.0);
+                    float tokenDropX = tokenAnchorX + tox;
+                    float tokenDropY = tokenAnchorY + toy;
+                    float tokenDropZ = tokenAnchorZ;
+
+                    ushort tokenEntityId = GetNextLootEntityId();
+                    TrackDroppedItem(tokenEntityId, tokenItem, conn);
+                    if (_droppedItems.TryGetValue(tokenEntityId, out var tokenInfo))
+                    {
+                        tokenInfo.PosX = tokenDropX;
+                        tokenInfo.PosY = tokenDropY;
+                        tokenInfo.PosZ = tokenDropZ;
+                        tokenInfo.PlayerLevel = tokenLvl;
+                    }
+                    SendDroppedItemSpawnPacket(conn, tokenEntityId, _droppedItems[tokenEntityId]);
+                    Debug.LogError($"[QUEST-REWARDS] 📦 TokenMaster drop: {tokenGcType} ({tokenNative}) tier={tier} class={classKey} slot={slotKey} at ({tokenDropX:F0},{tokenDropY:F0})");
+                    return;
+                }
+                else if (gen.IndexOf("WishingWell", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    // Wishing-well reward. Per retail behaviour (and well_debug.gc:
+                    // `RewardItemsAreDropped = true`), the rewards drop on the
+                    // ground next to the player — they're not pushed into
+                    // inventory. World drops use the dropped_items table and
+                    // SendDroppedItemSpawnPacket / SendGoldPileSpawnPacket
+                    // path, which is what the IG mod-injection drop path was
+                    // wired into. Inventory-add via 0x1E persisted a raw
+                    // mythic that bricked zone-in on the next login (see
+                    // feedback-mythic-inventory-persistence in MEMORY.md) —
+                    // dropping on the ground side-steps that entirely.
+                    rewardItems = null;
+                    PlayerState wwPS = GetPlayerState(conn.ConnId.ToString());
+                    int wwLvl = wwPS?.Level ?? 1;
+
+                    // Drop near the Well NPC's known DB position, NOT the player's
+                    // position. Players standing on a ramp/stair near the well
+                    // have a different Z than the well itself, which sent the gold
+                    // ingot drop "under the map" in one test. Anchor to the
+                    // canonical well row so the drop lands on the well's floor.
+                    float wellX = conn.PlayerPosX;
+                    float wellY = conn.PlayerPosY;
+                    float wellZ = conn.PlayerPosZ;
+                    var wellNpc = DatabaseLoader.TownNPCs?.FirstOrDefault(n =>
+                        n.gcType != null && n.gcType.Equals("world.town.npc.Well", StringComparison.OrdinalIgnoreCase));
+                    if (wellNpc != null)
+                    {
+                        wellX = wellNpc.posX;
+                        wellY = wellNpc.posY;
+                        wellZ = wellNpc.posZ;
+                    }
+
+                    // Multi-tier reward pool. ALL gcTypes listed WITHOUT the
+                    // `items.pal.` prefix — see feedback_gctype_prefix_only_when_dict_says_so
+                    // memory. Every entry verified against Database/GCDictionary.dict.
+                    //
+                    // Rarity colour is derived client-side from either:
+                    //   • the gcType name pattern (`*MythicPAL.*` → Mythic / rainbow), or
+                    //   • the `-N` dash-suffix tier (`-4` = Rare / yellow, `-5` = Unique / purple),
+                    // per `RarityHelper.GetTierFromGcType` + `GetRarityFromTier`. Mythics from
+                    // dedicated `*MythicPAL.*` files have no suffix; the merchant-style flag-byte
+                    // path in `GCObject.WriteInitForDroppedItem` handles them. Dash-suffix items
+                    // flow through the generic equipment drop write at the bottom of that
+                    // function, which uses GetTierFromGcType for the ScaleMod block.
+                    //
+                    // Named-Unique armor (`PlatePAL.PlateUniqueArmor5` etc.) is intentionally
+                    // omitted — `GetTierFromGcType` returns 1 (Normal) for items without a
+                    // `-N` suffix, so those render with the wrong colour. Separate fix
+                    // needed before re-adding.
+                    string[] wwMythics = new[] {
+                        "PlateMythicPAL.PlateMythicHelm5",
+                        "PlateMythicPAL.PlateMythicHelm6",
+                        "LeatherMythicPAL.LeatherMythicHelm3",
+                        "ScaleMythicPAL.ScaleMythicHelm2",
+                        "PlateMythicPAL.PlateMythicBoots5",
+                        "LeatherMythicPAL.LeatherMythicBoots2",
+                        "PlateMythicPAL.PlateMythicGloves5",
+                        "LeatherMythicPAL.LeatherMythicGloves4",
+                        "PlateMythicPAL.PlateMythicArmor5",
+                        "PlateMythicPAL.PlateMythicShoulders5",
+                        "PlateMythicPAL.PlateMythicShield3",
+                        "RingMythicPAL.RingMythic12",
+                        "RingMythicPAL.RingMythic13",
+                        "RingMythicPAL.RingMythic14",
+                        "RingMythicPAL.RingMythic15",
+                        "RingMythicPAL.RingMythic16",
+                        "RingMythicPAL.RingMythic17",
+                        "AmuletMythicPAL.AmuletMythic7",
+                        "2HStaffMythicPAL.2HStaffMythic3",
+                        "2HCrossbowMythicPAL.2HCrossbowMythic5",
+                        "2HCannonMythicPAL.2HCannonMythic3",
+                        "2HGunMythicPAL.2HGunMythic4",
+                        "2HGunMythicPAL.2HGunMythic6",
+                    };
+                    // Unique (purple). Two flavours:
+                    //   1. Dash-suffix `-5` weapons — rarity decoded by GetTierFromGcType.
+                    //   2. Named-Unique armor (`*PAL.*Unique*`) — no dash, relies on
+                    //      `GetEffectiveRarity` (via StoredRarity = 4) + the
+                    //      `DetectRarityFromGCClass` name-pattern match in the drop
+                    //      branch's ScaleMod fallback. Items verified in
+                    //      GCDictionary.dict; drawn from WishingWellArmorIG.gc.
+                    string[] wwUniques = new[] {
+                        // Weapons (suffix-tier)
+                        "1HAxe2PAL.1HAxe2-5",
+                        "1HMace2PAL.1HMace2-5",
+                        "1HSword2PAL.1HSword2-5",
+                        "1HStaff2PAL.1HStaff2-5",
+                        "1HPick2PAL.1HPick2-5",
+                        "1HGun2PAL.1HGun2-5",
+                        "1HAxe3PAL.1HAxe3-5",
+                        "1HMace3PAL.1HMace3-5",
+                        "1HSword3PAL.1HSword3-5",
+                        "1HStaff3PAL.1HStaff3-5",
+                        // Named Unique armor
+                        "PlatePAL.PlateUniqueArmor5",
+                        "PlatePAL.PlateUniqueHelm5",
+                        "PlatePAL.PlateUniqueBoots5",
+                        "PlatePAL.PlateUniqueGloves5",
+                        "PlatePAL.PlateUniqueShoulders5",
+                        "PlatePAL.PlateUniqueShield4",
+                        "LeatherPAL.LeatherUniqueArmor3",
+                        "LeatherPAL.LeatherUniqueHelm3",
+                        "LeatherPAL.LeatherUniqueBoots3",
+                        "LeatherPAL.LeatherUniqueGloves3",
+                        "ScalePAL.ScaleUniqueHelm2",
+                    };
+                    // Rare (yellow) — dash-suffix `-4`, same PAL range.
+                    string[] wwRares = new[] {
+                        "1HAxe2PAL.1HAxe2-4",
+                        "1HMace2PAL.1HMace2-4",
+                        "1HSword2PAL.1HSword2-4",
+                        "1HStaff2PAL.1HStaff2-4",
+                        "1HPick2PAL.1HPick2-4",
+                        "1HGun2PAL.1HGun2-4",
+                        "1HAxe3PAL.1HAxe3-4",
+                        "1HMace3PAL.1HMace3-4",
+                    };
+
+                    int rolls = Math.Max(1, questData.numRewardItems);
+                    // Per Kubjas's recall + OneTimeUseOnlyWishingWellIG mix: mostly
+                    // equipment, gold rarer. ~20% gold, ~32% Rare, ~32% Unique, ~16% Mythic.
+                    // Roll once: <gold> → gold pile; <gold+rare> → wwRares; <gold+rare+unique>
+                    // → wwUniques; else wwMythics.
+                    const double goldThreshold   = 0.20;
+                    const double rareThreshold   = 0.52;  // gold + 0.32 rare
+                    const double uniqueThreshold = 0.84;  // + 0.32 unique
+                    for (int wi = 0; wi < rolls; wi++)
+                    {
+                        double roll = _lootRng.NextDouble();
+                        // Well's collision box is ±12 XY (NPC_TheWell_Base.gc), so any
+                        // drop within that radius lands inside the well. The well also
+                        // sits against a wall — random 360° picks send half the drops
+                        // behind it. Aim TOWARD the player: the path from player to
+                        // well is by definition walkable, so dropping in their direction
+                        // keeps items reachable on the player's side. Distance 16–24
+                        // units (past the rim) with a ±30° spread for some variation.
+                        float toPlayerX = conn.PlayerPosX - wellX;
+                        float toPlayerY = conn.PlayerPosY - wellY;
+                        double baseAngle;
+                        if (toPlayerX * toPlayerX + toPlayerY * toPlayerY < 1.0)
+                            baseAngle = _lootRng.NextDouble() * 2.0 * Math.PI;  // player on top — fall back to random
+                        else
+                            baseAngle = Math.Atan2(toPlayerY, toPlayerX);
+                        double spread = (_lootRng.NextDouble() - 0.5) * (Math.PI / 3.0); // ±30°
+                        double angle = baseAngle + spread;
+                        double dist = 16.0 + _lootRng.NextDouble() * 8.0;
+                        float dropX = wellX + (float)(Math.Cos(angle) * dist);
+                        float dropY = wellY + (float)(Math.Sin(angle) * dist);
+                        float dropZ = wellZ;
+
+                        if (roll < goldThreshold)
+                        {
+                            uint wwGold = (uint)Math.Max(25, wwLvl * 50);
+                            ushort goldEntityId = GetNextLootEntityId();
+                            var goldInfo = new DroppedItemInfo
+                            {
+                                Item = null,
+                                DbId = 0,
+                                Zone = conn.CurrentZoneName ?? "",
+                                ZoneId = conn.CurrentZoneId,
+                                InstanceId = conn.InstanceId,
+                                PosX = dropX, PosY = dropY, PosZ = dropZ,
+                                PlayerLevel = wwLvl,
+                                DroppedBy = conn.LoginName ?? "",
+                                IsGoldDrop = true,
+                                GoldAmount = wwGold
+                            };
+                            _droppedItems[goldEntityId] = goldInfo;
+                            SendGoldPileSpawnPacket(conn, goldEntityId, dropX, dropY, dropZ);
+                            Debug.LogError($"[QUEST-REWARDS] 🪙 Wishing Well gold pile drop: {wwGold}g at ({dropX:F0},{dropY:F0})");
+                        }
+                        else
+                        {
+                            // Pick the tier source array and rarity tag.
+                            string gcType;
+                            int storedRarity;
+                            string tierLabel;
+                            if (roll < rareThreshold)
+                            {
+                                gcType = wwRares[_lootRng.Next(wwRares.Length)];
+                                storedRarity = 3; // Rare
+                                tierLabel = "rare";
+                            }
+                            else if (roll < uniqueThreshold)
+                            {
+                                gcType = wwUniques[_lootRng.Next(wwUniques.Length)];
+                                storedRarity = 4; // Unique
+                                tierLabel = "unique";
+                            }
+                            else
+                            {
+                                gcType = wwMythics[_lootRng.Next(wwMythics.Length)];
+                                storedRarity = 5; // Mythic
+                                tierLabel = "mythic";
+                            }
+
+                            string gcLower = gcType.ToLowerInvariant();
+                            string nativeClass = "Armor";
+                            if (gcLower.Contains("crossbow") || gcLower.Contains("gun") ||
+                                gcLower.Contains("cannon") || gcLower.Contains("bow"))
+                                nativeClass = "RangedWeapon";
+                            else if (gcLower.Contains("sword") || gcLower.Contains("axe") ||
+                                     gcLower.Contains("mace") || gcLower.Contains("staff") ||
+                                     gcLower.Contains("pick"))
+                                nativeClass = "MeleeWeapon";
+                            else if (gcLower.Contains("ring") || gcLower.Contains("amulet"))
+                                nativeClass = "Item";
+
+                            var item = new GCObject
+                            {
+                                GCClass = gcType,
+                                NativeClass = nativeClass,
+                                StoredRarity = storedRarity,
+                                // Mythics use player-level + 3 (matches existing convention
+                                // for `*MythicPAL.*` items that have no PAL tier digit).
+                                // Rare / Unique dash-suffix items derive their level from
+                                // the PAL tier digit (MerchantManager.GetItemLevel),
+                                // so leave StoredLevel = -1 to let the drop-write pick it up.
+                                StoredLevel = storedRarity == 5 ? (wwLvl + 3) : -1,
+                            };
+
+                            ushort dropEntityId = GetNextLootEntityId();
+                            TrackDroppedItem(dropEntityId, item, conn);
+                            if (_droppedItems.TryGetValue(dropEntityId, out var dropInfo))
+                            {
+                                dropInfo.PosX = dropX;
+                                dropInfo.PosY = dropY;
+                                dropInfo.PosZ = dropZ;
+                                dropInfo.PlayerLevel = wwLvl;
+                            }
+                            SendDroppedItemSpawnPacket(conn, dropEntityId, _droppedItems[dropEntityId]);
+                            Debug.LogError($"[QUEST-REWARDS] 📦 Wishing Well {tierLabel} drop: {gcType} ({nativeClass}) at ({dropX:F0},{dropY:F0})");
+                        }
+                    }
+                    return;
+                }
 
                 if (rewardItems != null)
                 {
@@ -3761,28 +4600,48 @@ namespace DungeonRunners.Networking
             Debug.LogError($"[SAVE] ✅ Level={savedChar.level} XP={savedChar.experience} HP={savedChar.currentHP / 256}/{savedChar.maxHP} Mana={savedChar.currentMana / 256}/{savedChar.maxMana} for {conn.LoginName}");
         }
 
-        public (GCObject item, byte x, byte y)? GetInventoryItemBySlot(string connId, uint slotIndex)
+        public (GCObject item, byte x, byte y)? GetInventoryItemBySlot(string connId, uint slotIndex, byte containerId = 0x0B)
         {
-            if (_playerInventoryItems.ContainsKey(connId) && _playerInventoryItems[connId].ContainsKey(slotIndex))
+            string key = InvKey(connId, containerId);
+            if (_playerInventoryItems.ContainsKey(key) && _playerInventoryItems[key].ContainsKey(slotIndex))
             {
-                return _playerInventoryItems[connId][slotIndex];
+                return _playerInventoryItems[key][slotIndex];
             }
-            Debug.LogError($"[INV-TRACK] No item at slot {slotIndex}");
+            Debug.LogError($"[INV-TRACK] No item at slot {slotIndex} in container 0x{containerId:X2}");
             return null;
         }
 
-        public void RemoveInventoryItemBySlot(string connId, uint slotIndex)
+        public void RemoveInventoryItemBySlot(string connId, uint slotIndex, byte containerId = 0x0B)
         {
-            if (_playerInventoryItems.ContainsKey(connId) && _playerInventoryItems[connId].ContainsKey(slotIndex))
+            string key = InvKey(connId, containerId);
+            if (_playerInventoryItems.ContainsKey(key) && _playerInventoryItems[key].ContainsKey(slotIndex))
             {
-                _playerInventoryItems[connId].Remove(slotIndex);
-                Debug.LogError($"[INV-TRACK] Removed item at slot {slotIndex}");
+                _playerInventoryItems[key].Remove(slotIndex);
+                Debug.LogError($"[INV-TRACK] Removed item at slot {slotIndex} in container 0x{containerId:X2}");
             }
         }
-        public Dictionary<uint, (GCObject item, byte x, byte y)> GetAllInventoryItems(string connId)
+        public Dictionary<uint, (GCObject item, byte x, byte y)> GetAllInventoryItems(string connId, byte containerId = 0x0B)
         {
-            if (_playerInventoryItems.ContainsKey(connId))
-                return _playerInventoryItems[connId];
+            string key = InvKey(connId, containerId);
+            if (_playerInventoryItems.ContainsKey(key))
+                return _playerInventoryItems[key];
+            return null;
+        }
+
+        // Pickup packets carry only a slot index, not a container ID. This searches
+        // main inventory first, then each bank page. Returns the containerId where
+        // the slot lives, or null if no container has it.
+        public byte? FindContainerForSlot(string connId, uint slotIndex)
+        {
+            if (_playerInventoryItems.ContainsKey(connId) && _playerInventoryItems[connId].ContainsKey(slotIndex))
+                return 0x0B;
+            byte[] bankIds = { 0x0C, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13 };
+            foreach (byte cid in bankIds)
+            {
+                string key = InvKey(connId, cid);
+                if (_playerInventoryItems.ContainsKey(key) && _playerInventoryItems[key].ContainsKey(slotIndex))
+                    return cid;
+            }
             return null;
         }
 
@@ -4071,13 +4930,31 @@ namespace DungeonRunners.Networking
             body.WriteInt32(fx);
             body.WriteInt32(fy);
             body.WriteByte(0xBA);
+            int beforeInit = body.Position;
             info.Item.WriteInitForDroppedItem(body, info.PlayerLevel);
+            int afterInit = body.Position;
 
             var chan = new LEWriter();
             chan.WriteByte(0x07);
             chan.WriteBytes(body.ToArray());
             chan.WriteByte(0x06);
-            SendToClient(conn, chan.ToArray());
+            byte[] finalPacket = chan.ToArray();
+
+            // Dump the bytes WriteInitForDroppedItem emitted plus the surrounding
+            // framing, so we can diff against a working drop (or against the
+            // merchant write for the same gcType) when something desyncs.
+            // Triggered for items only — gold piles write a separate path.
+            if (info.Item != null)
+            {
+                byte[] bodyBytes = body.ToArray();
+                int writeInitLen = afterInit - beforeInit;
+                string writeInitHex = BitConverter.ToString(bodyBytes, beforeInit, writeInitLen).Replace("-", " ");
+                string fullHex = BitConverter.ToString(finalPacket).Replace("-", " ");
+                Debug.LogError($"[DROP-WRITEINIT] gc={info.Item.GCClass} writeInitBytes={writeInitLen} hex={writeInitHex}");
+                Debug.LogError($"[DROP-WRITEINIT] full-packet ({finalPacket.Length}B) hex={fullHex}");
+            }
+
+            SendToClient(conn, finalPacket);
         }
 
         /// <summary>
@@ -4771,6 +5648,23 @@ namespace DungeonRunners.Networking
                                         {
                                             Debug.LogError($"[DLL-HP] PLAYER DIED! Saving state...");
                                             SavePlayerLevel(hpConn);
+
+                                            // PvP: if dying player was in an active duel, route to ReportKill.
+                                            // Match-attribution for queued PvP matches is wired in Phase 3+ (needs team awareness).
+                                            try
+                                            {
+                                                var pendingDuel = _duelManager.GetDuel(hpConn.LoginName);
+                                                if (pendingDuel != null && pendingDuel.State == Managers.DuelManager.DuelState.Active)
+                                                {
+                                                    string winnerLogin = string.Equals(pendingDuel.ChallengerLogin, hpConn.LoginName, StringComparison.OrdinalIgnoreCase)
+                                                        ? pendingDuel.TargetLogin
+                                                        : pendingDuel.ChallengerLogin;
+                                                    var (_, _, duelInfo) = _duelManager.ReportKill(winnerLogin, hpConn.LoginName);
+                                                    if (duelInfo != null)
+                                                        SendDuelEndPackets(winnerLogin, hpConn.LoginName, duelInfo);
+                                                }
+                                            }
+                                            catch (Exception ex) { Debug.LogError($"[PVP-DUEL] Death-hook error: {ex.Message}"); }
 
                                             // MULTIPLAYER: Broadcast death animation to other players
                                             BroadcastPlayerDeath(hpConn);
@@ -5683,6 +6577,9 @@ namespace DungeonRunners.Networking
             if (conn.LoginName != null && _selectedCharacter.TryGetValue(conn.LoginName, out var disconnChar))
             {
                 SocialManager.Instance.PlayerOffline(conn.LoginName, disconnChar.Name, SendSocialViaAuth);
+                // Posse: rebroadcast CachedPosseFull to other posse members so they see the offline state.
+                try { PosseManager.Instance.NotifyMemberStateChange(disconnChar.Id, this); }
+                catch (Exception ex) { Debug.LogError($"[POSSE] disconnect notify failed: {ex.Message}"); }
             }
             else if (conn.LoginName != null)
             {
@@ -6027,8 +6924,25 @@ namespace DungeonRunners.Networking
                 case 11: // GroupClient channel (0x0B) — per binary VA 0x458B9B
                     HandleGroupClientChannel(conn, messageType, data);
                     break;
+                case 15: // PosseClient channel (0x0F) — binary-verified via Ghidra (2026-05-16)
+                    // PosseClient::start @ 0x00610610 has PUSH 0xf @ 0x00610676 immediately
+                    // before CALL TChannelManager<>::createChannel @ 0x0061067F. Dispatch
+                    // jump table for incoming messages lives at 0x00611F60. See PosseManager.cs
+                    // header for the full opcode map.
+                    PosseManager.Instance.HandleMessage(conn, messageType, data, SendSocialViaAuth, this);
+                    break;
                 default:
-                    Debug.LogWarning($"Unhandled channel: {channel}");
+                    {
+                        // Unknown-channel canary. PosseClient (slot 15) is wired above; any other
+                        // channel that surfaces here is a still-unmapped gateway client
+                        // (TradeClient candidates etc.). Keep the [POSSE-PROBE] prefix so the
+                        // existing RuntimeEvidenceManager.IsFocusedLog entry continues to surface
+                        // it in server.log.
+                        string hex = (data != null && data.Length > 0)
+                            ? BitConverter.ToString(data, 0, Math.Min(48, data.Length))
+                            : "EMPTY";
+                        Debug.LogError($"[POSSE-PROBE] Unhandled channel={channel} type=0x{messageType:X2} dataLen={data?.Length ?? 0} hex={hex}");
+                    }
                     break;
             }
         }
@@ -8668,6 +9582,9 @@ namespace DungeonRunners.Networking
 
             SendAdminHPSync(conn, ps);
             Debug.LogError($"[ADMIN-LEVELUP] Sent {newLevel - oldLevel} XP packet(s) + HP sync for level {oldLevel}->{newLevel}");
+            // Posse: refresh other members' rosters with the new Lvl value.
+            try { if (conn.CharSqlId != 0) PosseManager.Instance.NotifyMemberStateChange(conn.CharSqlId, this); }
+            catch (Exception px) { Debug.LogError($"[POSSE] level-up notify failed: {px.Message}"); }
         }
 
 
@@ -9192,6 +10109,7 @@ namespace DungeonRunners.Networking
                             // Give onAcceptItem if quest has one
                             if (DatabaseLoader.QuestsByHash.TryGetValue(questHash, out var acceptedQuest1) && !string.IsNullOrEmpty(acceptedQuest1.onAcceptItem))
                                 GiveOnAcceptItem(conn, acceptedQuest1.onAcceptItem);
+                            TryAutoCompleteWishingWellQuest(conn, questHash);
                         }
                     }
                 }
@@ -9212,6 +10130,7 @@ namespace DungeonRunners.Networking
                             QuestManager.Instance.HandleAcceptConfirmed(conn, npcEntityId, questHash);
                             if (DatabaseLoader.QuestsByHash.TryGetValue(questHash, out var acceptedQuest2) && !string.IsNullOrEmpty(acceptedQuest2.onAcceptItem))
                                 GiveOnAcceptItem(conn, acceptedQuest2.onAcceptItem);
+                            TryAutoCompleteWishingWellQuest(conn, questHash);
                         }
                         else
                         {
@@ -9291,6 +10210,7 @@ namespace DungeonRunners.Networking
                             QuestManager.Instance.HandleAcceptConfirmed(conn, npcEntityId, questHash);
                             if (DatabaseLoader.QuestsByHash.TryGetValue(questHash, out var acceptedQuest3) && !string.IsNullOrEmpty(acceptedQuest3.onAcceptItem))
                                 GiveOnAcceptItem(conn, acceptedQuest3.onAcceptItem);
+                            TryAutoCompleteWishingWellQuest(conn, questHash);
                             SavePlayerQuests(conn);
                         }
                         else if (conn.PendingTurnInInstanceId != 0)
@@ -10524,6 +11444,14 @@ namespace DungeonRunners.Networking
                     if (npc.IsMerchant)
                     {
                         TrackPendingMerchantActivation(conn, npc);
+                    }
+                    if (npc.IsPosseMagnate)
+                    {
+                        // Tad's dialog Create-Posse button is currently NOT surfaced (NPC component
+                        // GCType still unknown — both "PosseRegistryOption" and "posse" got Zone
+                        // Error 10). Fall back to a chat hint until we find the right string.
+                        SendSystemMessage(conn, "Open the Posse tab in your menu, or type /posse create <name> to start a posse (level 15+, 1,000,000 gold). Type /posse help for the full list of commands.");
+                        Debug.LogError($"[POSSE] Player clicked PosseMagnate {npc.GCClass} — chat hint sent");
                     }
                     Debug.LogError($"[NPC] ✅ Set CurrentDialogNpcId = {conn.CurrentDialogNpcId}");
                 }
@@ -13412,6 +14340,10 @@ namespace DungeonRunners.Networking
             public bool IsAdminMerchant;  // ← NEW
             public bool IsTrainer;
             public uint TrainerId;
+            public bool IsBank;
+            public uint BankComponentId;
+            public bool IsPosseMagnate;
+            public uint PosseOptionComponentId;
             /// <summary>
             /// Ordered list of AvailableSkill GC classes from the trainer's GC file.
             /// Index = the uint32 V sent in the train request packet.
@@ -13554,6 +14486,8 @@ namespace DungeonRunners.Networking
             {
                 bool isMerchant = MerchantManager.IsMerchant(npcData.gcType);
                 bool isTrainer = npcData.gcType.IndexOf("Trainer", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool isBank = npcData.gcType.EndsWith(".Bank", StringComparison.OrdinalIgnoreCase);
+                bool isPosseMagnate = npcData.gcType.EndsWith(".PosseMagnate", StringComparison.OrdinalIgnoreCase);
                 var npc = new ZoneNPC
                 {
                     GCClass = npcData.gcType,
@@ -13568,11 +14502,15 @@ namespace DungeonRunners.Networking
                     MerchantId = isMerchant ? _nextEntityId++ : 0,
                     IsTrainer = isTrainer,
                     TrainerId = isTrainer ? _nextEntityId++ : 0,
-                    TrainerSkills = isTrainer ? GetTrainerSkillList(npcData.gcType) : null
+                    TrainerSkills = isTrainer ? GetTrainerSkillList(npcData.gcType) : null,
+                    IsBank = isBank,
+                    BankComponentId = isBank ? _nextEntityId++ : 0,
+                    IsPosseMagnate = isPosseMagnate,
+                    PosseOptionComponentId = isPosseMagnate ? _nextEntityId++ : 0
                 };
 
                 _zoneNPCs[zoneId].Add(npc);
-                string tags = (isMerchant ? " [MERCHANT]" : "") + (isTrainer ? $" [TRAINER cid={npc.TrainerId}]" : "");
+                string tags = (isMerchant ? " [MERCHANT]" : "") + (isTrainer ? $" [TRAINER cid={npc.TrainerId}]" : "") + (isBank ? $" [BANK cid={npc.BankComponentId}]" : "") + (isPosseMagnate ? $" [POSSE cid={npc.PosseOptionComponentId}]" : "");
                 Debug.LogError($"[InitTownNPCs] ✓ Created NPC: {npc.Name} (ID: {npc.Id}){tags}");
             }
             // Initialize Tutorial NPCs
@@ -13588,6 +14526,8 @@ namespace DungeonRunners.Networking
                     {
                         bool isMerchant = MerchantManager.IsMerchant(npcData.gcType);
                         bool isTrainer = npcData.gcType.IndexOf("Trainer", StringComparison.OrdinalIgnoreCase) >= 0;
+                        bool isBank = npcData.gcType.EndsWith(".Bank", StringComparison.OrdinalIgnoreCase);
+                        bool isPosseMagnate = npcData.gcType.EndsWith(".PosseMagnate", StringComparison.OrdinalIgnoreCase);
                         var npc = new ZoneNPC
                         {
                             GCClass = npcData.gcType,
@@ -13602,11 +14542,15 @@ namespace DungeonRunners.Networking
                             MerchantId = isMerchant ? _nextEntityId++ : 0,
                             IsTrainer = isTrainer,
                             TrainerId = isTrainer ? _nextEntityId++ : 0,
-                            TrainerSkills = isTrainer ? GetTrainerSkillList(npcData.gcType) : null
+                            TrainerSkills = isTrainer ? GetTrainerSkillList(npcData.gcType) : null,
+                            IsBank = isBank,
+                            BankComponentId = isBank ? _nextEntityId++ : 0,
+                            IsPosseMagnate = isPosseMagnate,
+                            PosseOptionComponentId = isPosseMagnate ? _nextEntityId++ : 0
                         };
 
                         _zoneNPCs[tutorialZoneId].Add(npc);
-                        string tags = (isMerchant ? " [MERCHANT]" : "") + (isTrainer ? $" [TRAINER cid={npc.TrainerId}]" : "");
+                        string tags = (isMerchant ? " [MERCHANT]" : "") + (isTrainer ? $" [TRAINER cid={npc.TrainerId}]" : "") + (isBank ? $" [BANK cid={npc.BankComponentId}]" : "") + (isPosseMagnate ? $" [POSSE cid={npc.PosseOptionComponentId}]" : "");
                         Debug.LogError($"[InitTutorialNPCs] ✓ Created NPC: {npc.Name} (ID: {npc.Id}){tags}");
                     }
                 }
@@ -13627,6 +14571,8 @@ namespace DungeonRunners.Networking
                 {
                     bool isMerchant = MerchantManager.IsMerchant(npcData.gcType);
                     bool isTrainer = npcData.gcType.IndexOf("Trainer", StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool isBank = npcData.gcType.EndsWith(".Bank", StringComparison.OrdinalIgnoreCase);
+                    bool isPosseMagnate = npcData.gcType.EndsWith(".PosseMagnate", StringComparison.OrdinalIgnoreCase);
                     bool isPvpNpc = npcData.gcType.IndexOf("L33tenant", StringComparison.OrdinalIgnoreCase) >= 0
                                  || npcData.name.IndexOf("L33tenant", StringComparison.OrdinalIgnoreCase) >= 0;
                     var npc = new ZoneNPC
@@ -13643,7 +14589,11 @@ namespace DungeonRunners.Networking
                         MerchantId = isMerchant ? _nextEntityId++ : 0,
                         IsTrainer = isTrainer,
                         TrainerId = isTrainer ? _nextEntityId++ : 0,
-                        TrainerSkills = isTrainer ? GetTrainerSkillList(npcData.gcType) : null
+                        TrainerSkills = isTrainer ? GetTrainerSkillList(npcData.gcType) : null,
+                        IsBank = isBank,
+                        BankComponentId = isBank ? _nextEntityId++ : 0,
+                        IsPosseMagnate = isPosseMagnate,
+                        PosseOptionComponentId = isPosseMagnate ? _nextEntityId++ : 0
                     };
 
                     _zoneNPCs[pvpZoneId].Add(npc);
@@ -13828,6 +14778,43 @@ namespace DungeonRunners.Networking
                     WriteGCType(writer, skillTrainerGcType, preserveCase: true);
                     writer.WriteByte(0x00); // hasInit = false → client reads available skills from GC
                     if (VerbosePacketLogging) Debug.LogError($"[NPC-{npcCounter}] 🔷 SKILLTRAINER DONE (trainerId=0x{npc.TrainerId:X4})");
+                }
+
+                // ========== OP5d: Create Bank Component (0x32) - IF BANK ==========
+                // GCType "banker" sourced from DungeonRunners.exe strings table (offset 4798220,
+                // paired with "Merchant" at 4798452). hasInit=0x00 mirrors trainer pattern since
+                // the player's avatar.base.Bank container is already sent in OP8 UNITCONTAINER.
+                // Probe 1 with "bank" caused Zone error 10; "banker" is the corrected guess.
+                if (npc.IsBank)
+                {
+                    Debug.LogError($"[NPC-{npcCounter}] 🔷 CREATING BANK COMPONENT (bankId={npc.BankComponentId})");
+                    writer.WriteByte(0x32);
+                    writer.WriteUInt16(npcId);
+                    writer.WriteUInt16((ushort)npc.BankComponentId);
+                    WriteGCType(writer, "banker", preserveCase: false);
+                    writer.WriteByte(0x00); // hasInit = false (speculative; iterate if rejected)
+                    Debug.LogError($"[NPC-{npcCounter}] 🔷 BANK DONE (bankId=0x{npc.BankComponentId:X4})");
+                }
+
+                // ========== OP5e: Posse option component — PROBE 3 ==========
+                // The client registers 8 Posse* classes via DFCKernel::registerClass + a
+                // matching create<Name> factory (mirroring _register_class_Banker / createBanker
+                // at 0x0059A910). Of those, only "PosseRegistry" is the bare-noun analog of
+                // "Banker" / "Merchant" — every other Posse* is a UI class (Dialog/Panel/Control).
+                // Probes attempted previously:
+                //   "PosseRegistryOption" (preserveCase) — UI class name, Zone Error 10
+                //   "posse" (lowercase)                  — bare noun, Zone Error 10
+                // This probe writes "PosseRegistry" via the same path as banker (WriteGCType
+                // lowercases to "posseregistry" — DFCKernel::registerClass is case-insensitive).
+                if (npc.IsPosseMagnate)
+                {
+                    Debug.LogError($"[POSSE] CREATING POSSE COMPONENT (cid={npc.PosseOptionComponentId}) for {npc.GCClass}");
+                    writer.WriteByte(0x32);
+                    writer.WriteUInt16(npcId);
+                    writer.WriteUInt16((ushort)npc.PosseOptionComponentId);
+                    WriteGCType(writer, "PosseRegistry", preserveCase: false);
+                    writer.WriteByte(0x00);
+                    Debug.LogError($"[POSSE] POSSE COMPONENT DONE (cid=0x{npc.PosseOptionComponentId:X4})");
                 }
 
                 // ========== OP6: Init NPC Entity (0x02) ==========
@@ -14305,27 +15292,70 @@ namespace DungeonRunners.Networking
                 return;
             }
 
-            // Look up both characters for level check
-            var challengerChar = _selectedCharacter.TryGetValue(conn.LoginName, out var cs)
+            IssueDuelChallenge(conn, target);
+        }
+
+        /// <summary>
+        /// Shared duel-challenge path used by both opcode 0x2D and the @duel chat command.
+        /// Returns null on success, or a human-readable rejection reason.
+        /// </summary>
+        public string IssueDuelChallenge(RRConnection challengerConn, RRConnection targetConn)
+        {
+            if (challengerConn == null || targetConn == null) return "Connection not found.";
+
+            // Look up both characters for level check + CharSqlId
+            var challengerChar = _selectedCharacter.TryGetValue(challengerConn.LoginName, out var cs)
                 ? CharacterRepository.GetCharacter(cs.Id) : null;
-            var targetChar = CharacterRepository.GetCharacter(targetCharSqlId);
-            if (challengerChar == null || targetChar == null) { Debug.LogError("[PVP-DUEL] Character lookup failed"); return; }
+            var targetChar = _selectedCharacter.TryGetValue(targetConn.LoginName, out var ts)
+                ? CharacterRepository.GetCharacter(ts.Id) : null;
+            if (challengerChar == null || targetChar == null)
+            {
+                Debug.LogError("[PVP-DUEL] Character lookup failed");
+                return "Character lookup failed.";
+            }
 
             uint challengerCharSqlId = (uint)challengerChar.id;
-            string err = _duelManager.TryChallenge(conn.LoginName, challengerCharSqlId,
-                target.LoginName, targetCharSqlId,
+            uint targetCharSqlId     = (uint)targetChar.id;
+            string err = _duelManager.TryChallenge(challengerConn.LoginName, challengerCharSqlId,
+                targetConn.LoginName, targetCharSqlId,
                 challengerChar.level, targetChar.level);
             if (err != null)
             {
                 Debug.LogError($"[PVP-DUEL] Challenge rejected: {err}");
-                return;
+                return err;
             }
 
             // Notify target: Challenged
             byte[] targetPkt = PVPPackets.BuildDuelStatus(
                 PVPPackets.DuelStatusType.Challenged, challengerCharSqlId, 0, 0);
-            SendToClient(target, targetPkt);
-            Debug.LogError($"[PVP-DUEL] Sent Challenged to {target.LoginName}");
+            SendToClient(targetConn, targetPkt);
+            Debug.LogError($"[PVP-DUEL] Sent Challenged to {targetConn.LoginName}");
+            return null;
+        }
+
+        /// <summary>Chat-driven duel accept: same effect as opcode 0x2E.</summary>
+        public bool AcceptDuel(RRConnection conn)
+        {
+            HandleDuelAccept(conn);
+            return _duelManager.IsInDuel(conn.LoginName);
+        }
+
+        /// <summary>Chat-driven duel decline: same effect as opcode 0x2F.</summary>
+        public bool DeclineDuel(RRConnection conn)
+        {
+            var hadDuel = _duelManager.IsInDuel(conn.LoginName);
+            HandleDuelDecline(conn);
+            return hadDuel;
+        }
+
+        /// <summary>Human-readable duel state for @duel status.</summary>
+        public string GetDuelStatusFor(string loginName)
+        {
+            var d = _duelManager.GetDuel(loginName);
+            if (d == null) return "No active duel.";
+            string other = string.Equals(d.ChallengerLogin, loginName, StringComparison.OrdinalIgnoreCase)
+                ? d.TargetLogin : d.ChallengerLogin;
+            return $"{d.State} vs {other}";
         }
 
         private void HandleDuelAccept(RRConnection conn)
@@ -14343,6 +15373,12 @@ namespace DungeonRunners.Networking
             if (target != null)
                 SendToClient(target, PVPPackets.BuildDuelStatus(
                     PVPPackets.DuelStatusType.Accepted, duel.ChallengerCharSqlId, 0, 0));
+
+            // Schedule Countdown→Active transition. Drained from ProcessMatchmakingTick.
+            _pendingDuelActivations.Add((
+                DateTime.UtcNow.AddSeconds(Managers.DuelManager.DuelInfo.CountdownSec),
+                duel));
+            Debug.LogError($"[PVP-DUEL] Activation scheduled for {duel.ChallengerLogin} vs {duel.TargetLogin} in {Managers.DuelManager.DuelInfo.CountdownSec}s");
         }
 
         private void HandleDuelDecline(RRConnection conn)
@@ -14354,6 +15390,55 @@ namespace DungeonRunners.Networking
             if (challenger != null)
                 SendToClient(challenger, PVPPackets.BuildDuelStatus(
                     PVPPackets.DuelStatusType.Declined, duel.TargetCharSqlId, 0, 0));
+        }
+
+        // Phase 1: pending Countdown→Active activations, drained from ProcessMatchmakingTick.
+        private readonly List<(DateTime dueAt, Managers.DuelManager.DuelInfo duel)> _pendingDuelActivations
+            = new List<(DateTime, Managers.DuelManager.DuelInfo)>();
+
+        private void SendCombatStart(Managers.DuelManager.DuelInfo duel)
+        {
+            var challenger = FindConnectionByLogin(duel.ChallengerLogin);
+            var target     = FindConnectionByLogin(duel.TargetLogin);
+            if (challenger != null)
+            {
+                SendToClient(challenger, PVPPackets.BuildDuelStatus(
+                    PVPPackets.DuelStatusType.InProgress, duel.TargetCharSqlId, 0, 0));
+                SendToClient(challenger, PVPPackets.BuildPVPStatusChanged(pvpState: 1, matchId: 0));
+            }
+            if (target != null)
+            {
+                SendToClient(target, PVPPackets.BuildDuelStatus(
+                    PVPPackets.DuelStatusType.InProgress, duel.ChallengerCharSqlId, 0, 0));
+                SendToClient(target, PVPPackets.BuildPVPStatusChanged(pvpState: 1, matchId: 0));
+            }
+            Debug.LogError($"[PVP-DUEL] Combat start sent: {duel.ChallengerLogin} vs {duel.TargetLogin}");
+        }
+
+        private void SendDuelEndPackets(string winnerLogin, string loserLogin, Managers.DuelManager.DuelInfo duel)
+        {
+            // Resolve CharSqlIds from the duel record so we don't depend on connection state.
+            uint winnerCharSqlId = string.Equals(duel.ChallengerLogin, winnerLogin, StringComparison.OrdinalIgnoreCase)
+                ? duel.ChallengerCharSqlId : duel.TargetCharSqlId;
+            uint loserCharSqlId  = string.Equals(duel.ChallengerLogin, loserLogin,  StringComparison.OrdinalIgnoreCase)
+                ? duel.ChallengerCharSqlId : duel.TargetCharSqlId;
+
+            var winnerConn = FindConnectionByLogin(winnerLogin);
+            var loserConn  = FindConnectionByLogin(loserLogin);
+
+            if (winnerConn != null)
+            {
+                SendToClient(winnerConn, PVPPackets.BuildDuelStatus(
+                    PVPPackets.DuelStatusType.Won, loserCharSqlId, 0, 0));
+                SendToClient(winnerConn, PVPPackets.BuildPVPStatusChanged(pvpState: 0, matchId: 0));
+            }
+            if (loserConn != null)
+            {
+                SendToClient(loserConn, PVPPackets.BuildDuelStatus(
+                    PVPPackets.DuelStatusType.Lost, winnerCharSqlId, 0, 0));
+                SendToClient(loserConn, PVPPackets.BuildPVPStatusChanged(pvpState: 0, matchId: 0));
+            }
+            Debug.LogError($"[PVP-DUEL] End packets sent: winner={winnerLogin} loser={loserLogin}");
         }
 
         private RRConnection FindConnectionByLogin(string loginName)
@@ -14441,6 +15526,23 @@ namespace DungeonRunners.Networking
             if (!forceRun && (DateTime.UtcNow - _lastMatchmakingTick).TotalMilliseconds < 1000)
                 return;
             _lastMatchmakingTick = DateTime.UtcNow;
+
+            // Drain pending duel Countdown→Active activations.
+            if (_pendingDuelActivations.Count > 0)
+            {
+                var now = DateTime.UtcNow;
+                for (int i = _pendingDuelActivations.Count - 1; i >= 0; i--)
+                {
+                    var (dueAt, duel) = _pendingDuelActivations[i];
+                    if (dueAt <= now)
+                    {
+                        _pendingDuelActivations.RemoveAt(i);
+                        // Skip if duel was cancelled (declined / disconnect) before countdown elapsed.
+                        if (_duelManager.ActivateCombat(duel.ChallengerLogin))
+                            SendCombatStart(duel);
+                    }
+                }
+            }
 
             var (newMatches, endedMatches) = Managers.PVPMatchManager.Instance.Tick();
             foreach (var match in newMatches)
@@ -15381,6 +16483,9 @@ namespace DungeonRunners.Networking
                 string zoneName = startZone?.name ?? "tutorial";
                 conn.CurrentZoneName = zoneName;  // Exact zone name for multiplayer
                 GroupManager.Instance.UpdateMemberZone(conn.ConnId, zoneName);
+                // Posse: live-update other members' rosters with the new Location/world.
+                try { if (conn.CharSqlId != 0) PosseManager.Instance.NotifyMemberStateChange(conn.CharSqlId, this); }
+                catch (Exception px) { Debug.LogError($"[POSSE] zone-notify failed: {px.Message}"); }
                 //  conn.CurrentZoneGcType = startZone?.gcType ?? "world.tutorial"; // For quest filtering
                 Debug.LogError($"[ZONE-MSG] Zone ID: {zoneId} (0x{zoneId:X8})");
                 // Extract zone prefix for quest filtering
@@ -15410,6 +16515,15 @@ namespace DungeonRunners.Networking
                 // Social system — register player online and send initial social data
                 SocialManager.Instance.PlayerOnline(conn.LoginName, character.Name, conn, SendSocialViaAuth);
                 SocialManager.Instance.SendLoginSocialInit(conn, character.Name, SendSocialViaAuth);
+
+                // Posse system — push processConnectionNotification(connected=true) so the
+                // right-side Posse tab flips from "Posses are currently unavailable" to enabled.
+                // Unlocks the entire posse action surface (Create/Join/Invite/Kick/...).
+                PosseManager.Instance.SendConnectionNotification(conn, true, SendSocialViaAuth);
+                SendPosseStateForCharacter(conn, character.Id, SendSocialViaAuth);
+                // Tell other posse members this player came online so their rosters refresh.
+                try { PosseManager.Instance.NotifyMemberStateChange(character.Id, this); }
+                catch (Exception ex2) { Debug.LogError($"[POSSE] login-notify (HandleCharacterPlay) failed: {ex2.Message}"); }
             }
             catch (Exception ex)
             {
@@ -17177,9 +18291,11 @@ namespace DungeonRunners.Networking
                 writer.WriteByte(0x00);   // PvP Team null string
                 Debug.LogError($"[OP3] After WriteByte(0x00) PvP team: position {writer.Position} (should be +1)");
 
-                Debug.LogError($"[OP3] Before WriteCString(Reborn): position {writer.Position}");
-                writer.WriteCString("Reborn"); // Posse Name
-                Debug.LogError($"[OP3] After WriteCString(Reborn): position {writer.Position} (should be +15)");
+                // Posse name (empty string → client renders <No Posse>, see EXE 0x4643A0).
+                string op3PosseName = savedChar.posseName ?? "";
+                Debug.LogError($"[OP3] Before WriteCString posseName='{op3PosseName}': position {writer.Position}");
+                writer.WriteCString(op3PosseName);
+                Debug.LogError($"[OP3] After WriteCString posseName: position {writer.Position}");
 
                 Debug.LogError($"[OP3] Before final WriteUInt32(0x00): position {writer.Position}");
                 writer.WriteUInt32(0x00);
@@ -18518,9 +19634,50 @@ namespace DungeonRunners.Networking
                     }
                     else
                     {
+                        // Iteration-15 GetEffectiveRarity fallback: GetTierFromGcType returns
+                        // Normal for named-rarity items (`PlatePAL.PlateUniqueArmor5` etc.)
+                        // because they lack a `-N` dash-suffix. Falling back here lets the
+                        // OP5 equipment write emit a Unique ScaleMod block so the client
+                        // doesn't see the stream short by 7 bytes → tag-108 (0x6C=='l')
+                        // comm error on the next item's cstring read.
                         int op5Tier = RarityHelper.GetTierFromGcType(item.GCClass);
                         var op5Rarity = RarityHelper.GetRarityFromTier(op5Tier);
                         if (op5Rarity == ItemRarity.Normal)
+                        {
+                            int effective = item.GetEffectiveRarity();
+                            if (effective > 0 && effective < 5)
+                                op5Rarity = (ItemRarity)effective;
+                        }
+                        // Path B — try wire-mod injection first (matches WriteInit / WriteInitForInventory /
+                        // INV-RESTORE). OP5 is the ONLY equipment write path that fires on zone-in
+                        // sequencing, and was missed when Path B was wired everywhere else — that's
+                        // why equipped items kept rotating mods per zone-switch while inventory items
+                        // stayed stable. Wire bytes are identical across emissions now.
+                        var op5WireMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(item.GCClass);
+                        if (op5WireMods.Count == 0)
+                            op5WireMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetWrapperIGWireMods(item.GCClass, op5Rarity.ToString());
+
+                        if (DungeonRunners.Data.ItemStatDatabase.PathBEnabled && op5WireMods.Count > 0)
+                        {
+                            var op5Hashes = new List<uint>();
+                            var op5Emitted = new List<string>();
+                            var op5Skipped = new List<string>();
+                            foreach (var (slot, modRef) in op5WireMods.OrderBy(w => w.Slot))
+                            {
+                                uint h = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(modRef);
+                                if (h != 0) { op5Hashes.Add(h); op5Emitted.Add($"{modRef}#0x{h:X8}"); }
+                                else op5Skipped.Add(modRef);
+                            }
+                            writer.WriteByte((byte)op5Hashes.Count);
+                            foreach (uint h in op5Hashes)
+                            {
+                                writer.WriteByte(0x04);
+                                writer.WriteUInt32(h);
+                                writer.WriteByte(0x00);
+                            }
+                            Debug.LogError($"[IG-INJECT] op5-armor {item.GCClass} rarity={op5Rarity} storedRarity={item.StoredRarity} effective={item.GetEffectiveRarity()} mods={op5Hashes.Count}/{op5WireMods.Count} phase1ModCount={modCount} emitted=[{string.Join(" | ", op5Emitted)}] skipped=[{string.Join(",", op5Skipped)}]");
+                        }
+                        else if (op5Rarity == ItemRarity.Normal)
                         {
                             writer.WriteByte(0x00);  // no ScaleMod children for Normal
                             Debug.LogError($"[OP5-MODS] Normal item - no ScaleMod");
@@ -18530,8 +19687,11 @@ namespace DungeonRunners.Networking
                             writer.WriteByte(0x01);
                             int itemModStart = writer.Position;
                             writer.WriteByte(0xFF);
-                            string modifierClass = RarityHelper.GetRandomScaleMod(op5Rarity);
-                            Debug.LogError($"[OP5-MODS] Item '{item.GCClass}' -> rarity={op5Rarity} Modifier '{modifierClass}'");
+                            // Deterministic per (gcClass, rarity) — replaces GetRandomScaleMod which
+                            // re-rolled every zone-switch. Same input → same scaleMod across emissions
+                            // → stable equipped tooltip mods.
+                            string modifierClass = RarityHelper.GetDeterministicScaleMod(item.GCClass, op5Rarity);
+                            Debug.LogError($"[OP5-MODS] Item '{item.GCClass}' -> rarity={op5Rarity} Modifier '{modifierClass}' (deterministic)");
                             writer.WriteCString(modifierClass);
                             writer.WriteByte(0x03);
                             writer.WriteByte(0x15);
@@ -18745,23 +19905,74 @@ namespace DungeonRunners.Networking
                 writer.WriteUInt32(savedChar.gold);
 
                 Debug.LogError($"[UNITCONTAINER] 💰 Writing player gold: {savedChar.gold}");
-                writer.WriteByte(0x03);
 
                 var mainInventory = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.Inventory");
-                var bankInventory = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.Bank");
+                var bankPage1 = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.Bank");
+                var bankPage2 = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.Bank2");
+                var bankPage3 = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.Bank3");
+                var bankPage4 = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.Bank4");
+                var bankPage5 = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.Bank5");
+                var bankPage6 = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.Bank6");
+                var bankPage7 = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.Bank7");
                 var tradeInventory = unitContainer.Children.FirstOrDefault(c => c.GCClass == "avatar.base.TradeInventory");
 
-                if (mainInventory == null || bankInventory == null || tradeInventory == null)
+                if (mainInventory == null || bankPage1 == null || tradeInventory == null
+                    || bankPage2 == null || bankPage3 == null || bankPage4 == null
+                    || bankPage5 == null || bankPage6 == null || bankPage7 == null)
                 {
                     Debug.LogError("❌ Missing required inventories!");
                     return;
                 }
 
+                // Container IDs: TradeInventory stays at 0x0D (preserves trade compat).
+                // Bank pages take 0x0C (page 1, original) then 0x0E..0x13 (pages 2..7).
                 var inventoriesToWrite = new[] {
             (inventory: mainInventory, id: (byte)0x0B, name: "Inventory"),
-            (inventory: bankInventory, id: (byte)0x0C, name: "Bank"),
-            (inventory: tradeInventory, id: (byte)0x0D, name: "TradeInventory")
+            (inventory: bankPage1, id: (byte)0x0C, name: "Bank"),
+            (inventory: tradeInventory, id: (byte)0x0D, name: "TradeInventory"),
+            (inventory: bankPage2, id: (byte)0x0E, name: "Bank2"),
+            (inventory: bankPage3, id: (byte)0x0F, name: "Bank3"),
+            (inventory: bankPage4, id: (byte)0x10, name: "Bank4"),
+            (inventory: bankPage5, id: (byte)0x11, name: "Bank5"),
+            (inventory: bankPage6, id: (byte)0x12, name: "Bank6"),
+            (inventory: bankPage7, id: (byte)0x13, name: "Bank7")
         };
+
+                // Inventory count byte — must match the array length.
+                writer.WriteByte((byte)inventoriesToWrite.Length);
+
+                // Clear stale tracking from previous zone — for ALL containers, not just main inv.
+                // Done once before the loop; slot counter is per-player so it gets reset too.
+                {
+                    string clearConnId = conn.ConnId.ToString();
+                    byte[] allContainers = { 0x0B, 0x0C, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13 };
+                    foreach (byte cid in allContainers)
+                    {
+                        string key = InvKey(clearConnId, cid);
+                        if (_playerInventoryItems.ContainsKey(key))
+                            _playerInventoryItems[key].Clear();
+                        if (_inventoryStackCounts.ContainsKey(key))
+                            _inventoryStackCounts[key].Clear();
+                        if (_occupiedInventorySlots.ContainsKey(key))
+                            _occupiedInventorySlots[key].Clear();
+                    }
+                    if (_inventorySlotCounters.ContainsKey(clearConnId))
+                        _inventorySlotCounters.Remove(clearConnId);
+
+                    // Restore buy prices once across all containers.
+                    if (savedChar.inventory != null)
+                    {
+                        foreach (var bpItem in savedChar.inventory)
+                        {
+                            if (bpItem.buyPrice > 0)
+                                DungeonRunners.Managers.MerchantManager.SetBuyPrice(clearConnId, bpItem.gcClass, bpItem.buyPrice);
+                        }
+                    }
+                }
+
+                // Slot indices must be globally unique across containers so HandlePickup's
+                // single-index lookup (via FindContainerForSlot) finds the right item.
+                uint globalItemIndex = 1;
 
                 foreach (var inv in inventoriesToWrite)
                 {
@@ -18770,42 +19981,44 @@ namespace DungeonRunners.Networking
                     writer.WriteByte(inv.id);
                     writer.WriteByte(0x01);
 
-                    // Only main inventory (0x0B) gets starter items
-                    // Only main inventory (0x0B) gets starter items
-                    if (inv.id == 0x0B && savedChar.inventory != null && savedChar.inventory.Count > 0)
+                    // Filter items belonging to this container. Trade (0x0D) is never persisted.
+                    bool isPersistedContainer = (inv.id == 0x0B || inv.id == 0x0C || (inv.id >= 0x0E && inv.id <= 0x13));
+                    var containerItems = (isPersistedContainer && savedChar.inventory != null)
+                        ? savedChar.inventory.FindAll(i => i.containerId == inv.id)
+                        : new List<SavedInventoryItem>();
+
+                    if (containerItems.Count > 0)
                     {
-                        // Clear stale tracking from previous zone
                         string clearConnId = conn.ConnId.ToString();
-                        if (_playerInventoryItems.ContainsKey(clearConnId))
-                            _playerInventoryItems[clearConnId].Clear();
-                        if (_inventoryStackCounts.ContainsKey(clearConnId))
-                            _inventoryStackCounts[clearConnId].Clear();
-                        if (_occupiedInventorySlots.ContainsKey(clearConnId))
-                            _occupiedInventorySlots[clearConnId].Clear();
-                        if (_inventorySlotCounters.ContainsKey(clearConnId))
-                            _inventorySlotCounters.Remove(clearConnId);
+                        writer.WriteByte((byte)containerItems.Count);
+                        Debug.LogError($"      → GCType: {inv.inventory.GCClass}, ID: 0x{inv.id:X2}, Items: {containerItems.Count}");
 
-                        writer.WriteByte((byte)savedChar.inventory.Count);
-                        Debug.LogError($"      → GCType: {inv.inventory.GCClass}, ID: 0x{inv.id:X2}, Items: {savedChar.inventory.Count}");
-
-                        // Restore buy prices from DB for sell price calculation
-                        foreach (var bpItem in savedChar.inventory)
+                        foreach (var item in containerItems)
                         {
-                            if (bpItem.buyPrice > 0)
-                                DungeonRunners.Managers.MerchantManager.SetBuyPrice(clearConnId, bpItem.gcClass, bpItem.buyPrice);
-                        }
-
-                        uint itemIndex = 1;
-                        foreach (var item in savedChar.inventory)
-                        {
+                            uint itemIndex = globalItemIndex++;
                             string gcTypeToSend = item.gcClass.ToLowerInvariant();
                             // Compute prefixed gc class via single source of truth in GCObject
                             string packetGcType = GCObject.GetPacketGCClassFor(item.gcClass);
                             var itemData = DatabaseLoader.FindItem(gcTypeToSend);
                             bool isInvChain = gcTypeToSend.Contains("chain") && !gcTypeToSend.Contains("shield");
+                            bool isInvAmulet = gcTypeToSend.Contains("amulet");
+                            bool isInvRing = gcTypeToSend.Contains("ring");
                             int modSlots;
                             if (isInvChain)
                                 modSlots = 1;  // Chain: ScaleMod slot only, no SpeedM
+                            else if (isInvAmulet || isInvRing)
+                                // Empirical 2026-05-20: non-mythic ring/amulet desync —
+                                // Amulets aren't in `armor` or `weapons` SQLite tables, so
+                                // `FindItem` returns null → fallback `modSlots = 2` writes
+                                // 2 zero bytes. But BaseAmulet/BaseRing have ZERO inherited
+                                // ItemModifier children — Phase-1 reads 0 bytes — so only
+                                // 1 byte is needed (the FLAGS byte for Item::readData).
+                                // The extra zero gets consumed as Phase 2 count, ScaleMod
+                                // block becomes orphan bytes, cascade lands on 'S'=0x53
+                                // from a later `ScaleModPAL.*` cstring → tag-83 fatal.
+                                // Repro'd by Kubjas with [INV-RESTORE] hex showing 2 zeros
+                                // before ScaleMod count for AmuletPAL.AmuletUnique* items.
+                                modSlots = 1;
                             else if (itemData != null)
                                 modSlots = itemData.modCount;
                             else
@@ -18833,6 +20046,7 @@ namespace DungeonRunners.Networking
                                              || gcTypeToSend.Contains("skillbook")
                                              || gcTypeToSend.Contains("voucher");
 
+                            int invItemStart = writer.Position;
                             writer.WriteByte(0xFF);
                             writer.WriteCString(packetGcType);
                             writer.WriteUInt32(itemIndex);
@@ -18854,6 +20068,30 @@ namespace DungeonRunners.Networking
                                     writer.WriteByte(0x00);  // transient Mod1 flags
                                 writer.WriteByte(0x00);  // ReadChildData<ItemModifier> Phase 2 count = 0
                                 Debug.LogError($"        → Simple item {itemIndex}: {gcTypeToSend} (no ScaleMod)");
+                            }
+                            else if ((gcTypeToSend.Contains("ring") || gcTypeToSend.Contains("amulet")) && gcTypeToSend.Contains("mythic"))
+                            {
+                                // Mythic jewelry — NOT in _mythicModSlots dict (only
+                                // weapons/armor are). Mirror the OPXX armor-mythic shape:
+                                // write 1 inherited Phase-1 placeholder + N placeholders
+                                // for the .gc-defined Mod1..N children + Phase-2 count=0
+                                // (mods baked in GC class, identical to how `WriteItem`'s
+                                // hasModChildren branch handles non-IG-stub mythics at
+                                // MerchantManager.cs:2660). Writing Phase-2 hashes here —
+                                // even though `WriteInitForInventory`'s mythic-ring branch
+                                // does — double-stacks the same mods in the multi-item
+                                // OPXX packet → desync → tag 83 (`'S'` from a later
+                                // ScaleModPAL cstring). Repro'd by Kubjas 2026-05-20 with
+                                // RingMythic12 + AmuletMythic7 in inventory.
+                                bool isAmuletJ = gcTypeToSend.Contains("amulet");
+                                List<string> jMods = isAmuletJ
+                                    ? DatabaseLoader.GetAmuletModifiers(item.gcClass)
+                                    : DatabaseLoader.GetRingModifiers(item.gcClass);
+                                int jModCount = jMods.Count;
+                                writer.WriteByte(0x00);  // inherited Phase-1 placeholder
+                                for (int m = 0; m < jModCount; m++) writer.WriteByte(0x00);
+                                writer.WriteByte(0x00);  // Phase-2 count = 0 (mods baked in GC)
+                                Debug.LogError($"        → Mythic jewelry {itemIndex}: {gcTypeToSend} placeholders={jModCount + 1} phase2=0");
                             }
                             else
                             {
@@ -18878,28 +20116,96 @@ namespace DungeonRunners.Networking
                                     {
                                         writer.WriteByte(0x00);
                                     }
+                                    // OP8 inventory write — same GetEffectiveRarity-style
+                                    // fallback as OP5 / drop / WriteInitForInventory. Without
+                                    // this, named-Unique items (rarity=4 in DB but no `-N`
+                                    // suffix) write zero ScaleMod bytes, leaving the stream
+                                    // short → next item's gcType cstring is read as type tags
+                                    // → comm error "type tag 108" (0x6C='l' from leather/plate
+                                    // gcType chars). Reproduced on login by Kubjas 2026-05-19.
                                     int tier = RarityHelper.GetTierFromGcType(item.gcClass);
                                     var itemRarity = RarityHelper.GetRarityFromTier(tier);
                                     if (itemRarity == ItemRarity.Normal)
+                                    {
+                                        // Use the DB-stored rarity column if it indicates a
+                                        // higher tier (was set at drop-spawn time by the
+                                        // reward branch).
+                                        if (item.rarity > 0 && item.rarity < 5)
+                                            itemRarity = (ItemRarity)item.rarity;
+                                        // Else try name-pattern detection.
+                                        else
+                                        {
+                                            int detected = DungeonRunners.Data.GCObject.DetectRarityFromGCClass(item.gcClass);
+                                            if (detected > 0 && detected < 5)
+                                                itemRarity = (ItemRarity)detected;
+                                        }
+                                    }
+
+                                    // Path B — wire-mod injection (direct + wrapper). Mirrors
+                                    // the WriteInitForInventory/Equip/Drop paths so relog
+                                    // persistence preserves the per-tier visible-bonus count.
+                                    var restoreWireMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(item.gcClass);
+                                    if (restoreWireMods.Count == 0)
+                                        restoreWireMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetWrapperIGWireMods(item.gcClass, itemRarity.ToString());
+
+                                    if (DungeonRunners.Data.ItemStatDatabase.PathBEnabled && restoreWireMods.Count > 0)
+                                    {
+                                        var hashes = new List<uint>();
+                                        foreach (var (slot, modRef) in restoreWireMods.OrderBy(w => w.Slot))
+                                        {
+                                            uint h = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(modRef);
+                                            if (h != 0) hashes.Add(h);
+                                        }
+                                        writer.WriteByte((byte)hashes.Count);
+                                        foreach (uint h in hashes)
+                                        {
+                                            writer.WriteByte(0x04);
+                                            writer.WriteUInt32(h);
+                                            writer.WriteByte(0x00);
+                                        }
+                                        Debug.LogError($"        → IG-INJECT {itemIndex}: {gcTypeToSend} rarity={itemRarity} mods={hashes.Count} phase1ModSlots={modSlots}");
+                                    }
+                                    else if (itemRarity == ItemRarity.Normal)
                                     {
                                         writer.WriteByte(0x00);
                                         Debug.LogError($"        → Equipment {itemIndex}: {gcTypeToSend} rarity=Normal (no ScaleMod)");
                                     }
                                     else
                                     {
-                                        string scaleMod = RarityHelper.GetRandomScaleMod(itemRarity);
+                                        // Deterministic pick keyed by gcClass — fixes "mods change on
+                                        // every zone-switch / relog" for items not covered by Path B
+                                        // wire-mods (e.g. dash-suffix items with no wrapper IG, or
+                                        // synthesized items like PlateUniqueHelm5).
+                                        string scaleMod = RarityHelper.GetDeterministicScaleMod(item.gcClass, itemRarity);
                                         writer.WriteByte(0x01);
                                         writer.WriteByte(0xFF);
                                         writer.WriteCString(scaleMod);
                                         writer.WriteByte(0x03);
                                         writer.WriteByte(0x15);
                                         writer.WriteUInt32(0x11111111);
-                                        Debug.LogError($"        → Equipment {itemIndex}: {gcTypeToSend} rarity={itemRarity} scaleMod={scaleMod}");
+                                        Debug.LogError($"        → Equipment {itemIndex}: {gcTypeToSend} rarity={itemRarity} scaleMod={scaleMod} (deterministic)");
                                     }
                                 }
                             }
 
-                            // Track inventory item
+                            // Per-item hex dump — every byte emitted for this item including
+                            // the 0xFF prefix, cstring, slot, x/y/count/level, placeholders,
+                            // and Phase-2 payload. Use this to bisect which item desyncs in
+                            // the OPXX restore packet (the client crash log gives you the
+                            // failing readType tag, but not the offset).
+                            {
+                                int invItemLen = writer.Position - invItemStart;
+                                var invBuf = writer.ToArray();
+                                var invHexSb = new System.Text.StringBuilder(invItemLen * 3);
+                                for (int hi = 0; hi < invItemLen; hi++)
+                                {
+                                    if (hi > 0) invHexSb.Append(' ');
+                                    invHexSb.Append(invBuf[invItemStart + hi].ToString("X2"));
+                                }
+                                Debug.LogError($"[INV-RESTORE] item#{itemIndex} gc={item.gcClass} rar={item.rarity} lv={item.storedLevel} bytes={invItemLen} hex={invHexSb}");
+                            }
+
+                            // Track inventory item (container-aware via inv.id)
                             string gcLow = item.gcClass.ToLower();
                             string nc = "Armor";
                             if (gcLow.Contains("questitem") || gcLow.Contains("consumable") || gcLow.Contains("townportal") || gcLow.Contains("ring") || gcLow.Contains("amulet") || gcLow.Contains("scroll") || gcLow.Contains("potion") || gcLow.Contains("skillbook") || gcLow.Contains("voucher"))
@@ -18911,14 +20217,13 @@ namespace DungeonRunners.Networking
                             var gcObj = new GCObject { GCClass = item.gcClass, NativeClass = nc };
                             gcObj.StoredRarity = item.rarity;
                             gcObj.StoredLevel = item.storedLevel;
-                            TrackInventoryItem(conn.ConnId.ToString(), itemIndex, gcObj, item.x, item.y);
+                            TrackInventoryItem(conn.ConnId.ToString(), itemIndex, gcObj, item.x, item.y, inv.id);
                             var itemDims = DungeonRunners.Managers.MerchantManager.GetItemDimensions(item.gcClass);
                             int iw = itemDims.width, ih = itemDims.height;
-                            OccupyInventorySlots(conn.ConnId.ToString(), item.x, item.y, iw, ih);
-                            SetStackCount(conn.ConnId.ToString(), itemIndex, item.count > 0 ? item.count : 1);
+                            OccupyInventorySlots(conn.ConnId.ToString(), item.x, item.y, iw, ih, inv.id);
+                            SetStackCount(conn.ConnId.ToString(), itemIndex, item.count > 0 ? item.count : 1, inv.id);
 
-                            Debug.LogError($"        → Item {itemIndex}: {gcTypeToSend} at ({item.x},{item.y})");
-                            itemIndex++;
+                            Debug.LogError($"        → Item {itemIndex} (container 0x{inv.id:X2}): {gcTypeToSend} at ({item.x},{item.y})");
                         }
                     }
                     else
@@ -18926,6 +20231,14 @@ namespace DungeonRunners.Networking
                         writer.WriteByte(0x00);
                         Debug.LogError($"      → GCType: {inv.inventory.GCClass}, ID: 0x{inv.id:X2}, Items: 0");
                     }
+                }
+
+                // Ensure new placements (GetNextInventorySlot starts at 100) never collide
+                // with slot indices we just assigned to loaded items.
+                {
+                    string sc = conn.ConnId.ToString();
+                    uint floor = globalItemIndex > 100 ? globalItemIndex : 100;
+                    _inventorySlotCounters[sc] = floor;
                 }
 
                 writer.WriteByte(0x00);
@@ -20074,6 +21387,10 @@ namespace DungeonRunners.Networking
                     {
                         Debug.LogError($"[QUEUE-BRIDGE] Queue ready for {username} — resending social init");
                         SocialManager.Instance.SendLoginSocialInit(conn, sc.Name, SendSocialViaAuth);
+                        PosseManager.Instance.SendConnectionNotification(conn, true, SendSocialViaAuth);
+                        SendPosseStateForCharacter(conn, sc.Id, SendSocialViaAuth);
+                        try { PosseManager.Instance.NotifyMemberStateChange(sc.Id, this); }
+                        catch (Exception ex2) { Debug.LogError($"[POSSE] login-notify (OnQueueStreamReady) failed: {ex2.Message}"); }
                     }
                     break;
                 }

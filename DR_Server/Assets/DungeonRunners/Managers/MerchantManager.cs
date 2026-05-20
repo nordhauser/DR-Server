@@ -374,14 +374,15 @@ namespace DungeonRunners.Managers
                 int minItemLevel = invData.minItemLevel;
                 int maxItemLevel = invData.maxItemLevel;
                 float regenerateIntervalSeconds = invData.regenerateIntervalSeconds > 0 ? invData.regenerateIntervalSeconds : DEFAULT_REFRESH_INTERVAL_SECONDS;
-                ApplyNativeMerchantInventoryOverrides(merchantData.npcGcType, invData, ref itemGenerator, ref minItemLevel, ref maxItemLevel, ref regenerateIntervalSeconds);
+                string label = invData.label;
+                ApplyNativeMerchantInventoryOverrides(merchantData.npcGcType, invData, ref itemGenerator, ref minItemLevel, ref maxItemLevel, ref regenerateIntervalSeconds, ref label);
 
                 var runtimeInv = new MerchantInventoryRuntimeData
                 {
                     name = invData.name,
                     gcType = invData.gcType,
                     id = invData.id,
-                    label = invData.label,
+                    label = label,
                     width = invData.width,
                     height = invData.height,
                     staticContents = invData.staticContents,
@@ -473,7 +474,7 @@ namespace DungeonRunners.Managers
             return runtime;
         }
 
-        private static void ApplyNativeMerchantInventoryOverrides(string npcGcType, MerchantInventoryData invData, ref string itemGenerator, ref int minItemLevel, ref int maxItemLevel, ref float regenerateIntervalSeconds)
+        private static void ApplyNativeMerchantInventoryOverrides(string npcGcType, MerchantInventoryData invData, ref string itemGenerator, ref int minItemLevel, ref int maxItemLevel, ref float regenerateIntervalSeconds, ref string label)
         {
             if (string.Equals(npcGcType, "world.tutorial.npc.HermitVendor", StringComparison.OrdinalIgnoreCase) && invData.id == 2)
             {
@@ -481,6 +482,39 @@ namespace DungeonRunners.Managers
                 minItemLevel = 3;
                 maxItemLevel = 10;
                 regenerateIntervalSeconds = DEFAULT_REFRESH_INTERVAL_SECONDS;
+            }
+
+            // Townstone weapon vendors (Hughard / VendorWeapon2 / VendorWeapon3):
+            // restore native 300s regen interval (DB had Tim's invented 180s); rename
+            // tab 3 from "Superior" to retail label "Scrap Heap" per Kubjas's memory.
+            if (string.Equals(npcGcType, "world.town.npc.VendorWeapon1", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(npcGcType, "world.town.npc.VendorWeapon2", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(npcGcType, "world.town.npc.VendorWeapon3", StringComparison.OrdinalIgnoreCase))
+            {
+                regenerateIntervalSeconds = DEFAULT_REFRESH_INTERVAL_SECONDS;
+                if (invData.id == 3)
+                    label = "Scrap Heap";
+            }
+
+            // Townstone weapon vendors level range cascade — symmetric across all 3 tabs
+            // per Kubjas's retail memory. V1 locked at 3-20 by direct recall; V2/V3 set
+            // to a clean overlapping cascade since the client carries no per-vendor level
+            // data (it's locked inside game.pkg). Boundary overlap at 20 (V1↔V2) and 40-50
+            // (V2↔V3) is standard MMO design.
+            if (string.Equals(npcGcType, "world.town.npc.VendorWeapon1", StringComparison.OrdinalIgnoreCase))
+            {
+                minItemLevel = 3;
+                maxItemLevel = 20;
+            }
+            else if (string.Equals(npcGcType, "world.town.npc.VendorWeapon2", StringComparison.OrdinalIgnoreCase))
+            {
+                minItemLevel = 20;
+                maxItemLevel = 50;
+            }
+            else if (string.Equals(npcGcType, "world.town.npc.VendorWeapon3", StringComparison.OrdinalIgnoreCase))
+            {
+                minItemLevel = 40;
+                maxItemLevel = 100;
             }
         }
 
@@ -858,9 +892,11 @@ namespace DungeonRunners.Managers
             runtimeInv.items.Clear();
             runtimeInv.generatedForLevel = playerLevel;
 
-            // Base filters: regular -N suffix items only
+            // Base filters: regular -N suffix items, OR mythic items recognised by
+            // IsEnabledMythicItem (mythics are named like "items.pal.1haxemythicpal.1haxemythic1"
+            // — no -N suffix, so they previously failed this filter entirely).
             var safeItems = _sellableItems.Where(i =>
-                System.Text.RegularExpressions.Regex.IsMatch(i.gcType, @"-\d+$") &&
+                (System.Text.RegularExpressions.Regex.IsMatch(i.gcType, @"-\d+$") || IsEnabledMythicItem(i.gcType)) &&
                 i.gcType.IndexOf("PreBuilt", StringComparison.OrdinalIgnoreCase) < 0 &&
                 i.gcType.IndexOf("PartialBuilt", StringComparison.OrdinalIgnoreCase) < 0 &&
                 i.gcType.IndexOf("Seasonal", StringComparison.OrdinalIgnoreCase) < 0 &&
@@ -886,23 +922,37 @@ namespace DungeonRunners.Managers
             if (VerboseMerchantItemLogging)
                 Debug.LogError($"[MerchantManager] IG FILTER: inventory='{runtimeInv.name}' ig='{ig}'");
             System.Func<string, bool> isMythicItem = (gc) => IsEnabledMythicItem(gc);
+            // Single Random reused for IG weighting filter AND placement shuffle below.
+            var random = CreateMerchantRandom();
 
             if (ig.Equals("MerchantWeaponIG", StringComparison.OrdinalIgnoreCase))
             {
+                // Authored MerchantWeaponIG.gc has Rare (Chance=1) + Unique (Chance=20).
+                // Honour the weighting: tier-4 (Rare/green) always eligible; tier-5
+                // (Unique/purple) is gated to ~1/20 chance per candidate so it stays a
+                // rare occurrence, matching the authored Chance ratio.
                 safeItems = safeItems.Where(i =>
                 {
                     if (isMythicItem(i.gcType)) return false;
+                    if (!IsWeaponType(i.gcType)) return false;
                     int suffix = RarityHelper.GetTierFromGcType(i.gcType);
-                    return IsWeaponType(i.gcType) && suffix >= 4 && suffix <= 5;
+                    if (suffix == 4) return true;
+                    if (suffix == 5) return random.Next(20) == 0;
+                    return false;
                 });
             }
             else if (ig.Equals("MerchantArmorIG", StringComparison.OrdinalIgnoreCase))
             {
+                // Authored MerchantArmorIG.gc has Rare (Chance=1) + Unique (Chance=20).
+                // Same weighted gating as MerchantWeaponIG above.
                 safeItems = safeItems.Where(i =>
                 {
                     if (isMythicItem(i.gcType)) return false;
+                    if (!IsArmorType(i.gcType)) return false;
                     int suffix = RarityHelper.GetTierFromGcType(i.gcType);
-                    return IsArmorType(i.gcType) && suffix >= 4 && suffix <= 5;
+                    if (suffix == 4) return true;
+                    if (suffix == 5) return random.Next(20) == 0;
+                    return false;
                 });
             }
             else if (ig.Equals("MerchantTrashIG", StringComparison.OrdinalIgnoreCase))
@@ -923,6 +973,37 @@ namespace DungeonRunners.Managers
                     return suffix == 2;
                 });
             }
+            else if (ig.Equals("MerchantSpecialEvent01IG", StringComparison.OrdinalIgnoreCase))
+            {
+                // Amazonian (MerchantSpecialEvent01IG) mainly sells Rare/Unique at the tab's
+                // level range, with Mythic appearances as an occasional treat.
+                //
+                // Mythic items come in two flavours:
+                //   - SELF-CONTAINED (e.g. 1HSwordMythic1 "Wrath"): inline Mod1..Mod5 blocks
+                //     with Quality=MYTHIC. Render as rainbow when sold directly.
+                //   - IG-STUB (e.g. 2HAxeMythic101 "Diabolical"): no inline mods — mods come
+                //     from the IG → MG → ModPAL pipeline parsed by ItemStatDatabase at boot.
+                //     We allow them through if that pipeline produced wire-mod entries; WriteItem
+                //     appends a single Binder mod (Quality=MYTHIC) as a Phase 2 server-sent
+                //     ItemModifier child so the client renders rainbow.
+                safeItems = safeItems.Where(i =>
+                {
+                    if (isMythicItem(i.gcType))
+                    {
+                        string mkey = i.gcType.ToLowerInvariant();
+                        if (mkey.StartsWith("items.pal.")) mkey = mkey.Substring(10);
+                        if (!_mythicModSlots.TryGetValue(mkey, out int mslots)) return false;
+                        // IG-stub: only allow if ItemStatDatabase has wire mods we can inject
+                        if (mslots < 3 && DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(mkey).Count == 0)
+                            return false;
+                        return random.Next(10) == 0;        // Mythic ~10% (occasional treat across tabs)
+                    }
+                    int suffix = RarityHelper.GetTierFromGcType(i.gcType);
+                    if (suffix == 4) return true;            // Rare always (Chance=4 in authored)
+                    if (suffix == 5) return random.Next(4) == 0;  // Unique ~25% (Chance=1, less common than Rare)
+                    return false;
+                });
+            }
 
             // Reject any mythic item not in the lookup table — unknown byte count = crash
             // Also reject mythic items with modSlots <= 1 (zero GC mods = item pack/seasonal exclusives, not real equipment)
@@ -938,6 +1019,8 @@ namespace DungeonRunners.Managers
             });
 
             var safeList = safeItems.ToList();
+            if (VerboseMerchantItemLogging)
+                Debug.LogError($"[MERCHANT-DIAG] candidates inv='{runtimeInv.name}' ig={ig} count={safeList.Count} maxLvl={authoredMaxItemLevel} playerLvl={playerLevel}");
             if (VerboseMerchantItemLogging)
                 Debug.LogError($"[MerchantManager] 📦 {runtimeInv.name} (ig={ig}): {safeList.Count} candidates after filtering");
             // LOG EVERY MYTHIC ITEM that passed filtering for this tab
@@ -955,7 +1038,6 @@ namespace DungeonRunners.Managers
                 }
             }
             if (safeList.Count == 0) return;
-            var random = CreateMerchantRandom();
             var available = safeList.OrderBy(x => random.Next()).ToList();
             bool[,] grid = new bool[invData.width, invData.height];
             foreach (var itemData in available)
@@ -995,15 +1077,19 @@ namespace DungeonRunners.Managers
                     }
 
                     // USE SAME LEVEL AS WriteItem SENDS TO CLIENT
-                    // Mythic items get FIXED level at creation (ScaleToObserverLevel is consumables only)
-                    // Level clamped to configurable range from server.cfg (defaults from ItemTimeline.gc)
+                    // Mythics roll within the tab's authored level range like every other item,
+                    // then clamp to the configured mythic min/max safety bounds. (Previously this
+                    // used playerLevel directly which caused all tabs of a multi-tab mythic vendor
+                    // — e.g. Amazonian's Low/Medium/High/Max — to spawn mythics at the same level
+                    // regardless of which tab they belonged to.)
                     bool isMythicGen = IsEnabledMythicItem(itemData.gcType);
                     int level;
                     if (isMythicGen)
                     {
+                        int rolledLevel = RollMerchantStockLevel(runtimeInv, random);
                         int mythicMin = DungeonRunners.Core.ServerSettings.Get("mythicMinLevel", 15);
                         int mythicMax = DungeonRunners.Core.ServerSettings.Get("mythicMaxLevel", 100);
-                        level = Math.Max(mythicMin, Math.Min(mythicMax, playerLevel));
+                        level = Math.Max(mythicMin, Math.Min(mythicMax, rolledLevel));
                     }
                     else
                     {
@@ -1346,6 +1432,12 @@ namespace DungeonRunners.Managers
                 }
 
                 Debug.LogError($"[MerchantManager] 📤 Sent merchant refresh for {pending.npcGcClass}: {data.Length} bytes to {sent} clients");
+                if (VerboseMerchantItemLogging)
+                {
+                    int totalInv = runtimeMerchant.inventories.Count(inv => !inv.staticContents);
+                    int totalItems = runtimeMerchant.inventories.Where(inv => !inv.staticContents).Sum(inv => inv.items.Count);
+                    Debug.LogError($"[MERCHANT-DIAG] flushA npc={pending.npcGcClass} compId=0x{pending.componentId:X4} dataLen={data.Length} removed={pending.removedItemIds.Count} dynInv={totalInv} dynItems={totalItems} sentTo={sent}");
+                }
             }
         }
 
@@ -1410,8 +1502,21 @@ namespace DungeonRunners.Managers
             if (conn == null || !conn.IsConnected || !conn.HasActiveMerchantRefresh)
                 return false;
 
-            if (conn.ActiveMerchantRefreshDueUtc <= DateTime.UtcNow)
+            // The client emits subMessage 0x22 with empty payload when its inventory-reset
+            // timer expires — that's the cue to push fresh items back. Previously we only
+            // marked the connection "ready" but no caller acted on it, so the shop appeared
+            // empty until the player reopened it. Perform the regen + refresh inline here.
+            var nowBoundary = DateTime.UtcNow;
+            if (VerboseMerchantItemLogging)
+            {
+                double overdueSec = (nowBoundary - conn.ActiveMerchantRefreshDueUtc).TotalSeconds;
+                Debug.LogError($"[MERCHANT-DIAG] boundary conn={conn.ConnId} npc={conn.ActiveMerchantNpcGcClass} dueUtcOverdue={overdueSec:F2}s ready={conn.ActiveMerchantRefreshReady}");
+            }
+            if (conn.ActiveMerchantRefreshDueUtc <= nowBoundary)
+            {
                 conn.ActiveMerchantRefreshReady = true;
+                return FlushClientMerchantRefresh(conn, sendPacket);
+            }
 
             return false;
         }
@@ -1441,21 +1546,27 @@ namespace DungeonRunners.Managers
             }
 
             var removedItemIds = CaptureDynamicInventoryItemIds(runtimeMerchantBefore);
+            int preItemsB = runtimeMerchantBefore.inventories.Where(inv => !inv.staticContents).Sum(inv => inv.items.Count);
             ForceRegenerate(npcGcType, conn.PlayerLevel > 0 ? conn.PlayerLevel : 1);
 
             if (!_runtimeMerchants.TryGetValue(npcGcType, out var runtimeMerchant))
             {
                 conn.HasActiveMerchantRefresh = false;
                 conn.ActiveMerchantRefreshReady = false;
+                if (VerboseMerchantItemLogging)
+                    Debug.LogError($"[MERCHANT-DIAG] flushB-abort npc={npcGcType} reason=runtimeMissingPostRegen");
                 return false;
             }
 
+            int postItemsB = runtimeMerchant.inventories.Where(inv => !inv.staticContents).Sum(inv => inv.items.Count);
             byte[] data = BuildMerchantInventoryRefreshPacket(componentId, runtimeMerchant, removedItemIds);
             if (data.Length > 2)
             {
                 sendPacket(conn, 0x01, 0x0F, data);
                 Debug.LogError($"[MerchantManager] Sent client merchant refresh for {npcGcType}: {data.Length} bytes to {conn.LoginName ?? conn.ConnId.ToString()}");
             }
+            if (VerboseMerchantItemLogging)
+                Debug.LogError($"[MERCHANT-DIAG] flushB conn={conn.ConnId} npc={npcGcType} dataLen={data.Length} removed={removedItemIds.Count} itemsBefore={preItemsB} itemsAfter={postItemsB} playerLvl={conn.PlayerLevel}");
 
             ScheduleClientMerchantRefresh(conn, npcGcType, componentId, now, true);
             return true;
@@ -1533,6 +1644,7 @@ namespace DungeonRunners.Managers
                 if (invData == null)
                     continue;
 
+                int preItemCount = runtimeInv.items.Count;
                 Debug.LogError($"[MerchantManager] 🔄 REFRESHING inventory '{runtimeInv.name}' for {npcGcClass}");
                 foreach (var item in runtimeInv.items)
                 {
@@ -1541,6 +1653,8 @@ namespace DungeonRunners.Managers
                 }
                 GenerateInventoryItems(runtimeMerchant, runtimeInv, invData, runtimeInv.generatedForLevel > 0 ? runtimeInv.generatedForLevel : 100);
                 _lastRegeneration[regenKey] = now;
+                if (VerboseMerchantItemLogging)
+                    Debug.LogError($"[MERCHANT-DIAG] regenA npc={npcGcClass} inv={runtimeInv.id} '{runtimeInv.name}' ig={runtimeInv.itemGenerator} lvl={runtimeInv.generatedForLevel} elapsed={elapsed:F1}s itemsBefore={preItemCount} itemsAfter={runtimeInv.items.Count}");
                 refreshedViews++;
                 refreshedItems += runtimeInv.items.Count;
             }
@@ -2499,19 +2613,68 @@ namespace DungeonRunners.Managers
                     gcTypeToSend.Contains("boss") ||
                     gcTypeToSend.Contains("generated");
 
-                if (hasModChildren)
+                // Path B — non-mythic items can also have wire mods via the IG-stub pipeline
+                // (Rare/Unique direct-Item IGs + Magic/Superior wrapper IGs). Try direct lookup
+                // first, then wrapper-IG fallback keyed by rarity.
+                var wireMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetItemWireMods(gcTypeToSend);
+                string wireSource = wireMods.Count > 0 ? "direct" : null;
+                if (wireMods.Count == 0)
                 {
-                    // No stream children — mods already defined in GC class
-                    writer.WriteByte(0x00);
-                    if (verboseItemLogging)
-                        Debug.LogError($"[WriteItem] SPECIAL (0 children): {gcTypeToSend}, rarity={item.rarity}, modSlots={modSlots}, dbMod={itemData?.modCount}");
+                    wireMods = DungeonRunners.Data.ItemStatDatabase.Instance.GetWrapperIGWireMods(gcTypeToSend, item.rarity.ToString());
+                    if (wireMods.Count > 0) wireSource = $"wrapper:{item.rarity}";
+                }
+                bool hasInjectableMods = DungeonRunners.Data.ItemStatDatabase.PathBEnabled && wireMods.Count > 0;
+
+                if (hasModChildren || hasInjectableMods)
+                {
+                    if (wireMods.Count > 0)
+                    {
+                        // Pre-resolve hashes; skip any mod whose class isn't in the dict.
+                        // Wire format: per-mod (0x04 + UInt32(DJB2(lowered)) + 0x00 flags) per the
+                        // 2026-05-19 mythic IG-stub fix. Rarity-agnostic per Ghidra GCClassRegistry::readType.
+                        var resolved = new List<uint>(wireMods.Count);
+                        var skipped = new List<string>();
+                        foreach (var (slot, modRef) in wireMods.OrderBy(w => w.Slot))
+                        {
+                            uint h = DungeonRunners.Data.ItemStatDatabase.Instance.GetGCClassHash(modRef);
+                            if (h != 0) resolved.Add(h);
+                            else skipped.Add(modRef);
+                        }
+                        if (resolved.Count == 0)
+                        {
+                            writer.WriteByte(0x00);
+                            Debug.LogError($"[WriteItem] IG-INJECT (all mods missing from dict, count=0): gc={gcTypeToSend} rarity={item.rarity} src={wireSource} skipped=[{string.Join(",", skipped)}]");
+                        }
+                        else
+                        {
+                            writer.WriteByte((byte)resolved.Count);   // Phase 2 count
+                            foreach (uint h in resolved)
+                            {
+                                writer.WriteByte(0x04);               // type tag: 4-byte class hash
+                                writer.WriteUInt32(h);                // DJB2(lowered canonical name)
+                                writer.WriteByte(0x00);               // ItemModifier flags=0
+                            }
+                            if (verboseItemLogging)
+                            {
+                                string hashes = string.Join(",", resolved.Select(x => $"0x{x:X8}"));
+                                Debug.LogError($"[WriteItem] IG-INJECT: gc={gcTypeToSend} rarity={item.rarity} src={wireSource} modSlots={modSlots} mods={resolved.Count} skipped={skipped.Count} djb2=[{hashes}]");
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // hasModChildren=true but no wire mods (e.g., partialbuilt with no IG-stub).
+                        writer.WriteByte(0x00);
+                        if (verboseItemLogging)
+                            Debug.LogError($"[WriteItem] SPECIAL (0 children): {gcTypeToSend}, rarity={item.rarity}, modSlots={modSlots}, dbMod={itemData?.modCount}");
+                    }
                 }
                 else
                 {
-                    // Regular -N suffix items: write ScaleMod child
+                    // Regular -N suffix items not covered by Path B: write single ScaleMod child (legacy fallback).
                     string scaleMod = !string.IsNullOrEmpty(item.scaleMod) ? item.scaleMod : RarityHelper.GetRandomScaleMod(item.rarity);
                     if (verboseItemLogging)
-                        Debug.LogError($"[WriteItem] EQUIP: {gcTypeToSend}, rarity={item.rarity}, ScaleMod={scaleMod}, modSlots={modSlots}, dbMod={itemData?.modCount}");
+                        Debug.LogError($"[WriteItem] EQUIP-SCALEMOD: {gcTypeToSend}, rarity={item.rarity}, ScaleMod={scaleMod}, modSlots={modSlots}, dbMod={itemData?.modCount}");
                     writer.WriteByte(0x01);
                     writer.WriteByte(0xFF);
                     writer.WriteCString(scaleMod);
@@ -2722,6 +2885,22 @@ namespace DungeonRunners.Managers
         {
             if (ScaleMods.TryGetValue(rarity, out var mods) && mods.Length > 0)
                 return mods[_random.Next(mods.Length)];
+            return "ScaleModPAL.Rare.Mod1";
+        }
+
+        // Deterministic per-gcClass ScaleMod pick. Used by write paths that fire on every
+        // zone-load / relog (INV-RESTORE, WriteInit*) to avoid "mods change on relog"
+        // symptom when wire-mods aren't available for the item. Same gcClass+rarity always
+        // returns the same mod across sessions.
+        public static string GetDeterministicScaleMod(string gcClass, ItemRarity rarity)
+        {
+            if (ScaleMods.TryGetValue(rarity, out var mods) && mods.Length > 0)
+            {
+                uint h = 5381;
+                if (!string.IsNullOrEmpty(gcClass))
+                    foreach (char c in gcClass.ToLowerInvariant()) h = h * 33u + (uint)c;
+                return mods[(int)(h % (uint)mods.Length)];
+            }
             return "ScaleModPAL.Rare.Mod1";
         }
 

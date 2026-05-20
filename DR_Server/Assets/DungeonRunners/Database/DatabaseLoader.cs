@@ -674,7 +674,13 @@ public static class DatabaseLoader
     {
         var modifiers = new List<string>();
         if (string.IsNullOrEmpty(gcType)) { modifiers.Add("RingModPAL.Mod1"); return modifiers; }
-        string baseKey = gcType.ToLower();
+        // GeneralItemDatabase stores keys without the `items.pal.` prefix
+        // (e.g. `ringmythicpal.ringmythic15.mod1`). Callers pass either form
+        // depending on context. Strip the prefix so the lookup hits the
+        // actual rows instead of falling back to the wrong placeholder
+        // count via the `ringmodpal.mod1` sentinel.
+        string baseKey = gcType.ToLowerInvariant();
+        if (baseKey.StartsWith("items.pal.")) baseKey = baseKey.Substring("items.pal.".Length);
         for (int i = 1; i <= 10; i++)
         {
             string modKey = $"{baseKey}.mod{i}";
@@ -688,7 +694,9 @@ public static class DatabaseLoader
     {
         var modifiers = new List<string>();
         if (string.IsNullOrEmpty(gcType)) { modifiers.Add("AmuletModPAL.Mod1"); return modifiers; }
-        string baseKey = gcType.ToLower();
+        // See GetRingModifiers — same prefix-strip rationale.
+        string baseKey = gcType.ToLowerInvariant();
+        if (baseKey.StartsWith("items.pal.")) baseKey = baseKey.Substring("items.pal.".Length);
         for (int i = 1; i <= 10; i++)
         {
             string modKey = $"{baseKey}.mod{i}";

@@ -1,9 +1,12 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using UnityEngine;
 using DungeonRunners.Utilities;
 using DungeonRunners.Networking;
+using DungeonRunners.Database;
 
 namespace DungeonRunners.Managers
 {
@@ -15,19 +18,88 @@ namespace DungeonRunners.Managers
         private Dictionary<string, PlayerQuestState> _playerQuests = new Dictionary<string, PlayerQuestState>();
         private Action<RRConnection, byte, byte, byte[]> _sendPacket;
 
-        // Info-style quests authored AutoAcceptOnQuery + Temporary in .gc — help-text dialogs.
-        // Server treats them as accept-and-immediately-finalize so they never persist in the
-        // quest journal. Not added to CompletedQuests either, so the `!` stays on the giver
-        // and the player can re-read the dialog any time.
-        private static readonly HashSet<string> _autoCompleteOnAcceptQuestIds =
-            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        // Info-style quests authored AutoAcceptOnQuery + Temporary + 0 objectives in .gc —
+        // help-text dialogs and short flavour quests. Server treats them as
+        // accept-and-immediately-finalize so they never persist in the journal. Not added to
+        // CompletedQuests either, so the `!` stays on the giver and the player can re-read
+        // any time.
+        //
+        // Populated lazily at first quest accept by scanning Database/gc/Q*.gc for the
+        // signature, then matching basenames against DatabaseLoader.Quests entries with
+        // zero authored objectives. Zero-objective filter avoids basename collisions
+        // (e.g. many zones have a Q01_a1, but only the info-style ones lack objective rows).
+        private static HashSet<string> _autoCompleteOnAcceptQuestIds = null;
+        private static readonly object _autoCompleteLock = new object();
+
+        private static HashSet<string> GetAutoCompleteOnAcceptIds()
         {
-            "quests.base.HelperNoobosaur.Q101_a1",
-            "quests.base.HelperNoobosaur.Q111_a1",
-            "quests.base.HelperNoobosaur.Q112_a1",
-            "quests.base.HelperNoobosaur.Q121_a1",
-            "quests.base.HelperNoobosaur.Q131_a1",
-        };
+            if (_autoCompleteOnAcceptQuestIds != null) return _autoCompleteOnAcceptQuestIds;
+            lock (_autoCompleteLock)
+            {
+                if (_autoCompleteOnAcceptQuestIds != null) return _autoCompleteOnAcceptQuestIds;
+                _autoCompleteOnAcceptQuestIds = LoadAutoCompleteOnAcceptSet();
+            }
+            return _autoCompleteOnAcceptQuestIds;
+        }
+
+        private static HashSet<string> LoadAutoCompleteOnAcceptSet()
+        {
+            var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                string gcDir;
+#if UNITY_EDITOR
+                gcDir = Path.Combine(Application.dataPath, "DungeonRunners/Database/gc");
+#else
+                gcDir = Path.Combine(Application.dataPath, "..", "Database", "gc");
+#endif
+                if (!Directory.Exists(gcDir))
+                {
+                    Debug.LogError($"[QUEST-AUTOCOMPLETE] gc dir not found: {gcDir}");
+                    return result;
+                }
+
+                // Step 1: scan Q*.gc files, collect basenames matching the info-quest signature
+                var infoBasenames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var rxAuto = new Regex(@"(?m)^\s*AutoAcceptOnQuery\s*=\s*true\s*;", RegexOptions.Compiled);
+                var rxTemp = new Regex(@"(?m)^\s*Temporary\s*=\s*true\s*;", RegexOptions.Compiled);
+                var rxObj  = new Regex(@"(?m)^\s*\*\s+extends\s+quests\.base\.\w+Objective", RegexOptions.Compiled);
+                foreach (var file in Directory.EnumerateFiles(gcDir, "Q*.gc"))
+                {
+                    try
+                    {
+                        string content = File.ReadAllText(file);
+                        if (!rxAuto.IsMatch(content)) continue;
+                        if (!rxTemp.IsMatch(content)) continue;
+                        if (rxObj.IsMatch(content)) continue;
+                        infoBasenames.Add(Path.GetFileNameWithoutExtension(file));
+                    }
+                    catch { /* skip unreadable */ }
+                }
+
+                // Step 2: match basenames against DB quests with zero objectives.
+                // Zero-objective filter is the disambiguator for shared basenames (e.g. Q01_a1
+                // exists in many zones; only the truly info-style ones have no objectives).
+                foreach (var q in DatabaseLoader.Quests)
+                {
+                    if (string.IsNullOrEmpty(q.id)) continue;
+                    if (q.objectives != null && q.objectives.Count > 0) continue;
+                    int dot = q.id.LastIndexOf('.');
+                    string basename = dot >= 0 ? q.id.Substring(dot + 1) : q.id;
+                    if (infoBasenames.Contains(basename))
+                    {
+                        result.Add(q.id);
+                        Debug.LogError($"[QUEST-AUTOCOMPLETE] info quest: {q.id}");
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[QUEST-AUTOCOMPLETE] Boot scan failed: {e.Message}");
+            }
+            Debug.LogError($"[QUEST-AUTOCOMPLETE] Detected {result.Count} info-style auto-complete quests");
+            return result;
+        }
 
         // ═══════════════════════════════════════════════════════════════════
         // Quest kill-objective monster-type lookup, parsed from Q*.gc files
@@ -832,7 +904,7 @@ namespace DungeonRunners.Managers
                 // Auto-accept info quests (HelperNoobosaur help dialogs): immediately remove
                 // from active and send Finalize + Remove packets so the journal stays clean.
                 // Do NOT add to CompletedQuests so the player can re-read the dialog later.
-                if (_autoCompleteOnAcceptQuestIds.Contains(quest.id))
+                if (GetAutoCompleteOnAcceptIds().Contains(quest.id))
                 {
                     Debug.LogError($"[QUEST-AUTOCOMPLETE] Finalizing info quest {quest.id} instanceId={result.Quest.InstanceId}");
                     var playerState = GetPlayerState(conn.ConnId.ToString());

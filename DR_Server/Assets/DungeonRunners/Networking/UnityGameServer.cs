@@ -16474,14 +16474,61 @@ namespace DungeonRunners.Networking
                   zoneWriter.WriteByte(0xFF);                              // Flag - WAS MISSING!
                   zoneWriter.WriteCString("world.town.quest.Q01_a1");      // Quest zone source - WAS MISSING!*/
 
-                ////////////THIS BELOW STARTS US AT  DEW VALLEY////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-                zoneWriter.WriteCString("tutorial");
+                ////////////SPAWN AT LAST-SAVED ZONE (native behaviour); dungeons redirect to respawn_zone////////////
+                // The DB persists characters.current_zone on every save (CharacterRepository.cs:262).
+                // For fresh characters the default is 'tutorial', so they correctly start in Dew Valley.
+                // For existing characters, restore the saved zone — but if the saved zone is a dungeon
+                // (zones.respawn_zone points elsewhere), redirect to the safe hub instead. Dungeons are
+                // instanced and reset on logout; native MMO behaviour is to spawn at the dungeon's
+                // respawn target (typically 'town' for dungeon01+, 'tutorial' for dungeon00).
+                // Safe zones (town, tutorial, thehub, pvp_*) are self-referential in respawn_zone
+                // and pass through unchanged.
+                string spawnZoneName = "tutorial";
+                var savedChar = CharacterRepository.GetCharacter(character.Id);
+                if (savedChar != null && !string.IsNullOrWhiteSpace(savedChar.currentZoneName))
+                {
+                    string requested = savedChar.currentZoneName.Trim();
+                    var savedZone = _zones.Values.FirstOrDefault(z =>
+                        string.Equals(z.name, requested, StringComparison.OrdinalIgnoreCase));
+                    if (savedZone != null)
+                    {
+                        bool needsRedirect = !string.IsNullOrEmpty(savedZone.respawnZone)
+                            && !string.Equals(savedZone.respawnZone, savedZone.name, StringComparison.OrdinalIgnoreCase);
+                        if (needsRedirect)
+                        {
+                            var redirect = _zones.Values.FirstOrDefault(z =>
+                                string.Equals(z.name, savedZone.respawnZone, StringComparison.OrdinalIgnoreCase));
+                            if (redirect != null)
+                            {
+                                spawnZoneName = redirect.name;
+                                Debug.LogError($"[ZONE-MSG] Dungeon logout redirect: {savedZone.name} -> {redirect.name}");
+                            }
+                            else
+                            {
+                                spawnZoneName = savedZone.name;
+                                Debug.LogError($"[ZONE-MSG] Redirect target '{savedZone.respawnZone}' not in _zones; spawning at {savedZone.name}");
+                            }
+                        }
+                        else
+                        {
+                            spawnZoneName = savedZone.name;
+                        }
+                    }
+                    else
+                    {
+                        Debug.LogError($"[ZONE-MSG] Saved zone '{requested}' not found in _zones; falling back to tutorial");
+                    }
+                }
+
+                zoneWriter.WriteCString(spawnZoneName);
                 // Get zone for tracking purposes
-                var startZone = _zones.Values.FirstOrDefault(z => z.name.ToLower() == "tutorial");
+                var startZone = _zones.Values.FirstOrDefault(z =>
+                    string.Equals(z.name, spawnZoneName, StringComparison.OrdinalIgnoreCase));
                 uint zoneId = startZone?.id ?? 2781714545u;
                 conn.CurrentZoneId = zoneId;  // Store for HandleZoneChannel tracking
-                string zoneName = startZone?.name ?? "tutorial";
+                string zoneName = startZone?.name ?? spawnZoneName;
                 conn.CurrentZoneName = zoneName;  // Exact zone name for multiplayer
+                Debug.LogError($"[ZONE-MSG] Spawn zone resolved: {zoneName} (saved={savedChar?.currentZoneName ?? "<null>"})");
                 GroupManager.Instance.UpdateMemberZone(conn.ConnId, zoneName);
                 // Posse: live-update other members' rosters with the new Location/world.
                 try { if (conn.CharSqlId != 0) PosseManager.Instance.NotifyMemberStateChange(conn.CharSqlId, this); }

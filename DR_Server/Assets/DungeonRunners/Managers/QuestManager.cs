@@ -15,6 +15,20 @@ namespace DungeonRunners.Managers
         private Dictionary<string, PlayerQuestState> _playerQuests = new Dictionary<string, PlayerQuestState>();
         private Action<RRConnection, byte, byte, byte[]> _sendPacket;
 
+        // Info-style quests authored AutoAcceptOnQuery + Temporary in .gc — help-text dialogs.
+        // Server treats them as accept-and-immediately-finalize so they never persist in the
+        // quest journal. Not added to CompletedQuests either, so the `!` stays on the giver
+        // and the player can re-read the dialog any time.
+        private static readonly HashSet<string> _autoCompleteOnAcceptQuestIds =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "quests.base.HelperNoobosaur.Q101_a1",
+            "quests.base.HelperNoobosaur.Q111_a1",
+            "quests.base.HelperNoobosaur.Q112_a1",
+            "quests.base.HelperNoobosaur.Q121_a1",
+            "quests.base.HelperNoobosaur.Q131_a1",
+        };
+
         // ═══════════════════════════════════════════════════════════════════
         // Quest kill-objective monster-type lookup, parsed from Q*.gc files
         // (plus manual entries for hand-authored DB quests).
@@ -421,21 +435,24 @@ namespace DungeonRunners.Managers
             // Instance ID directly after type reference
             writer.WriteUInt32(activeQuest.InstanceId);
 
-            // Objectives - client crashes with 0 objectives, so add default if empty
+            // Objectives - client crashes with 0 objectives, so add default if empty.
+            // For authored zero-objective quests (HelperNoobosaur info dialogs, talk-to quests
+            // with AutoAcceptOnQuery), the placeholder is shown as already complete so the
+            // quest is immediately turn-in-ready.
             var objectives = activeQuest.Objectives ?? new List<QuestProgress>();
-            if (objectives.Count == 0)
+            bool zeroObjectiveQuest = objectives.Count == 0;
+            if (zeroObjectiveQuest)
             {
                 objectives = new List<QuestProgress> {
-            new QuestProgress {
-                Label = "Read",
-                Required = 1,
-                Current = 0  // NOT complete on accept
-            }
-        };
+                    new QuestProgress {
+                        Label = "Read",
+                        Required = 1,
+                        Current = 1  // Pre-completed for zero-objective auto-turn-in quests
+                    }
+                };
             }
 
-            // Calculate allComplete AFTER default objectives are set up
-            bool allComplete = objectives.Count > 0 && objectives.All(o => o.IsComplete);
+            bool allComplete = objectives.All(o => o.IsComplete);
             writer.WriteByte(allComplete ? (byte)0x01 : (byte)0x00);
 
             writer.WriteByte((byte)objectives.Count);
@@ -486,7 +503,7 @@ namespace DungeonRunners.Managers
         public void SendProgressPacket(RRConnection conn, uint instanceId, ActiveQuest quest)
         {
             var objectives = quest.Objectives ?? new System.Collections.Generic.List<QuestProgress>();
-            bool allComplete = objectives.Count > 0 && objectives.All(o => o.IsComplete);
+            bool allComplete = objectives.All(o => o.IsComplete);
 
             // Packet 1: Update objectives (questSubmsg=1 → readObjectives)
             var writer = new LEWriter();
@@ -723,9 +740,11 @@ namespace DungeonRunners.Managers
             bool isTurnIn = false;
             if (activeQuest != null)
             {
-                // Check if all objectives are complete
+                // Check if all objectives are complete. Empty list = vacuous true
+                // (zero-objective info quests like HelperNoobosaur dialogs are turn-in-ready
+                // the moment they're accepted).
                 var objectives = activeQuest.Objectives ?? new List<QuestProgress>();
-                bool allComplete = objectives.Count > 0 && objectives.All(o => o.IsComplete);
+                bool allComplete = objectives.All(o => o.IsComplete);
                 isTurnIn = allComplete;
                 Debug.LogError($"[QUEST-QUERY] Active quest found! InstanceId={activeQuest.InstanceId}, objectives={objectives.Count}, allComplete={allComplete}, isTurnIn={isTurnIn}");
             }
@@ -809,6 +828,19 @@ namespace DungeonRunners.Managers
                 }
 
                 SendAddPacket(conn, quest, result.Quest);
+
+                // Auto-accept info quests (HelperNoobosaur help dialogs): immediately remove
+                // from active and send Finalize + Remove packets so the journal stays clean.
+                // Do NOT add to CompletedQuests so the player can re-read the dialog later.
+                if (_autoCompleteOnAcceptQuestIds.Contains(quest.id))
+                {
+                    Debug.LogError($"[QUEST-AUTOCOMPLETE] Finalizing info quest {quest.id} instanceId={result.Quest.InstanceId}");
+                    var playerState = GetPlayerState(conn.ConnId.ToString());
+                    playerState?.ActiveQuests.Remove(result.Quest);
+                    SendFinalizePacket(conn, result.Quest.InstanceId);
+                    SendRemovePacket(conn, result.Quest.InstanceId);
+                }
+
                 SendAvailableQuestUpdateForZone(conn);
             }
         }
@@ -1147,7 +1179,7 @@ namespace DungeonRunners.Managers
             {
                 writeGcType(writer, quest.QuestId, true);
                 writer.WriteUInt32(quest.InstanceId);        // actual instanceId, not hardcoded 0
-                bool allDone = quest.Objectives.Count > 0 && quest.Objectives.All(o => o.IsComplete);
+                bool allDone = quest.Objectives.All(o => o.IsComplete);
                 writer.WriteByte(allDone ? (byte)0x01 : (byte)0x00);
                 writer.WriteByte((byte)quest.Objectives.Count);
                 foreach (var obj in quest.Objectives)

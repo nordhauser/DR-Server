@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System;
 using UnityEngine;
 
 namespace DungeonRunners.Data
@@ -13,11 +14,28 @@ namespace DungeonRunners.Data
         // Base stats (from avatar/base/avatar.gc)
         public const int BASE_ENDURANCE = 10;
         public const int BASE_INTELLECT = 10;
+        public const int HERO_HEALTH_PER_LEVEL = 16;
+        public const int HEALTH_PER_ENDURANCE = 25;
         public const float BASE_HP_PER_ENDURANCE = 1.0f;  // 100% baseline
 
-        // Wire format: HP is stored as value * 256
-        // HP per Endurance in wire format ≈ 9.1 (derived from crash data analysis)
-        public const float HP_PER_ENDURANCE_WIRE = 9.14f;
+        private static uint ClampWire(long wire)
+        {
+            if (wire <= 0) return 0;
+            if (wire >= uint.MaxValue) return uint.MaxValue;
+            return (uint)wire;
+        }
+
+        public static uint CalculateNativeHPWire(int level, int endurance, int healthPerEnduranceModPercent)
+        {
+            int nativeLevel = Math.Max(1, level);
+            int nativeEndurance = Math.Max(1, endurance);
+            int percent = Math.Max(0, 100 + healthPerEnduranceModPercent);
+            int percentFixed = (int)(((long)percent * 0x10000L) / 0x6400L);
+            long hpPerEnduranceFixed = ((long)HEALTH_PER_ENDURANCE * 256L * percentFixed) >> 8;
+            long enduranceHP = (((long)nativeEndurance << 8) * hpPerEnduranceFixed) >> 16;
+            long levelHP = (long)nativeLevel * HERO_HEALTH_PER_LEVEL;
+            return ClampWire((enduranceHP + levelHP) * 256L);
+        }
 
         /// <summary>
         /// Class passive definitions - derived from game files
@@ -105,50 +123,27 @@ namespace DungeonRunners.Data
         };
 
         /// <summary>
-        /// Calculate HP bonus in wire format based on class passive
-        /// These values are empirically derived from client crash logs:
-        /// - Fighter: Client shows 25646 = 25600 + 46, so bonus = 46
-        /// - Mage: Client shows 25600 = base, so bonus = 0
-        /// - Ranger: TODO - needs testing, assumed 0 for now
-        /// 
-        /// The client auto-applies these bonuses based on avatar.GCClass
-        /// during initial spawn. The server must match these exact values.
+        /// Calculate HP bonus in wire format based on class passive.
+        /// Values are native runtime anchors from EntitySynchInfo HP validation.
         /// </summary>
-        public static int CalculateHPBonusWire(string className)
+        public static int CalculateHPBonusWire(string className, int level = 1, int allocatedEndurance = 0)
         {
-            // Empirically verified values from client crash logs
-            int bonus;
-            switch (className)
+            int baseEndurance = BASE_ENDURANCE + Math.Max(0, allocatedEndurance);
+            uint noPassiveHP = CalculateNativeHPWire(level, baseEndurance, 0);
+
+            if (!Passives.TryGetValue(className, out ClassPassive passive))
             {
-                case "Fighter":
-                    // Verified: Client HP 51968 = 51200 + 768
-                    // FighterClassPassive: +50% HP/END, -5 END
-                    bonus = 768;
-                    break;
-
-                case "Mage":
-                    // Verified: Client HP 25600 = base (no bonus)
-                    // MageClassPassive: -25% HP/END, +5 END
-                    // Net effect is 0 or negative, client shows base HP
-                    bonus = 0;
-                    break;
-
-                case "Ranger":
-                    // TODO: Test with Ranger character to verify
-                    // RangerClassPassive: +10% HP/END, +5 END
-                    // Estimated small positive bonus, but using 0 until verified
-                    bonus = 0;
-                    break;
-
-                default:
-                    Debug.LogWarning($"[ClassPassiveData] Unknown class '{className}', returning 0 HP bonus");
-                    bonus = 0;
-                    break;
+                Debug.LogWarning($"[ClassPassiveData] Unknown class '{className}', returning 0 HP bonus");
+                return 0;
             }
 
-            Debug.LogError($"[ClassPassiveData] {className}: HP Bonus = {bonus} wire (empirically verified)");
-             return bonus;
-            //return 46;
+            int passiveEndurance = Math.Max(1, baseEndurance + passive.EnduranceMod);
+            uint passiveHP = CalculateNativeHPWire(level, passiveEndurance, passive.HealthPerEnduranceMod);
+            long bonus = (long)passiveHP - noPassiveHP;
+            if (bonus > int.MaxValue) bonus = int.MaxValue;
+            if (bonus < int.MinValue) bonus = int.MinValue;
+            Debug.LogError($"[ClassPassiveData] {className}: HP Bonus = {bonus} wire noPassive={noPassiveHP} passive={passiveHP} level={level} end={baseEndurance}->{passiveEndurance} hpeMod={passive.HealthPerEnduranceMod}");
+            return (int)bonus;
         }
 
         /// <summary>

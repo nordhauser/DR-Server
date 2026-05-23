@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Threading;
 using UnityEngine;
 
 namespace DungeonRunners.Core
@@ -17,11 +18,44 @@ namespace DungeonRunners.Core
         private static int _pendingLogLines;
         private static bool _unityFilterInstalled;
         private static ILogHandler _originalLogHandler;
+        private static Mutex _singleInstanceMutex;
+        private static bool _ownsSingleInstanceMutex;
+        private static bool _shouldAbortStartup;
+
+        public static bool ShouldAbortStartup => _shouldAbortStartup;
 
         public static void EnsureStarted()
         {
             if (_started) return;
             _started = true;
+
+            if (TryRelaunchNormalizedRuntime())
+            {
+                _shouldAbortStartup = true;
+                Application.quitting += Stop;
+                AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
+                return;
+            }
+
+            if (!TryAcquireSingleInstanceMutex())
+            {
+                _shouldAbortStartup = true;
+                WriteDuplicateLaunchNotice("mutex", 0);
+                Application.quitting += Stop;
+                AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
+                return;
+            }
+
+            bool otherRuntimeActive = IsOtherRuntimeProcessActive(out int otherRuntimePid);
+            if (otherRuntimeActive && !IsTruthy(Environment.GetEnvironmentVariable("DR_SERVER_RELAUNCH_CHILD")))
+            {
+                _shouldAbortStartup = true;
+                WriteDuplicateLaunchNotice("process", otherRuntimePid);
+                ReleaseSingleInstanceMutex();
+                Application.quitting += Stop;
+                AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
+                return;
+            }
 
             if (IsTruthy(Environment.GetEnvironmentVariable("DR_SERVER_DISABLE_SELF_EVIDENCE")))
                 return;
@@ -62,6 +96,8 @@ namespace DungeonRunners.Core
                     _originalLogHandler = null;
                     _unityFilterInstalled = false;
                 }
+
+                ReleaseSingleInstanceMutex();
             }
         }
 
@@ -109,11 +145,18 @@ namespace DungeonRunners.Core
                 Application.logMessageReceivedThreaded += OnLogMessage;
                 WriteLogLine("[RUNTIME-EVIDENCE] pid=" + pid + " log=" + _logPath);
                 UnityEngine.Debug.LogError("[RUNTIME-EVIDENCE] Mirroring server log to " + _logPath);
+                LogBuildBinding("mirror");
             }
             catch (Exception ex)
             {
                 UnityEngine.Debug.LogError("[RUNTIME-EVIDENCE] Server log mirror failed: " + ex.Message);
             }
+        }
+
+        public static void LogBuildBinding(string source)
+        {
+            string marker = string.IsNullOrWhiteSpace(source) ? "[BUILD-BINDING] " : "[BUILD-BINDING] source=" + source + " ";
+            UnityEngine.Debug.LogError(marker + ResolveBuildBinding());
         }
 
         private static void StartWireCapture()
@@ -135,7 +178,7 @@ namespace DungeonRunners.Core
                 }
 
                 int pid = Process.GetCurrentProcess().Id;
-                string args = "-NoProfile -ExecutionPolicy Bypass -File " + Quote(scriptPath) + " -Single -Name server-auto -ReplaceExisting -OwnerPid " + pid + " -StopWhenOwnerExits";
+                string args = "-NoProfile -ExecutionPolicy Bypass -File " + Quote(scriptPath) + " -Single -Name server-auto -OwnerPid " + pid + " -StopWhenOwnerExits";
                 var psi = new ProcessStartInfo
                 {
                     FileName = "powershell.exe",
@@ -174,6 +217,178 @@ namespace DungeonRunners.Core
             }
         }
 
+        private static bool TryRelaunchNormalizedRuntime()
+        {
+            if (Application.isEditor)
+                return false;
+            if (IsTruthy(Environment.GetEnvironmentVariable("DR_SERVER_DISABLE_SELF_RELAUNCH")))
+                return false;
+            string[] args = Environment.GetCommandLineArgs();
+            if (HasArg(args, "-batchmode") && HasArg(args, "-nographics") && HasArg(args, "-logFile"))
+                return false;
+            if (IsOtherRuntimeProcessActive(out int otherRuntimePid))
+            {
+                WriteDuplicateLaunchNotice("process", otherRuntimePid);
+                return true;
+            }
+            try
+            {
+                string exePath = Process.GetCurrentProcess().MainModule?.FileName;
+                if (string.IsNullOrWhiteSpace(exePath) || !File.Exists(exePath))
+                    return false;
+                string logPath = ResolveServerLogPath(ResolveClientLogsDir());
+                var psi = new ProcessStartInfo
+                {
+                    FileName = exePath,
+                    Arguments = "-batchmode -logFile " + Quote(logPath) + " -nographics",
+                    WorkingDirectory = ResolveBuildDir(),
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                psi.EnvironmentVariables["DR_SERVER_RELAUNCH_CHILD"] = "1";
+                Process.Start(psi);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                UnityEngine.Debug.LogError("[RUNTIME-EVIDENCE] Normalized runtime relaunch failed: " + ex.Message);
+                return false;
+            }
+        }
+
+        private static bool HasArg(string[] args, string name)
+        {
+            if (args == null) return false;
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        private static bool TryAcquireSingleInstanceMutex()
+        {
+            try
+            {
+                _singleInstanceMutex = new Mutex(false, "DungeonRunnersServerUnityRuntime");
+                _ownsSingleInstanceMutex = _singleInstanceMutex.WaitOne(0, false);
+                if (!_ownsSingleInstanceMutex)
+                {
+                    _singleInstanceMutex.Dispose();
+                    _singleInstanceMutex = null;
+                    return false;
+                }
+                return true;
+            }
+            catch (AbandonedMutexException)
+            {
+                _ownsSingleInstanceMutex = true;
+                return true;
+            }
+            catch
+            {
+                return true;
+            }
+        }
+
+        private static void ReleaseSingleInstanceMutex()
+        {
+            if (_singleInstanceMutex == null)
+                return;
+            try
+            {
+                if (_ownsSingleInstanceMutex)
+                    _singleInstanceMutex.ReleaseMutex();
+            }
+            catch
+            {
+            }
+            try
+            {
+                _singleInstanceMutex.Dispose();
+            }
+            catch
+            {
+            }
+            _singleInstanceMutex = null;
+            _ownsSingleInstanceMutex = false;
+        }
+
+        private static void WriteDuplicateLaunchNotice(string reason, int otherPid)
+        {
+            string line = DateTime.Now.ToString("o") + " [Error] [RUNTIME-EVIDENCE] Duplicate DR_Server.exe launch aborted pid=" + Process.GetCurrentProcess().Id + " otherPid=" + otherPid + " reason=" + reason;
+            try
+            {
+                string path = ResolveServerLogPath(ResolveClientLogsDir());
+                string dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrWhiteSpace(dir))
+                    Directory.CreateDirectory(dir);
+                File.AppendAllText(path, line + Environment.NewLine, new UTF8Encoding(false));
+            }
+            catch
+            {
+            }
+            UnityEngine.Debug.LogError(line);
+        }
+
+        private static bool IsOtherRuntimeProcessActive(out int otherPid)
+        {
+            otherPid = 0;
+            try
+            {
+                using (var current = Process.GetCurrentProcess())
+                {
+                    string currentPath = "";
+                    try
+                    {
+                        currentPath = current.MainModule?.FileName ?? "";
+                    }
+                    catch
+                    {
+                    }
+
+                    string processName = !string.IsNullOrWhiteSpace(currentPath)
+                        ? Path.GetFileNameWithoutExtension(currentPath)
+                        : current.ProcessName;
+
+                    foreach (var proc in Process.GetProcessesByName(processName))
+                    {
+                        try
+                        {
+                            if (proc.Id == current.Id)
+                                continue;
+
+                            string otherPath = "";
+                            try
+                            {
+                                otherPath = proc.MainModule?.FileName ?? "";
+                            }
+                            catch
+                            {
+                            }
+
+                            if (string.IsNullOrWhiteSpace(currentPath) ||
+                                string.Equals(otherPath, currentPath, StringComparison.OrdinalIgnoreCase))
+                            {
+                                otherPid = proc.Id;
+                                return true;
+                            }
+                        }
+                        finally
+                        {
+                            proc.Dispose();
+                        }
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            return false;
+        }
+
         private static void OnLogMessage(string condition, string stackTrace, LogType type)
         {
             if (!ShouldMirrorLog(condition, type))
@@ -183,6 +398,39 @@ namespace DungeonRunners.Core
             if (!string.IsNullOrWhiteSpace(stackTrace) && (type == LogType.Exception || type == LogType.Assert))
                 line += Environment.NewLine + stackTrace;
             WriteLogLine(line);
+        }
+
+        private static string ResolveBuildBinding()
+        {
+            try
+            {
+                string buildDir = ResolveBuildDir();
+                string buildInfoPath = Path.Combine(buildDir, "build_info.txt");
+                if (File.Exists(buildInfoPath))
+                    return File.ReadAllText(buildInfoPath).Replace("\r", " ").Replace("\n", " ").Trim();
+                return "Runtime=unity BuildInfoMissing=" + buildInfoPath;
+            }
+            catch (Exception ex)
+            {
+                return "Runtime=unity BuildInfoError=" + ex.Message;
+            }
+        }
+
+        private static string ResolveBuildDir()
+        {
+            try
+            {
+                string dataPath = Application.dataPath;
+                if (!string.IsNullOrWhiteSpace(dataPath))
+                {
+                    var dir = Directory.GetParent(dataPath);
+                    if (dir != null) return dir.FullName;
+                }
+            }
+            catch
+            {
+            }
+            return AppDomain.CurrentDomain.BaseDirectory;
         }
 
         private static void WriteLogLine(string line)
@@ -290,6 +538,7 @@ namespace DungeonRunners.Core
                 || line.IndexOf("FATAL", StringComparison.OrdinalIgnoreCase) >= 0
                 || line.IndexOf("Invalid ComponentID", StringComparison.OrdinalIgnoreCase) >= 0
                 || line.StartsWith("[RUNTIME-EVIDENCE]", StringComparison.OrdinalIgnoreCase)
+                || line.StartsWith("[BUILD-BINDING]", StringComparison.OrdinalIgnoreCase)
                 || line.StartsWith("[DRLog]", StringComparison.OrdinalIgnoreCase)
                 || line.StartsWith("=== Dungeon Runners Server", StringComparison.OrdinalIgnoreCase)
                 || line.StartsWith("Server Version:", StringComparison.OrdinalIgnoreCase)
@@ -302,8 +551,39 @@ namespace DungeonRunners.Core
                 || line.StartsWith("[SERVER]", StringComparison.OrdinalIgnoreCase);
         }
 
+        // 2026-05-23 RNG-divergence diagnostic. When true, server.log only captures
+        // RNG-trace + a few essential combat markers. Drops every other prefix so the
+        // log is small enough to diff line-for-line against client x32dbg trace.
+        // Flip back to false when done.
+        public static bool RngOnlyMode = true;
+
+        private static readonly string[] RngOnlyPrefixes =
+        {
+            "[RNG-TRACE]",
+            "[RNG-SEED]",
+            "[RNG-COMBAT]",
+            "[RNG-AUDIT]",
+            "[PLAYER-HIT-DETAIL]",
+            "[MONSTER-DAMAGE]",
+            "[ZONE-JOIN]",
+            "[DUNGEON-PORTAL]",
+            "[SPAWN-TRACK]",
+            "[Combat] SPAWNED:",
+            "[ROOM-RNG]",
+            "[RUNTIME-SEED]",
+        };
+
         private static bool IsFocusedLog(string line)
         {
+            if (RngOnlyMode)
+            {
+                foreach (string prefix in RngOnlyPrefixes)
+                {
+                    if (line.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+                return false;
+            }
             string[] allowedPrefixes =
             {
                 "[Combat]",
@@ -312,18 +592,83 @@ namespace DungeonRunners.Core
                 "[ACTION",
                 "[NPC]",
                 "[DAMAGE]",
+                "[GetNearest]",
                 "[MON-DAMAGE]",
+                "[MON-DAMAGE-SYNC]",
                 "[MON-ATTACK]",
+                "[MON-STATE]",
+                "[MONSTER-DAMAGE]",
+                "[MON-CONTACT]",
                 "[MON-HP-TRUTH]",
+                "[MON-REGEN]",
+                "[MON-MANA-REGEN]",
+                "[MON-SKILL]",
+                "[MON-SKILL-CD]",
                 "[MON-MOVE]",
+                "[MON-MOVE-SEND]",
+                "[MON-PRE-SUFFIX-COMBAT]",
+                "[MON-HP-PRIMER]",
+                "[DUNGEON-SNAPSHOT]",
+                "[DUNGEON-SPAWN]",
+                "[DUNGEON-TRANSFORM]",
+                "[DUNGEON-PORTAL]",
+                "[PROJECTILE-HIT]",
+                "[PRE-SUFFIX-DUE-DRAIN]",
+                "[RANGED-PROJECTILE]",
+                "[RANGED-PROJECTILE-DUE]",
+                "[PROJECTILE-ENTITY]",
                 "[PLAYER-HP-TRUTH]",
+                "[PLAYER-HP-SUFFIX]",
+                "[PLAYER-HP-NATIVE",
+                "[PLAYER-DAMAGE]",
+                "[PLAYER-REGEN]",
+                "[PLAYER-REGEN-COOLDOWN]",
+                "[HP-PRESERVE]",
+                "[SPAWN-HP-PRESERVE]",
+                "[SPAWN-HP-FULL]",
+                "[SPAWN-HP-REGEN]",
+                "[SPAWN-XP]",
+                "[ZONE-HP-PRESERVE]",
+                "[ZONE-HP-FULL]",
+                "[ZONE-HP-REGEN]",
+                "[ZONE-HP-BOOTSTRAP]",
+                "[PLAYERSTATE",
+                "[ALLOC-STATS]",
+                "[HP-FINAL]",
+                "[PLAYER-HIT-DETAIL]",
+                "[SPAWN]",
+                "[SPAWN-SYNCH]",
+                "[SPAWN-TRACK]",
+                "[PACKET-2]",
+                "[PACKET-3]",
+                "[OP12]",
+                "[RNG-AUDIT]",
+                "[RNG-COMBAT]",
+                "[RNG-SEED]",
+                "[RNG-TRACE]",
+                "[RUNTIME-SEED]",
+                "[NATIVE-VALIDATION-CUTOFF]",
+                "[LAYOUT-SEED]",
+                "[UDP-RNG]",
+                "[SPELL",
                 "[LOCAL-MOVE-ACK]",
                 "[SEND-COMPRESSEDA]",
+                "[SYNC-SUFFIX",
                 "[TAKEDAMAGE]",
+                "[MANA]",
+                "[MANA-0x52]",
                 "[WEAPON-CYCLE]",
                 "[SERVER-AGGRO]",
+                "[SERVER-SHOUT]",
                 "[AGGRO]",
+                "[AGGRO-OBSERVE]",
                 "[AI",
+                "[AI-TRACE]",
+                "[ROOM-RNG]",
+                "[WANDER-RNG]",
+                "[WANDER-AUDIT]",
+                "[MazeSpawner]",
+                "[ZoneSpawnManager]",
                 "[BEHAVIOR]",
                 "[DLL-HP]",
                 "[DLL-HP-RAW]",
@@ -336,6 +681,7 @@ namespace DungeonRunners.Core
                 "[HP-VERIFY]",
                 "[SYNCH",
                 "[REGEN]",
+                "[COMBAT-TICK]",
                 "[UDP-COMBAT",
                 "[ZONE-INVULN]",
                 "[ZONE-TRACK]",
@@ -382,8 +728,7 @@ namespace DungeonRunners.Core
                 "[INV-SLOT]",
                 "[INV-VALIDATOR]",
                 "[INV-RESTORE]",
-                "[EQUIP]",
-                "[EQUIP-TRACK]",
+                "[EQUIP",
                 "[EQUIPMENT-INIT]",
                 "[GIVE-STACKED]",
                 "[GIVE-ON-ACCEPT-ITEM]",

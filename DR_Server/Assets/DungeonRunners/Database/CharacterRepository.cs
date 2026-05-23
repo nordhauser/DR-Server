@@ -406,11 +406,73 @@ namespace DungeonRunners.Database
             try
             {
                 using (var conn = GameDatabase.GetConnection())
+                using (var tx = conn.BeginTransaction())
                 {
-                    // CASCADE handles sub-tables
-                    GameDatabase.ExecuteNonQuery(conn, "DELETE FROM characters WHERE id = @id", ("@id", (int)characterId));
-                    Debug.LogError($"[DB-CHAR] Deleted character ID: {characterId}");
-                    return true;
+                    string characterName = "";
+                    uint posseId = 0;
+                    bool isFounder = false;
+                    using (var r = GameDatabase.ExecuteReader(conn,
+                        @"SELECT c.name, COALESCE(c.posse_id, 0), CASE WHEN p.founder_character_id = c.id THEN 1 ELSE 0 END
+                          FROM characters c
+                          LEFT JOIN posses p ON p.id = c.posse_id
+                          WHERE c.id = @id",
+                        ("@id", (int)characterId)))
+                    {
+                        if (!r.Read())
+                        {
+                            Debug.LogError($"[DB-CHAR] DeleteCharacter missing ID: {characterId}");
+                            return false;
+                        }
+                        characterName = r.GetString(0);
+                        posseId = (uint)r.GetInt32(1);
+                        isFounder = r.GetInt32(2) != 0;
+                    }
+
+                    if (posseId != 0)
+                    {
+                        if (isFounder)
+                        {
+                            GameDatabase.ExecuteNonQuery(conn,
+                                "UPDATE characters SET posse_id = 0 WHERE posse_id = @pid",
+                                ("@pid", (int)posseId));
+                            GameDatabase.ExecuteNonQuery(conn,
+                                "DELETE FROM posses WHERE id = @pid",
+                                ("@pid", (int)posseId));
+                            Debug.LogError($"[DB-CHAR] Disbanded founded posse id={posseId} before deleting character ID: {characterId}");
+                        }
+                        else
+                        {
+                            GameDatabase.ExecuteNonQuery(conn,
+                                "UPDATE characters SET posse_id = 0 WHERE id = @id",
+                                ("@id", (int)characterId));
+                        }
+                    }
+
+                    if (Convert.ToInt32(GameDatabase.ExecuteScalar(conn,
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='social_friends_v2'")) != 0)
+                    {
+                        GameDatabase.ExecuteNonQuery(conn,
+                            "DELETE FROM social_friends_v2 WHERE character_name = @name OR friend_name = @name",
+                            ("@name", characterName));
+                    }
+                    if (Convert.ToInt32(GameDatabase.ExecuteScalar(conn,
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='social_ignores_v2'")) != 0)
+                    {
+                        GameDatabase.ExecuteNonQuery(conn,
+                            "DELETE FROM social_ignores_v2 WHERE character_name = @name OR ignore_name = @name",
+                            ("@name", characterName));
+                    }
+
+                    GameDatabase.ExecuteNonQuery(conn,
+                        "UPDATE accounts SET current_character_id = 0 WHERE current_character_id = @id",
+                        ("@id", (int)characterId));
+                    GameDatabase.ExecuteNonQuery(conn,
+                        "DELETE FROM characters WHERE id = @id",
+                        ("@id", (int)characterId));
+                    int deleted = Convert.ToInt32(GameDatabase.ExecuteScalar(conn, "SELECT changes()") ?? 0);
+                    tx.Commit();
+                    Debug.LogError($"[DB-CHAR] Deleted character ID: {characterId} deleted={deleted}");
+                    return deleted != 0;
                 }
             }
             catch (Exception ex)

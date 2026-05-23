@@ -283,24 +283,41 @@ namespace DungeonRunners.Core
 
         public bool CanReachPoint(float startX, float startY, float endX, float endY)
         {
+            if (TryCanReachPoint(startX, startY, endX, endY, out bool canReach))
+                return canReach;
+            return false;
+        }
+
+        public bool TryCanReachPoint(float startX, float startY, float endX, float endY, out bool canReach)
+        {
+            canReach = false;
             var startNode = GetReachNodeAtWorld(startX, startY);
             var endNode = GetReachNodeAtWorld(endX, endY);
             if (startNode == null || endNode == null) return false;
-            if (startNode.GridX == endNode.GridX && startNode.GridY == endNode.GridY) return true;
+            if (startNode.GridX == endNode.GridX && startNode.GridY == endNode.GridY)
+            {
+                canReach = true;
+                return true;
+            }
 
             float dx = endX - startX;
             float dy = endY - startY;
             float dist = Mathf.Sqrt(dx * dx + dy * dy);
-            if (dist <= 0.001f) return true;
+            if (dist <= 0.001f)
+            {
+                canReach = true;
+                return true;
+            }
 
             int steps = Mathf.Max(1, Mathf.CeilToInt(dist / (TILE_SIZE * 0.5f)));
             for (int i = 1; i < steps; i++)
             {
                 float t = i / (float)steps;
                 var node = GetNodeAtWorld(startX + dx * t, startY + dy * t);
-                if (node == null || !node.IsWalkable) return false;
+                if (node == null || !node.IsWalkable) return true;
             }
 
+            canReach = true;
             return true;
         }
 

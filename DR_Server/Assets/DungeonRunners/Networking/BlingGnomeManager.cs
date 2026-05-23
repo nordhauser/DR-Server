@@ -50,6 +50,7 @@ namespace DungeonRunners.Networking
             public ushort BehaviorId;
             public ushort ModifiersId;
             public ushort ManipulatorsId;
+            public uint OwnerEntityId;
 
             // Position (world coords, NOT fixed-point)
             public float PosX, PosY, PosZ;
@@ -109,6 +110,7 @@ namespace DungeonRunners.Networking
         private const int GNOME_SPEED = 50;
         private const float COOLDOWN_SECONDS = 45f;
         private const float EFFECT_DURATION_SECONDS = 10f;
+        private const float CONVERT_BOUNCE_SECONDS = 2.05f;
         private const int IDLE_BASE_SECONDS = 2;
         private const int IDLE_VARIABLE_SECONDS = 7;
 
@@ -234,6 +236,92 @@ namespace DungeonRunners.Networking
             return 0;
         }
 
+        public bool TryResolveGnomeTarget(RRConnection conn, ushort targetEntityId,
+            out uint entityId, out ushort behaviorId, out bool behaviorBootstrapped, out string reason)
+        {
+            entityId = 0;
+            behaviorId = 0;
+            behaviorBootstrapped = false;
+
+            if (!TryResolveGnomeState(conn, targetEntityId, out var g, out _, out reason))
+                return false;
+
+            entityId = g.EntityId;
+            behaviorId = g.BehaviorId;
+            behaviorBootstrapped = g.BehaviorBootstrapped;
+            return targetEntityId == 0 || g.EntityId == targetEntityId;
+        }
+
+        private bool TryResolveGnomeState(RRConnection conn, ushort targetEntityId,
+            out GnomeState g, out int stateConnId, out string reason)
+        {
+            g = null;
+            stateConnId = 0;
+            reason = "none";
+
+            if (conn == null)
+            {
+                reason = "nil-conn";
+                return false;
+            }
+
+            if (_gnomes.TryGetValue(conn.ConnId, out g))
+            {
+                stateConnId = conn.ConnId;
+                if (targetEntityId == 0 || g.EntityId == targetEntityId)
+                {
+                    reason = "owned-conn";
+                    return true;
+                }
+
+                reason = $"owned-target-mismatch expected={g.EntityId} got={targetEntityId}";
+                return false;
+            }
+
+            if (targetEntityId != 0)
+            {
+                int foundConnId = 0;
+                GnomeState found = null;
+                foreach (var kvp in _gnomes)
+                {
+                    if (kvp.Value.EntityId != targetEntityId)
+                        continue;
+                    foundConnId = kvp.Key;
+                    found = kvp.Value;
+                    break;
+                }
+
+                if (found != null)
+                {
+                    uint avatarEntityId = conn.Avatar != null ? (uint)conn.Avatar.Id : 0;
+                    if (found.OwnerEntityId != 0 && avatarEntityId != 0 && found.OwnerEntityId != avatarEntityId)
+                    {
+                        reason = $"target-owned-by-other owner={found.OwnerEntityId} avatar={avatarEntityId}";
+                        return false;
+                    }
+
+                    if (foundConnId != conn.ConnId)
+                    {
+                        _gnomes.Remove(foundConnId);
+                        _gnomes[conn.ConnId] = found;
+                        reason = $"target-rekey oldConn={foundConnId} newConn={conn.ConnId}";
+                        Debug.LogError($"[GNOME-TARGET] Rebound Bling Gnome entity={found.EntityId} from conn={foundConnId} to conn={conn.ConnId}");
+                    }
+                    else
+                    {
+                        reason = "target-entity";
+                    }
+
+                    g = found;
+                    stateConnId = conn.ConnId;
+                    return true;
+                }
+            }
+
+            reason = "no-gnome";
+            return false;
+        }
+
         public void CleanupForZoneTransition(int connId)
         {
             if (_gnomes.TryGetValue(connId, out var g))
@@ -340,10 +428,24 @@ namespace DungeonRunners.Networking
         /// Activate the BlingGnome's conversion ability (called when player casts SummonBlingGnome skill on gnome).
         /// Opens a 10-second window where items within radius are converted to gold.
         /// </summary>
-        public void ActivateGnome(RRConnection conn)
+        public bool ActivateGnome(RRConnection conn)
         {
-            if (!_gnomes.TryGetValue(conn.ConnId, out var g)) return;
-            if (!g.BehaviorBootstrapped) return;
+            return ActivateGnome(conn, 0);
+        }
+
+        public bool ActivateGnome(RRConnection conn, ushort targetEntityId)
+        {
+            if (!TryResolveGnomeState(conn, targetEntityId, out var g, out _, out string reason))
+            {
+                Debug.LogError($"[GNOME-ACTIVATE] skipped target={targetEntityId} reason={reason}");
+                return false;
+            }
+
+            if (!g.BehaviorBootstrapped)
+            {
+                Debug.LogError($"[GNOME-ACTIVATE] skipped target={targetEntityId} entity={g.EntityId} reason=behavior-not-bootstrapped match={reason}");
+                return false;
+            }
 
             g.IsActive = true;
             g.ActivateUntil = Time.time + EFFECT_DURATION_SECONDS;
@@ -351,12 +453,14 @@ namespace DungeonRunners.Networking
             g.GoldGenerated = 0;
             g.NextSearchTime = Time.time; // search immediately
 
+            SendPlayAnimation(conn, g, ANIM_ACTIVE_SKILL, ANIM_STATE_ACTIVE, 40);
             // Send ConvertItemsToGold action (0xA1) — triggers client's native conversion visuals
             SendConvertItemsToGoldAction(conn, g);
             if (g.ConversionCoroutine != null) StopCoroutine(g.ConversionCoroutine);
             g.ConversionCoroutine = StartCoroutine(ApplyActiveConversion(conn, g));
 
-            Debug.LogError($"[GNOME-ACTIVATE] Conversion window open for {EFFECT_DURATION_SECONDS}s, radius={CONVERT_SEARCH_RADIUS}");
+            Debug.LogError($"[GNOME-ACTIVATE] Conversion window open for {EFFECT_DURATION_SECONDS}s, radius={CONVERT_SEARCH_RADIUS}, target={targetEntityId}, match={reason}");
+            return true;
         }
 
         // ═══════════════════════════════════════════════════════════════════
@@ -395,6 +499,7 @@ namespace DungeonRunners.Networking
                 BehaviorId = behaviorId,
                 ModifiersId = modifiersId,
                 ManipulatorsId = manipulatorsId,
+                OwnerEntityId = conn.Avatar != null ? (uint)conn.Avatar.Id : 0,
                 PosX = posXf,
                 PosY = posYf,
                 PosZ = posZf,
@@ -763,7 +868,15 @@ namespace DungeonRunners.Networking
 
             if (goldAmount == 0) goldAmount = 1;
 
-            _server.BlingGnomePickupItem(conn, entityId);
+            if (!goldDrop)
+                yield return new WaitForSeconds(CONVERT_BOUNCE_SECONDS);
+
+            if (!_gnomes.TryGetValue(conn.ConnId, out current) || current.EntityId != g.EntityId || !conn.IsConnected)
+                yield break;
+
+            if (!_server.BlingGnomePickupItem(conn, entityId))
+                yield break;
+
             _server.BlingGnomeCreditGold(conn, goldAmount);
 
             current.ItemsConverted++;
@@ -791,6 +904,8 @@ namespace DungeonRunners.Networking
             AddConversionCandidates(_server.GetDroppedItemsNear(zone, instId, ownerX, ownerY, CONVERT_SEARCH_RADIUS), conn, candidates, seen);
             candidates.Sort((a, b) => a.entityId.CompareTo(b.entityId));
 
+            var pendingConversions = new List<(ushort entityId, uint goldAmount)>();
+            Debug.LogError($"[GNOME-CONVERT] Search pulse radius={CONVERT_SEARCH_RADIUS} candidates={candidates.Count}");
             foreach (var candidate in candidates)
             {
                 if (!_gnomes.TryGetValue(conn.ConnId, out current) || current.EntityId != g.EntityId || !current.IsActive || !conn.IsConnected)
@@ -801,13 +916,33 @@ namespace DungeonRunners.Networking
                 uint goldAmount = CalculateConversionGold(conn, candidate.info);
                 if (goldAmount == 0) goldAmount = 1;
 
-                _server.BlingGnomePickupItem(conn, candidate.entityId);
-                _server.BlingGnomeCreditGold(conn, goldAmount);
+                pendingConversions.Add((candidate.entityId, goldAmount));
+            }
+
+            if (pendingConversions.Count == 0)
+                yield break;
+
+            Debug.LogError($"[GNOME-CONVERT] BounceAndConvert pending={pendingConversions.Count} bounce={CONVERT_BOUNCE_SECONDS:F2}s");
+            yield return new WaitForSeconds(CONVERT_BOUNCE_SECONDS);
+
+            foreach (var pending in pendingConversions)
+            {
+                if (!_gnomes.TryGetValue(conn.ConnId, out current) || current.EntityId != g.EntityId || !conn.IsConnected)
+                    yield break;
+                if (current.BehaviorBootstrapped)
+                    SendPlayAnimation(conn, current, ANIM_PICKUP, ANIM_STATE_DIRECT, 16);
+                yield return new WaitForSeconds(0.3f);
+                if (!_gnomes.TryGetValue(conn.ConnId, out current) || current.EntityId != g.EntityId || !conn.IsConnected)
+                    yield break;
+                if (!_server.BlingGnomePickupItem(conn, pending.entityId))
+                    continue;
+
+                _server.BlingGnomeCreditGold(conn, pending.goldAmount);
 
                 current.ItemsConverted++;
-                current.GoldGenerated += goldAmount;
+                current.GoldGenerated += pending.goldAmount;
 
-                Debug.LogError($"[GNOME-CONVERT] Item 0x{candidate.entityId:X4} → {goldAmount}g (total: {current.GoldGenerated}g)");
+                Debug.LogError($"[GNOME-GOLDGENERATED] Item 0x{pending.entityId:X4} -> {pending.goldAmount}g (total: {current.GoldGenerated}g)");
                 yield return new WaitForSeconds(0.05f);
             }
         }
@@ -1212,6 +1347,7 @@ namespace DungeonRunners.Networking
 
             writer.WriteByte(0x02);
             writer.WriteUInt32(hitPointsWire);
+            Debug.LogError($"[SYNC-SUFFIX] packet=GNOME owner=BlingGnome entity={g.EntityId} component={g.BehaviorId} flags=0x02 hp={hitPointsWire}");
         }
 
         private ushort PickFidgetAnimation(GnomeState g)

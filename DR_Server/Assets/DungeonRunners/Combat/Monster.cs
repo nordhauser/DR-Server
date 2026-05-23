@@ -27,21 +27,27 @@ namespace DungeonRunners.Combat
         public string SpawnGCType;  // dungeon-specific GC path for spawn packet
         public uint MaxHPWire;
         public uint CurrentHPWire;
-        public bool ClientHPDirty;
-        public float ClientHPDirtySince;
-        public string ClientHPDirtyReason;
-        public uint ClientHPDirtyStartWire;
-        public float ClientHPDirtyAllowSameConfirmAt;
-        public int SuppressedMonsterHPSyncPackets;
         public float LastClientHPReportTime;
         public uint LastClientHPReportWire;
+        public bool DeathPendingClientConfirmation;
+        public float DeathPendingSince;
+        public byte NativeDeathState;
+        public ushort NativeCorpseTicksRemaining;
+        public ushort NativeFadeTicksRemaining;
+        public bool NativeDeathLifecycleActive;
+        public bool NativeDeathRemoveSent;
         public uint MaxManaWire;
         public uint CurrentManaWire;
         public int BaseDamage;
         public float AttackRating = 1.0f;
         public float DamageMod = 1.0f;
+        public float DamageTakenMod = 100f;
         public float DamageVolatility = 0.5f;
         public float WeaponDamage = 1.0f;
+        public float HealthRegen = 0f;
+        public bool HasAuthoredHealthRegen;
+        public float ManaRegen = 0f;
+        public bool HasAuthoredManaRegen;
         public float CritChance = 0f;
         public float DefenseRating = 1.0f;
         public float DivineResist = 0f;
@@ -61,6 +67,30 @@ namespace DungeonRunners.Combat
         public float AttackRange = 2.5f;
         public float ClientSyncTolerance = 10f;
         public float CollisionRadius = 5f;
+        public string AttackType;
+        public string IdleAction;
+        public string LogicType;
+        public string AttackStyle;
+        public bool Retreatable;
+        public bool Leashed;
+        public bool UseIdleTime;
+        public bool AutoScan;
+        public bool AvoidUnits;
+        public bool TurnBeforeMoving;
+        public bool PlayerControlled;
+        public int CollisionBand;
+        public int CollisionPriority;
+        public float ScanFrequency;
+        public float FleeRange;
+        public float RetreatRangeSquared;
+        public float TeleportFrequency;
+        public float TeleportLimboTime;
+        public float BaseTime;
+        public float VariableTime;
+        public ushort CorpseLingerTicks = 900;
+        public bool AutoRespawn = false;
+        public ushort RespawnRateTicks = 3600;
+        public float AttackSpeed = 1.0f;
         public float AttackCooldown = 1.5f;
         public float AttackLeadDelay = 0.75f;
         public float MoveSpeed = 5f;
@@ -101,14 +131,40 @@ namespace DungeonRunners.Combat
         public bool AttackSoundPending;
         public bool HasAttackSound;
         public uint AttackSoundRaw;
+        public uint AttackSoundGateRaw;
+        public uint AttackSoundRepeatRaw;
         public byte AttackSessionId;
         public byte AttackAnimationIndex;
         public uint AttackUseRaw;
+        public uint AttackSearchTargetId;
+        public uint AttackSearchRaw;
+        public uint AttackSearchTieRaw;
         public bool AttackClientVisible;
+        public bool AttackNativeContactOnly;
+        public bool AttackHitResolved;
+        public bool UsePrimaryActiveSkillThisAttack;
+        public string PrimaryActiveSkillPath;
+        public byte PrimaryActiveSkillId = 10;
+        public float PrimaryActiveSkillRange;
+        public float PrimaryActiveSkillCooldownSeconds;
+        public ushort PrimaryActiveSkillCooldownTicks;
+        public ushort PrimaryActiveSkillCooldownRemainingTicks;
+        public float PrimaryActiveSkillCooldownLastTime;
+        public int PrimaryActiveSkillAnimationId;
+        public string PrimaryActiveSkillEffect;
+        public string PrimaryActiveSkillCastModifier;
+        public float AttackStartedTime;
+        public float AttackEndTime;
+        public int AttackWeaponSoundCount;
+        public int AttackRepeatSoundCount;
+        public int[] AttackTotalFrames = new int[] { 30, 30, 30 };
+        public int[] AttackHitFrames = new int[] { 15, 15, 15 };
+        public int[] AttackSoundFrames = new int[] { 10, 10, 10 };
         public float AttackCommitTargetX;
         public float AttackCommitTargetY;
         public uint CombatContactTargetId;
         public float CombatContactUntil;
+        public uint AlertSourceEntityId;
         public float SpawnTime;  // Time.time when spawned - skip first move packet
         private volatile bool _aggroTriggered = false;
         public bool AggroTriggered
@@ -121,12 +177,6 @@ namespace DungeonRunners.Combat
         public string EncounterGroupKey;
         public int HP => (int)(CurrentHPWire / 256);
         public int MaxHP => (int)(MaxHPWire / 256);
-
-        // Server-side Think/DoAttack/ComputeDamage REMOVED.
-        // Client is authoritative on combat — it runs MeleeWeapon::update (0x591980)
-        // every frame, computes all damage locally, and sends type 9 for aggro.
-        // HP validation patched out of client (0x5DD9E4: je -> jmp).
-
         public void AddThreat(uint playerId, int amount)
         {
             if (_threatTable.ContainsKey(playerId))
@@ -138,6 +188,7 @@ namespace DungeonRunners.Combat
         public void ClearTarget()
         {
             TargetId = 0;
+            AlertSourceEntityId = 0;
             _threatTable.Clear();
         }
     }

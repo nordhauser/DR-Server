@@ -78,7 +78,7 @@ public static class DatabaseLoader
     public static Dictionary<string, List<QuestKillDropEntry>> QuestKillDropsByMonster
         = new Dictionary<string, List<QuestKillDropEntry>>(StringComparer.OrdinalIgnoreCase);
 
-    [Serializable] public class DungeonSpawnData { public string zoneName; public string gcType; public float posX; public float posY; public float posZ; public float heading; public string encounterGroupKey; public float encounterDifficulty = -1f; }
+    [Serializable] public class DungeonSpawnData { public string zoneName; public string gcType; public string spawnGcTypeOverride; public float posX; public float posY; public float posZ; public float heading; public string encounterGroupKey; public float encounterDifficulty = -1f; public int gridX = -1; public int gridY = -1; public string tileType; public float worldOriginX; public float worldOriginY; public float localX; public float localY; public float localZ; public string placementRole; public string placeholderSource; public int placeholderIndex = -1; public float placeholderSizeX; public float placeholderSizeY; public int encounterChoiceIndex = -1; public bool snapApplied; }
 
     public static void LoadAll()
     {
@@ -97,7 +97,7 @@ public static class DatabaseLoader
             BuildEquipmentMappings();
             Debug.Log($"ALL LOADED: Skills:{Skills.Count} Quests:{Quests.Count} Creatures:{Creatures.Count} Weapons:{AllWeapons.Count} Armor:{AllArmor.Count} Merchants:{Merchants.Count} TownNPCs:{TownNPCs.Count} TutorialNPCs:{TutorialNPCs.Count} QuestKillDrops:{QuestKillDropsByMonster.Count}");
         }
-        catch (Exception ex) { Debug.LogError($"CRITICAL LOAD ERROR: {ex.Message}\n{ex.StackTrace}"); }
+        catch (Exception ex) { Debug.LogError($"CRITICAL LOAD ERROR: {ex.Message}\n{ex.StackTrace}"); throw; }
     }
 
     private static void LoadSkills()
@@ -537,8 +537,8 @@ public static class DatabaseLoader
         }
         catch (Exception ex)
         {
-            // Table missing is non-fatal — quest item drops just won't fire
             Debug.LogError($"[QuestKillDrops] Could not load quest_kill_drops table: {ex.Message}");
+            throw;
         }
     }
 
@@ -557,7 +557,8 @@ public static class DatabaseLoader
                     defenseRating = DB.GetFloat(r, "defense_rating"),
                     damage = DB.GetFloat(r, "damage"),
                     range = DB.GetInt(r, "weapon_range"),
-                    cooldown = DB.GetFloat(r, "cooldown", 1f),
+                    cooldown = DB.GetFloat(r, "cooldown", 0f),
+                    weaponSpeed = DB.GetFloat(r, "weapon_speed", DB.GetFloat(r, "weaponSpeed", DB.GetFloat(r, "WeaponSpeed", 0f))),
                     slotType = DB.GetString(r, "slot_type"),
                     weaponClass = DB.GetString(r, "weapon_class"),
                     inventoryWidth = DB.GetInt(r, "inventory_width", 1),
@@ -829,7 +830,7 @@ public class GeneralItemData
 public class ItemData
 {
     public string gcType; public string name; public string description;
-    public float goldValue; public float defenseRating; public float damage; public int range; public float cooldown;
+    public float goldValue; public float defenseRating; public float damage; public int range; public float cooldown; public float weaponSpeed;
     public string slotType; public string weaponClass; public int inventoryWidth; public int inventoryHeight;
     public string inventoryIcon; public string groundObject; public bool equipable; public int modCount = 3; public int requiredLevel = 1;
     /// <summary>
@@ -876,12 +877,14 @@ public class ItemData
 
 public static class MonsterHealthTable
 {
-    private const float LEVEL_1_HP = 60.5f; private const float LEVEL_100_HP = 5452f; private const float SLOPE = (LEVEL_100_HP - LEVEL_1_HP) / 99f;
     private static readonly Dictionary<string, float> DifficultyModifiers = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase) { { "FODDER", 0.5f }, { "RECRUIT", 1f }, { "VETERAN", 2f }, { "WARMONGER", 2.5f }, { "CHAMPION", 4f }, { "HERO", 7f }, { "DUNGEON_BOSS", 8f }, { "BOSS", 8f } };
-    public static float GetBaseHP(int level) { level = Math.Max(1, Math.Min(100, level)); return LEVEL_1_HP + (level - 1) * SLOPE; }
+    public static float GetBaseHP(int level) { level = Math.Max(1, Math.Min(110, level)); return DungeonRunners.Data.GCDatabase.Instance.GetCurveValue("MonsterHealth", level); }
     public static float GetDifficultyModifier(string d) { if (string.IsNullOrEmpty(d)) return 1f; return DifficultyModifiers.TryGetValue(d, out float m) ? m : 1f; }
-    public static int CalculateHP(int level, string diff) { return (int)(GetBaseHP(level) * GetDifficultyModifier(diff)); }
-    public static uint CalculateHPWire(int level, string diff, float mod = 1f) { return (uint)(CalculateHP(level, diff) * mod * 256); }
+    public static int CalculateHP(int level, string diff) { return CalculateHP(level, diff, 1f); }
+    public static int CalculateHP(int level, string diff, float mod) { return CalculateHP(level, GetDifficultyModifier(diff), mod); }
+    public static int CalculateHP(int level, float difficulty, float mod) { int baseF32 = DungeonRunners.Data.GCDatabase.Instance.GetCurveValueFixed32("MonsterHealth", Math.Max(1, Math.Min(110, level))); int diffF32 = (int)(Math.Max(0f, difficulty) * 256f); int modF32 = (int)(Math.Max(0f, mod) * 256f); long hpF32 = ((long)baseF32 * modF32) >> 8; hpF32 = (hpF32 * diffF32) >> 8; return Math.Max(1, (int)(hpF32 >> 8)); }
+    public static uint CalculateHPWire(int level, string diff, float mod = 1f) { return (uint)(CalculateHP(level, diff, mod) * 256); }
+    public static uint CalculateHPWire(int level, float difficulty, float mod = 1f) { return (uint)(CalculateHP(level, difficulty, mod) * 256); }
 }
 
 [Serializable]

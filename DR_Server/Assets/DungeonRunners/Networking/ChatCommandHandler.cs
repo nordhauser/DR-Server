@@ -605,15 +605,27 @@ namespace DungeonRunners.Networking
                 }
                 string setKey = setParts[0].Trim();
                 string setValue = setParts[1].Trim();
+                if (!ServerSettings.IsRuntimeMutableKey(setKey))
+                {
+                    sendMessage(conn, $"[Config] '{setKey}' is native-authoritative and cannot be changed with @set");
+                    return true;
+                }
                 string oldValue = ServerSettings.GetString(setKey, "(not set)");
-                ServerSettings.Set(setKey, setValue);
-                sendMessage(conn, $"[Config] {setKey}: {oldValue} -> {setValue} (saved to DB)");
+                if (ServerSettings.Set(setKey, setValue))
+                    sendMessage(conn, $"[Config] {setKey}: {oldValue} -> {setValue} (saved to DB)");
+                else
+                    sendMessage(conn, $"[Config] '{setKey}' was not changed");
                 return true;
             }
 
             if (command.StartsWith("get "))
             {
                 string getKey = command.Substring(4).Trim();
+                if (!ServerSettings.IsRuntimeMutableKey(getKey))
+                {
+                    sendMessage(conn, $"[Config] '{getKey}' is native-authoritative and not runtime mutable");
+                    return true;
+                }
                 var all = ServerSettings.GetAll();
                 if (all.TryGetValue(getKey, out var entry))
                     sendMessage(conn, $"[Config] {getKey} = {entry.value} (source: {entry.source})");
@@ -658,16 +670,14 @@ namespace DungeonRunners.Networking
             {
                 bool isFree = _server.IsPlayerFreePublic(conn.LoginName);
                 string mode = isFree ? "FREE PLAYER" : "MEMBER";
-                float xpMult = ServerSettings.GetFloat("freePlayerXPMultiplier", 0.6f);
-                float expMod = ServerSettings.GetFloat("gcExperienceMod", 1.0f);
+                float xpMult = GCDatabase.Instance.GetKnob("FreePlayerExperienceMult", 0.87f);
+                float expMod = GCDatabase.Instance.GetKnob("ExperienceMod", 5.0f);
                 sendMessage(conn, $"[Membership] You are: {mode}");
                 if (isFree)
                     sendMessage(conn, $"  XP penalty: ×{xpMult} | Shadow items: ON | Item restrictions: ON");
                 else
                     sendMessage(conn, $"  Full XP | All items usable | No restrictions");
                 sendMessage(conn, $"  Base ExperienceMod: {expMod}");
-                string defMode = ServerSettings.GetString("defaultMembership", "member");
-                sendMessage(conn, $"  Default for new accounts: {defMode}");
                 return true;
             }
 
@@ -722,9 +732,11 @@ namespace DungeonRunners.Networking
 
             if (command == "config" || command == "settings" || command == "cfg")
             {
-                var all = ServerSettings.GetAll();
+                var all = ServerSettings.GetAll()
+                    .Where(kvp => ServerSettings.IsRuntimeMutableKey(kvp.Key))
+                    .ToList();
                 int totalSettings = all.Count;
-                sendMessage(conn, $"[Config] {totalSettings} settings loaded:");
+                sendMessage(conn, $"[Config] {totalSettings} runtime settings loaded:");
                 int shown = 0;
                 foreach (var kvp in all)
                 {
@@ -744,6 +756,11 @@ namespace DungeonRunners.Networking
             {
                 string unsetKey = command.Substring(command.IndexOf(' ') + 1).Trim();
                 ServerSettings.Remove(unsetKey);
+                if (!ServerSettings.IsRuntimeMutableKey(unsetKey))
+                {
+                    sendMessage(conn, $"[Config] Removed ignored DB override for native-authoritative '{unsetKey}'");
+                    return true;
+                }
                 string cfgVal = ServerSettings.GetString(unsetKey, "(default)");
                 sendMessage(conn, $"[Config] Removed DB override for '{unsetKey}'. Now using: {cfgVal}");
                 return true;
@@ -1827,6 +1844,12 @@ namespace DungeonRunners.Networking
                 return true;
             }
 
+            if (args == "clearall" || args.StartsWith("remove ") || args.StartsWith("delete "))
+            {
+                sendMessage(conn, "[Behavior] Runtime behavior mutation is disabled.");
+                return true;
+            }
+
             if (args == "clearall")
             {
                 try
@@ -1904,6 +1927,12 @@ namespace DungeonRunners.Networking
                 {
                     sendMessage(conn, $"[Behavior] Error: {ex.Message}");
                 }
+                return true;
+            }
+
+            if (bparts.Length > 1)
+            {
+                sendMessage(conn, "[Behavior] Runtime behavior mutation is disabled.");
                 return true;
             }
 

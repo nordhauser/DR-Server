@@ -426,10 +426,6 @@ namespace DungeonRunners.Managers
                 }
             }
 
-            // Kings Coin roll - tier-based percentage from ServerSettings
-            var kcDrop = RollKingsCoin(monster.Tier);
-            if (kcDrop != null) drops.Add(kcDrop);
-
             if (drops.Count > 0)
                 Debug.LogError($"[LootManager] {monster.Name} ({monster.Tier}): " +
                     $"{drops.Count(d => d.IsGold)} gold, {drops.Count(d => d.IsItem)} items, " +
@@ -816,14 +812,10 @@ namespace DungeonRunners.Managers
         // ===========================================================================
         // KING'S COIN DROP ROLL
         //
-        // Source: KingsCoinIG.gc declares three generators (KingsCoin1, KingsCoin5,
-        // KingsCoin10). The numbers in those names match the original drop percentages
-        // they were referenced at in creature.gc files. We rebuild that mapping here
-        // keyed off Monster.Tier.
-        //
-        // Rates are read from ServerSettings on every roll so they can be tuned at
-        // runtime without recompiling. Defaults: HERO/BOSS=10%, CHAMPION=5%,
-        // VETERAN=2%, grunt=1%, BARREL=1%.
+        // KingsCoinIG.gc is an authored item-generator table. Mob loot must reference
+        // that generator through creature treasure data; there is no native/authored
+        // evidence for an extra tier-wide mob roll. This helper remains for the
+        // explicit BARREL path until destroyable loot is fully authored.
         // ===========================================================================
         public LootDrop RollKingsCoin(string tier)
         {

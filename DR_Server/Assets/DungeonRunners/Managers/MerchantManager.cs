@@ -2051,8 +2051,7 @@ namespace DungeonRunners.Managers
                                 itemWriter.WriteByte(0x01);  // level
                                 itemWriter.WriteByte(0x00);  // flags
                                 itemWriter.WriteByte(0x00);  // modifier count = 0
-                                itemWriter.WriteByte(0x02);
-                                itemWriter.WriteUInt32(0x00000000);
+                                server.WritePlayerEntitySynch(conn, itemWriter);
                                 itemWriter.WriteByte(0x06);
                                 sendPacket(conn, 0x01, 0x0F, itemWriter.ToArray());
 
@@ -2130,8 +2129,7 @@ namespace DungeonRunners.Managers
                                     itemWriter.WriteUInt16(conn.UnitContainerId);
                                     itemWriter.WriteByte(0x1F);
                                     itemWriter.WriteUInt32(partialSlot);
-                                    itemWriter.WriteByte(0x02);
-                                    itemWriter.WriteUInt32(0x00000000);
+                                    server.WritePlayerEntitySynch(conn, itemWriter);
                                     itemWriter.WriteByte(0x35);
                                     itemWriter.WriteUInt16(conn.UnitContainerId);
                                     itemWriter.WriteByte(0x1E);
@@ -2145,8 +2143,7 @@ namespace DungeonRunners.Managers
                                     itemWriter.WriteByte(0x01);
                                     itemWriter.WriteByte(0x00);
                                     itemWriter.WriteByte(0x00);
-                                    itemWriter.WriteByte(0x02);
-                                    itemWriter.WriteUInt32(0x00000000);
+                                    server.WritePlayerEntitySynch(conn, itemWriter);
                                     itemWriter.WriteByte(0x06);
                                     sendPacket(conn, 0x01, 0x0F, itemWriter.ToArray());
 
@@ -2189,8 +2186,7 @@ namespace DungeonRunners.Managers
                                     itemWriter.WriteByte(0x01);  // level
                                     itemWriter.WriteByte(0x00);  // flags
                                     itemWriter.WriteByte(0x00);  // modifier count = 0
-                                    itemWriter.WriteByte(0x02);
-                                    itemWriter.WriteUInt32(0x00000000);
+                                    server.WritePlayerEntitySynch(conn, itemWriter);
                                     itemWriter.WriteByte(0x06);
                                     sendPacket(conn, 0x01, 0x0F, itemWriter.ToArray());
 
@@ -2235,8 +2231,7 @@ namespace DungeonRunners.Managers
                                 itemWriter.WriteByte(0x0B);
                                 int actualItemLevel = item_final.level > 0 ? item_final.level : RarityHelper.GetItemLevel(buyGcType);
                                 newItem.WriteInitForInventory(itemWriter, slotX, slotY, slot, actualItemLevel);
-                                itemWriter.WriteByte(0x02);
-                                itemWriter.WriteUInt32(0x00000000);
+                                server.WritePlayerEntitySynch(conn, itemWriter);
                                 itemWriter.WriteByte(0x06);
                                 sendPacket(conn, 0x01, 0x0F, itemWriter.ToArray());
 

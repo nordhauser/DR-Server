@@ -8,6 +8,8 @@ namespace DungeonRunners.Networking
 
         public void Enqueue(byte[] data)
         {
+            if (data == null || data.Length == 0)
+                return;
             _queue.Enqueue(data);
         }
 
@@ -24,7 +26,7 @@ namespace DungeonRunners.Networking
         }
 
         public int Count => _queue.Count;
-        // ✅ ADD THIS METHOD
+
         public void Clear()
         {
             _queue.Clear();

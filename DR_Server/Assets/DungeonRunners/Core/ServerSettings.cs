@@ -26,6 +26,33 @@ namespace DungeonRunners.Core
         private static Dictionary<string, string> _dbValues = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private static bool _loaded = false;
         private static string _cfgPath;
+        private static readonly HashSet<string> _runtimeMutableKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "authIP",
+            "authPort",
+            "gameIP",
+            "gamePort",
+            "queuePort",
+            "serverName",
+            "maxPlayers",
+            "startZone",
+            "enableDebugLog",
+            "focusedDebugLog",
+            "logCategories",
+            "welcomeMessage",
+            "welcomeColor",
+            "motd",
+            "motdColor",
+            "announceColor",
+            "announceEffect"
+        };
+
+        public static bool IsRuntimeMutableKey(string key)
+        {
+            if (string.IsNullOrWhiteSpace(key)) return false;
+            return _runtimeMutableKeys.Contains(key)
+                || key.StartsWith("verbose", StringComparison.OrdinalIgnoreCase);
+        }
 
         public static void Load()
         {
@@ -106,14 +133,20 @@ namespace DungeonRunners.Core
 
         // ═══ SET — writes to SQLite, live, persists across restarts ═══
 
-        public static void Set(string key, string value)
+        public static bool Set(string key, string value)
         {
+            if (!IsRuntimeMutableKey(key))
+            {
+                Debug.LogError($"[CONFIG] Blocked native-authoritative DB override '{key}'");
+                return false;
+            }
             _dbValues[key] = value;
             SaveToDatabase(key, value);
             Debug.LogError($"[CONFIG] Set '{key}' = '{value}' (saved to DB)");
 
             if (key.Equals("maxPlayers", StringComparison.OrdinalIgnoreCase))
                 QueueConnectionBridge.MaxPlayers = Get("maxPlayers", 50);
+            return true;
         }
 
         // ═══ REMOVE — deletes from DB, falls back to .cfg ═══
@@ -234,13 +267,23 @@ namespace DungeonRunners.Core
                         "SELECT key, value FROM server_settings"))
                     {
                         int count = 0;
+                        int skipped = 0;
                         while (reader.Read())
                         {
-                            _dbValues[reader.GetString(0)] = reader.GetString(1);
+                            string key = reader.GetString(0);
+                            string value = reader.GetString(1);
+                            if (!IsRuntimeMutableKey(key))
+                            {
+                                skipped++;
+                                continue;
+                            }
+                            _dbValues[key] = value;
                             count++;
                         }
                         if (count > 0)
                             Debug.LogError($"[CONFIG] Loaded {count} DB overrides");
+                        if (skipped > 0)
+                            Debug.LogError($"[CONFIG] Ignored {skipped} native-authoritative DB overrides");
                     }
                 }
             }
@@ -291,10 +334,6 @@ namespace DungeonRunners.Core
             Debug.LogError($"[CONFIG]   serverName = {GetString("serverName", "Dungeon Runners")}");
             Debug.LogError($"[CONFIG]   maxPlayers = {Get("maxPlayers", 50)}");
             Debug.LogError($"[CONFIG]   startZone = {GetString("startZone", "tutorial")}");
-            Debug.LogError($"[CONFIG]   experienceMod = {GetFloat("experienceMod", 5.0f)}");
-            Debug.LogError($"[CONFIG]   xpMultiplier = {GetFloat("xpMultiplier", 1.0f)}");
-            Debug.LogError($"[CONFIG]   enableFreePlayerXP = {GetBool("enableFreePlayerXP", true)}");
-            Debug.LogError($"[CONFIG]   maxLevel = {Get("maxLevel", 100)}");
             Debug.LogError($"[CONFIG]   welcomeMessage = {GetString("welcomeMessage", "Welcome!")}");
             int dbCount = _dbValues.Count;
             if (dbCount > 0)

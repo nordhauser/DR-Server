@@ -17,6 +17,7 @@ namespace DungeonRunners.Managers
 
         private Dictionary<string, PlayerQuestState> _playerQuests = new Dictionary<string, PlayerQuestState>();
         private Action<RRConnection, byte, byte, byte[]> _sendPacket;
+        private Func<RRConnection, LEWriter, bool> _writeEntitySynch;
 
         // Info-style quests authored AutoAcceptOnQuery + Temporary + 0 objectives in .gc —
         // help-text dialogs and short flavour quests. Server treats them as
@@ -260,6 +261,27 @@ namespace DungeonRunners.Managers
         public void SetSendCallback(Action<RRConnection, byte, byte, byte[]> sendCallback)
         {
             _sendPacket = sendCallback;
+        }
+
+        public void SetEntitySynchCallback(Func<RRConnection, LEWriter, bool> writeEntitySynch)
+        {
+            _writeEntitySynch = writeEntitySynch;
+        }
+
+        private bool WriteEntitySynchAndEnd(RRConnection conn, LEWriter writer, string packetName)
+        {
+            if (_writeEntitySynch == null)
+            {
+                Debug.LogError($"[{packetName}] Missing EntitySynch callback");
+                return false;
+            }
+            if (!_writeEntitySynch(conn, writer))
+            {
+                Debug.LogError($"[{packetName}] EntitySynch write blocked");
+                return false;
+            }
+            writer.WriteByte(0x06);
+            return true;
         }
 
         public void InitializePlayer(string connId, List<ActiveQuest> activeQuests,
@@ -539,8 +561,7 @@ namespace DungeonRunners.Managers
                 writer.WriteUInt16((ushort)(obj.Required > 0 ? obj.Required : 1));
             }
 
-            writer.WriteByte(0x00);
-            writer.WriteByte(0x06);
+            if (!WriteEntitySynchAndEnd(conn, writer, "QUEST-ADD")) return;
             Debug.LogError($"[QUEST-ADD] HEX: {BitConverter.ToString(writer.ToArray()).Replace("-", " ")}");
             Debug.LogError($"[QUEST-ADD] Sending {questData.id} InstanceId={activeQuest.InstanceId} allComplete={allComplete}");
             _sendPacket?.Invoke(conn, 0x01, 0x0F, writer.ToArray());
@@ -558,8 +579,7 @@ namespace DungeonRunners.Managers
 
             writer.WriteUInt32(instanceId);
 
-            writer.WriteByte(0x00);
-            writer.WriteByte(0x06);
+            if (!WriteEntitySynchAndEnd(conn, writer, "QUEST-REMOVE")) return;
             Debug.LogError($"[QUEST-ADD] HEX: {BitConverter.ToString(writer.ToArray()).Replace("-", " ")}");
             Debug.LogError($"[QUEST-REMOVE] InstanceId={instanceId}");
             _sendPacket?.Invoke(conn, 0x01, 0x0F, writer.ToArray());
@@ -598,8 +618,7 @@ namespace DungeonRunners.Managers
                 writer.WriteUInt16((ushort)(obj.Required > 0 ? obj.Required : 1));
             }
 
-            writer.WriteByte(0x00);  // sync
-            writer.WriteByte(0x06);  // EndStream
+            if (!WriteEntitySynchAndEnd(conn, writer, "QUEST-PROGRESS")) return;
             Debug.LogError($"[QUEST-PROGRESS] Objectives packet: {BitConverter.ToString(writer.ToArray()).Replace("-", " ")}");
             _sendPacket?.Invoke(conn, 0x01, 0x0F, writer.ToArray());
 
@@ -615,8 +634,7 @@ namespace DungeonRunners.Managers
             flagWriter.WriteByte(0x00);  // Quest submessage 0 = set complete flag
             flagWriter.WriteByte(allComplete ? (byte)0x01 : (byte)0x00);  // the flag value
 
-            flagWriter.WriteByte(0x00);  // sync
-            flagWriter.WriteByte(0x06);  // EndStream
+            if (!WriteEntitySynchAndEnd(conn, flagWriter, "QUEST-PROGRESS-FLAG")) return;
             Debug.LogError($"[QUEST-PROGRESS] Complete flag packet: allComplete={allComplete}");
             _sendPacket?.Invoke(conn, 0x01, 0x0F, flagWriter.ToArray());
 
@@ -635,8 +653,7 @@ namespace DungeonRunners.Managers
 
             writer.WriteUInt32(instanceId);
 
-            writer.WriteByte(0x00);
-            writer.WriteByte(0x06);
+            if (!WriteEntitySynchAndEnd(conn, writer, "QUEST-COMPLETE-PKT")) return;
             Debug.LogError($"[QUEST-ADD] HEX: {BitConverter.ToString(writer.ToArray()).Replace("-", " ")}");
             Debug.LogError($"[QUEST-COMPLETE-PKT] InstanceId={instanceId}");
             _sendPacket?.Invoke(conn, 0x01, 0x0F, writer.ToArray());
@@ -722,8 +739,7 @@ namespace DungeonRunners.Managers
                 }
             }
 
-            writer.WriteByte(0x00);  // Stream terminator
-            writer.WriteByte(0x06);  // EndStream
+            if (!WriteEntitySynchAndEnd(conn, writer, "QUEST-AVAILABLE")) return;
 
             var packet = writer.ToArray();
             Debug.LogError($"[QUEST-AVAILABLE] Sending packet: {packet.Length} bytes");
@@ -739,7 +755,7 @@ namespace DungeonRunners.Managers
 
             if (zoneName.IndexOf("pvp", StringComparison.OrdinalIgnoreCase) >= 0 || currentZonePrefix.Equals("world.pvp", StringComparison.OrdinalIgnoreCase))
                 npcs = DatabaseLoader.PvpNPCs;
-            else if (zoneName.IndexOf("tutorial", StringComparison.OrdinalIgnoreCase) >= 0 || zoneName.IndexOf("dungeon00", StringComparison.OrdinalIgnoreCase) >= 0 || currentZonePrefix.Equals("world.tutorial", StringComparison.OrdinalIgnoreCase))
+            else if (zoneName.IndexOf("tutorial", StringComparison.OrdinalIgnoreCase) >= 0 || currentZonePrefix.Equals("world.tutorial", StringComparison.OrdinalIgnoreCase))
                 npcs = DatabaseLoader.TutorialNPCs;
             else if (zoneName.IndexOf("town", StringComparison.OrdinalIgnoreCase) >= 0 || currentZonePrefix.Equals("world.town", StringComparison.OrdinalIgnoreCase))
                 npcs = DatabaseLoader.TownNPCs;
@@ -859,8 +875,7 @@ namespace DungeonRunners.Managers
                 Debug.LogError($"[QUEST-QUERY] Sending ACCEPT dialog for {quest.id} hash=0x{questHash:X8}");
             }
 
-            writer.WriteByte(0x00);
-            writer.WriteByte(0x06); // EndStream
+            if (!WriteEntitySynchAndEnd(conn, writer, "QUEST-QUERY")) return;
 
             Debug.LogError($"[QUEST-QUERY] HEX: {BitConverter.ToString(writer.ToArray()).Replace("-", " ")}");
             _sendPacket?.Invoke(conn, 0x01, 0x0F, writer.ToArray());
@@ -933,8 +948,7 @@ namespace DungeonRunners.Managers
 
             writer.WriteUInt32(instanceId);
 
-            writer.WriteByte(0x00);
-            writer.WriteByte(0x06);
+            if (!WriteEntitySynchAndEnd(conn, writer, "QUEST-FINALIZE")) return;
             Debug.LogError($"[QUEST-ADD] HEX: {BitConverter.ToString(writer.ToArray()).Replace("-", " ")}");
             Debug.LogError($"[QUEST-FINALIZE] InstanceId={instanceId}");
             _sendPacket?.Invoke(conn, 0x01, 0x0F, writer.ToArray());
@@ -1100,8 +1114,7 @@ namespace DungeonRunners.Managers
             writer.WriteUInt16(conn.QuestManagerId);
             writer.WriteByte(0x06);  // submessage 6 = processUpdateQueryComplete
             writer.WriteUInt32(instanceId);  // quest instanceId (NOT hash)
-            writer.WriteByte(0x00);  // Sync flags
-            writer.WriteByte(0x06);  // EndStream
+            if (!WriteEntitySynchAndEnd(conn, writer, "QUEST-TURNIN")) return;
 
             var packet = writer.ToArray();
             Debug.LogError($"[QUEST-TURNIN] HEX: {BitConverter.ToString(packet).Replace("-", " ")}");

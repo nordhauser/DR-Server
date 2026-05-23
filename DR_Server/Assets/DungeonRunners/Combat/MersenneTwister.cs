@@ -8,7 +8,7 @@ namespace DungeonRunners.Combat
     /// From Ghidra analysis:
     /// - State size: 0x270 (624) uint32 values
     /// - Magic constant: 0x6c078965
-    /// - Standard MT19937 tempering
+    /// - Native Dungeon Runners tempering masks at Random::generate(char const*) 0x0044B1F0
     /// 
     /// Server MUST send seed via opcode 0x0C and use this class for damage calculations
     /// to match client's Random::generate() output exactly.
@@ -34,6 +34,14 @@ namespace DungeonRunners.Combat
         public uint LastSeed { get; private set; }
         public int CallsSinceReseed { get; private set; }
         public uint LastGeneratedValue { get; private set; }
+
+        // 2026-05-23 RNG-divergence diagnostic. When true, every Generate() call logs
+        // [RNG-TRACE] with pos, caller (first non-MersenneTwister stack frame), and value.
+        // Compare against client x32dbg log breakpoint on Random::generate @ 0x0044B1F0 to
+        // find the first call where server and client diverge.
+        // Stack-trace lookups are slow — keep off in production. Flip to true for a single
+        // test session, capture server.log, then flip back.
+        public static bool VerboseRngTrace = true;
 
         /// <summary>
         /// Create uninitialized MT - must call Seed() before Generate()
@@ -74,6 +82,22 @@ namespace DungeonRunners.Combat
                 _mt[i] = (uint)(0x6c078965 * (_mt[i - 1] ^ (_mt[i - 1] >> 30)) + i);
             }
             _mti = N; // Force regeneration on first generate call
+
+            if (VerboseRngTrace)
+            {
+                var st = new System.Diagnostics.StackTrace(1, false);
+                string callerName = "?";
+                for (int i = 0; i < st.FrameCount; i++)
+                {
+                    var m = st.GetFrame(i)?.GetMethod();
+                    if (m == null) continue;
+                    var dt = m.DeclaringType;
+                    if (dt == typeof(MersenneTwister)) continue;
+                    callerName = (dt != null ? dt.Name : "?") + "." + m.Name;
+                    break;
+                }
+                UnityEngine.Debug.LogError($"[RNG-TRACE] SEED 0x{seed:X8} caller={callerName}");
+            }
         }
 
         /// <summary>
@@ -121,18 +145,41 @@ namespace DungeonRunners.Combat
             // Get next value from state
             y = _mt[_mti++];
 
-            // Tempering - matches Ghidra exactly:
+            // Tempering - matches Random::generate(char const*) at 0x0044B1F0:
             // uVar1 = uVar1 ^ uVar1 >> 0xb;
             // uVar1 = uVar1 ^ (uVar1 & 0xff3a58ad) << 7;
             // uVar1 = uVar1 ^ (uVar1 & 0xffffdf8c) << 0xf;
             // return uVar1 >> 0x12 ^ uVar1;
             y ^= (y >> 11);
-            y ^= (y << 7) & TEMPERING_MASK_B;
-            y ^= (y << 15) & TEMPERING_MASK_C;
+            y ^= (y & TEMPERING_MASK_B) << 7;
+            y ^= (y & TEMPERING_MASK_C) << 15;
             y ^= (y >> 18);
 
             CallsSinceReseed++;
             LastGeneratedValue = y;
+
+            if (VerboseRngTrace)
+            {
+                // First non-MersenneTwister stack frame = the caller we care about.
+                // (frame 0 is Generate() itself, then potentially Generate(uint,uint) etc.)
+                var st = new System.Diagnostics.StackTrace(1, false);
+                string callerName = "?";
+                string callerFrame2 = "";
+                int outFrames = 0;
+                for (int i = 0; i < st.FrameCount && outFrames < 2; i++)
+                {
+                    var m = st.GetFrame(i)?.GetMethod();
+                    if (m == null) continue;
+                    var dt = m.DeclaringType;
+                    if (dt == typeof(MersenneTwister)) continue;
+                    string name = (dt != null ? dt.Name : "?") + "." + m.Name;
+                    if (outFrames == 0) callerName = name;
+                    else callerFrame2 = " <- " + name;
+                    outFrames++;
+                }
+                UnityEngine.Debug.LogError($"[RNG-TRACE] pos={CallsSinceReseed} val=0x{y:X8} caller={callerName}{callerFrame2}");
+            }
+
             return y;
         }
 
@@ -167,5 +214,18 @@ namespace DungeonRunners.Combat
             uint range = (uint)(max - min + 1);
             return (int)((Generate() % range) + (uint)min);
         }
+    }
+
+    public static class NativeRandomStreams
+    {
+        private static readonly MersenneTwister _globalSoundRng = new MersenneTwister();
+
+        public static uint GenerateGlobalSound()
+        {
+            return _globalSoundRng.Generate();
+        }
+
+        public static int GlobalSoundCalls => _globalSoundRng.CallsSinceReseed;
+        public static uint GlobalSoundSeed => _globalSoundRng.LastSeed;
     }
 }

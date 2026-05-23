@@ -37,6 +37,8 @@ namespace DungeonRunners.Database
 
         public static SqliteConnection GetConnection()
         {
+            if (!_initialized && string.IsNullOrWhiteSpace(_connectionString))
+                Initialize();
             var conn = new SqliteConnection(_connectionString);
             conn.Open();
             using (var cmd = conn.CreateCommand())

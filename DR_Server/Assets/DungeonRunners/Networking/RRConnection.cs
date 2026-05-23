@@ -31,15 +31,20 @@ namespace DungeonRunners.Networking
         public float PendingLocalMoveFlushAt { get; set; } = 0f;
         public int LastCombatSyncFlushFrame { get; set; } = -1;
         public float IgnoreClientHPUntilTime { get; set; } = 0f;
-        public bool PlayerHPClientTruthDirty { get; set; } = false;
-        public float PlayerHPDirtySinceTime { get; set; } = 0f;
-        public string PlayerHPDirtyReason { get; set; } = null;
-        public uint LastAcceptedClientHPWire { get; set; } = 0;
-        public float LastAcceptedClientHPTime { get; set; } = 0f;
-        public int SuppressedPlayerHPSyncPackets { get; set; } = 0;
+        public uint LastOutboundHPWire { get; set; } = 0;
+        public float LastOutboundHPTime { get; set; } = 0f;
+        public string LastOutboundHPSource { get; set; } = null;
+        public uint LastObservedClientHPWire { get; set; } = 0;
+        public float LastObservedClientHPTime { get; set; } = 0f;
+        public string LastObservedClientHPSource { get; set; } = null;
         public bool HasActiveUseTarget { get; set; } = false;
         public ushort ActiveUseTargetId { get; set; } = 0;
         public byte ActiveUseTargetFlags { get; set; } = 0;
+        public int LastAvatarPreSuffixActionSliceFrame { get; set; } = -1;
+        public bool PendingClientControlReset { get; set; } = false;
+        public ushort PendingClientControlResetComponentId { get; set; } = 0;
+        public float PendingClientControlResetNextAttemptTime { get; set; } = 0f;
+        public byte PendingClientControlResetAttempts { get; set; } = 0;
         public ushort UnitContainerId { get; set; } = 0;
         public ushort ModifiersId { get; set; } = 0;
         public bool ZoneSpawnInvulnerabilityActive { get; set; } = false;
@@ -79,6 +84,7 @@ namespace DungeonRunners.Networking
         public float PendingSpawnX;
         public float PendingSpawnY;
         public float PendingSpawnZ;
+        public string PendingSpawnPoint { get; set; } = "";
 
         // ═══ MULTIPLAYER ═══
         public string CurrentZoneName { get; set; } = "";  // Exact zone name (e.g. "dungeon00_level01")

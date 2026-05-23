@@ -21,12 +21,20 @@ namespace DungeonRunners.Core
         void Awake()
         {
             RuntimeEvidenceManager.EnsureStarted();
-            // Ensure MainThreadDispatcher exists
+            if (RuntimeEvidenceManager.ShouldAbortStartup)
+            {
+                enabled = false;
+                Application.Quit();
+                return;
+            }
             var dispatcher = MainThreadDispatcher.Instance;
         }
 
         void Start()
         {
+            if (RuntimeEvidenceManager.ShouldAbortStartup)
+                return;
+
             if (serverConfig == null)
             {
                 Debug.LogError("ServerConfig not assigned! Please create a ServerConfig asset and assign it.");
@@ -34,8 +42,9 @@ namespace DungeonRunners.Core
             }
 
             Debug.Log("=== Dungeon Runners Server Starting ===");
+            RuntimeEvidenceManager.LogBuildBinding("startup");
             Debug.Log($"Server Version: {serverConfig.serverVersion}");
-            Debug.Log($"Max Players: {serverConfig.maxPlayers}");
+            Debug.Log($"Max Players: {ServerSettings.Get("maxPlayers", serverConfig.maxPlayers)}");
 
             if (startAuthServer)
             {

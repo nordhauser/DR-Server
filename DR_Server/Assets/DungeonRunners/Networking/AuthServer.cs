@@ -27,6 +27,7 @@ namespace DungeonRunners.Networking
         // Set synchronously before TCP write, checked on next accept
         private static string _pendingQueueUser = null;
         private static uint _pendingQueueToken = 0;
+        private static string _pendingQueueAdvertisedServerIP = null;
 
         void Start()
         {
@@ -79,10 +80,11 @@ namespace DungeonRunners.Networking
         /// Set by AuthConnection.SendGoHandoffToQueue before TCP write.
         /// Consumed by OnClientConnected when queue connection arrives.
         /// </summary>
-        public static void SetPendingQueueUser(string username, uint token = 0)
+        public static void SetPendingQueueUser(string username, uint token = 0, string advertisedServerIP = null)
         {
             _pendingQueueUser = username;
             _pendingQueueToken = token;
+            _pendingQueueAdvertisedServerIP = advertisedServerIP;
         }
 
         private void OnClientConnected(TcpClient client)
@@ -106,14 +108,24 @@ namespace DungeonRunners.Networking
         private void OnQueueClientConnected(TcpClient client)
         {
             // Queue port 2606 — ALWAYS a queue connection
+            if (string.IsNullOrWhiteSpace(_pendingQueueUser))
+            {
+                Debug.LogError($"[QUEUE] Rejected unexpected queue connection from {client.Client.RemoteEndPoint}");
+                try { client.Close(); } catch { }
+                return;
+            }
+
             string queueUser = _pendingQueueUser ?? "UNKNOWN";
             uint queueToken = _pendingQueueToken;
+            string queueAdvertisedServerIP = _pendingQueueAdvertisedServerIP;
             _pendingQueueUser = null;
             _pendingQueueToken = 0;
+            _pendingQueueAdvertisedServerIP = null;
             Debug.LogError($"[QUEUE] ✅ Queue connection on port 2606 for '{queueUser}' from {client.Client.RemoteEndPoint}");
 
             var queueConn = new AuthConnection(client, config);
             queueConn.SetSessionToken(queueToken);
+            queueConn.SetAdvertisedServerIP(queueAdvertisedServerIP);
             queueConn.StartQueueMode(this, queueUser);
             _connections.Add(queueConn);
         }
@@ -127,10 +139,17 @@ namespace DungeonRunners.Networking
         private NetworkStream _stream;
         private string _username; // Store the logged-in username
         private uint _sessionToken; // Store session token for HandoffToGame
+        private string _advertisedServerIP;
 
         public void SetSessionToken(uint token)
         {
             _sessionToken = token;
+        }
+
+        public void SetAdvertisedServerIP(string advertisedServerIP)
+        {
+            if (!string.IsNullOrWhiteSpace(advertisedServerIP))
+                _advertisedServerIP = advertisedServerIP;
         }
         private MonoBehaviour _coroutineRunner; // For delayed sends
         private bool _handoffSent = false; // Guard against duplicate AboutToPlay
@@ -143,6 +162,8 @@ namespace DungeonRunners.Networking
             _stream = client.GetStream();
             _config = config;
             _client = new ClientConnection(client);
+            _advertisedServerIP = ResolveAdvertisedServerIP(client, config.gameServerIP);
+            Debug.LogError($"[AUTH-NET] remote={GetEndpointIP(client?.Client?.RemoteEndPoint) ?? "unknown"} local={GetEndpointIP(client?.Client?.LocalEndPoint) ?? "unknown"} configured={config.gameServerIP} advertised={_advertisedServerIP}");
 
             _client.OnDisconnected += () => OnDisconnected?.Invoke();
         }
@@ -201,6 +222,11 @@ namespace DungeonRunners.Networking
                 if (totalLen < 4)
                 {
                     Debug.LogWarning($"Bad frame length: {totalLen}");
+                    break;
+                }
+                if (totalLen > buffer.Length)
+                {
+                    Debug.LogWarning($"Bad frame length too large: {totalLen}");
                     break;
                 }
 
@@ -358,6 +384,7 @@ namespace DungeonRunners.Networking
 
                 // Store the username for later use
                 _username = username;
+                _advertisedServerIP = ResolveAdvertisedServerIP(_tcpClient, _config.gameServerIP);
 
                 // Get or create account in SQLite — no password check (matches original server)
                 Database.GameDatabase.Initialize();
@@ -383,7 +410,7 @@ namespace DungeonRunners.Networking
 
                 SendGoLoginOk(accountId);
                 SendGoServerList();
-                Debug.Log($"📋 ServerListEx sent to {_config.gameServerIP}:{_config.gameServerPort}");
+                Debug.Log($"📋 ServerListEx sent to {_advertisedServerIP}:{_config.gameServerPort}");
             }
             catch (Exception ex)
             {
@@ -410,7 +437,7 @@ namespace DungeonRunners.Networking
             Debug.Log($"🎫 Generated session token 0x{sessionToken:X8} for user '{_username}'");
 
             // CRITICAL TIMING: Set queue username BEFORE sending anything!
-            AuthServer.SetPendingQueueUser(_username, sessionToken);
+            AuthServer.SetPendingQueueUser(_username, sessionToken, _advertisedServerIP);
             Debug.Log($"🔗 Queue username set for {_username}");
 
             // PDB-VERIFIED Session 50:
@@ -483,7 +510,10 @@ namespace DungeonRunners.Networking
 
         private void SendGoServerList()
         {
-            uint ipInt = IPToUInt32(_config.gameServerIP);
+            string advertisedIP = string.IsNullOrWhiteSpace(_advertisedServerIP)
+                ? ResolveAdvertisedServerIP(_tcpClient, _config.gameServerIP)
+                : _advertisedServerIP;
+            uint ipInt = IPToUInt32(advertisedIP);
 
             var writer = new ByteWriter();
             byte serverId = 0x01;
@@ -504,7 +534,7 @@ namespace DungeonRunners.Networking
             writer.WriteByte(0x01);
 
             WriteGoAuthMessage(0x04, writer.ToArray());
-            Debug.Log($"📋 Server list sent with 1 server (ID 1) → queue port {queuePort}");
+            Debug.Log($"📋 Server list sent with 1 server (ID 1) → {advertisedIP}:{queuePort}");
         }
 
         private void SendGoPlayOk(uint playToken, byte serverId)
@@ -555,6 +585,8 @@ namespace DungeonRunners.Networking
         public void StartQueueMode(MonoBehaviour coroutineRunner, string username)
         {
             _username = username;
+            if (string.IsNullOrWhiteSpace(_advertisedServerIP))
+                _advertisedServerIP = ResolveAdvertisedServerIP(_tcpClient, _config.gameServerIP);
             // NO Go welcome! Queue uses THCSockets, not Go auth protocol.
             coroutineRunner.StartCoroutine(QueueReceiveAndHandoff());
         }
@@ -791,7 +823,10 @@ namespace DungeonRunners.Networking
                 }
                 catch (Exception ex) { Debug.LogError($"[QUEUE] Flag IP error: {ex.Message}"); }
 
-                uint ipLE = IPToUInt32(_config.gameServerIP);
+                string advertisedIP = string.IsNullOrWhiteSpace(_advertisedServerIP)
+                    ? ResolveAdvertisedServerIP(_tcpClient, _config.gameServerIP)
+                    : _advertisedServerIP;
+                uint ipLE = IPToUInt32(advertisedIP);
                 uint port = (uint)_config.gameServerPort;
 
                 var inner = new ByteWriter();
@@ -809,7 +844,7 @@ namespace DungeonRunners.Networking
                 byte[] frameBytes = frame.ToArray();
                 _stream.Write(frameBytes, 0, frameBytes.Length);
                 _stream.Flush();
-                Debug.LogError($"[QUEUE-TX] HandoffToGame ({frameBytes.Length}b): {BitConverter.ToString(frameBytes)} → {_config.gameServerIP}:{_config.gameServerPort}");
+                Debug.LogError($"[QUEUE-TX] HandoffToGame ({frameBytes.Length}b): {BitConverter.ToString(frameBytes)} → {advertisedIP}:{_config.gameServerPort}");
             }
 
             // ═══════════════════════════════════════════════════════════════
@@ -1018,6 +1053,98 @@ namespace DungeonRunners.Networking
         {
             var p = ip.Split('.');
             return (uint)(byte.Parse(p[0]) | (byte.Parse(p[1]) << 8) | (byte.Parse(p[2]) << 16) | (byte.Parse(p[3]) << 24));
+        }
+
+        private static string ResolveAdvertisedServerIP(TcpClient client, string configuredIP)
+        {
+            string remoteIP = GetEndpointIP(client?.Client?.RemoteEndPoint);
+            if (IsLoopbackIPv4(remoteIP))
+                return "127.0.0.1";
+
+            string configured = NormalizeIPv4(configuredIP);
+            if (IsConcreteIPv4(configured))
+            {
+                if (!IsPrivateIPv4(configured) || IsAssignedLocalIPv4(configured))
+                    return configured;
+            }
+
+            string localIP = GetEndpointIP(client?.Client?.LocalEndPoint);
+            if (IsConcreteIPv4(localIP))
+                return localIP;
+
+            if (IsConcreteIPv4(configured))
+                return configured;
+
+            return "127.0.0.1";
+        }
+
+        private static string GetEndpointIP(System.Net.EndPoint endpoint)
+        {
+            try
+            {
+                var ep = endpoint as System.Net.IPEndPoint;
+                if (ep == null)
+                    return null;
+                var address = ep.Address;
+                if (address.IsIPv4MappedToIPv6)
+                    address = address.MapToIPv4();
+                if (address.AddressFamily == AddressFamily.InterNetwork)
+                    return address.ToString();
+                if (System.Net.IPAddress.IsLoopback(address))
+                    return "127.0.0.1";
+            }
+            catch { }
+            return null;
+        }
+
+        private static string NormalizeIPv4(string ip)
+        {
+            if (string.IsNullOrWhiteSpace(ip))
+                return null;
+            if (!System.Net.IPAddress.TryParse(ip.Trim(), out var address))
+                return null;
+            if (address.IsIPv4MappedToIPv6)
+                address = address.MapToIPv4();
+            if (address.AddressFamily != AddressFamily.InterNetwork)
+                return null;
+            return address.ToString();
+        }
+
+        private static bool IsConcreteIPv4(string ip)
+        {
+            return !string.IsNullOrWhiteSpace(ip) && ip != "0.0.0.0";
+        }
+
+        private static bool IsLoopbackIPv4(string ip)
+        {
+            if (string.IsNullOrWhiteSpace(ip))
+                return false;
+            return ip == "127.0.0.1" || ip.StartsWith("127.", StringComparison.Ordinal);
+        }
+
+        private static bool IsPrivateIPv4(string ip)
+        {
+            if (!System.Net.IPAddress.TryParse(ip, out var address))
+                return false;
+            byte[] b = address.GetAddressBytes();
+            return b.Length == 4 && (b[0] == 10 || (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168));
+        }
+
+        private static bool IsAssignedLocalIPv4(string ip)
+        {
+            try
+            {
+                foreach (var address in System.Net.Dns.GetHostAddresses(System.Net.Dns.GetHostName()))
+                {
+                    var a = address;
+                    if (a.IsIPv4MappedToIPv6)
+                        a = a.MapToIPv4();
+                    if (a.AddressFamily == AddressFamily.InterNetwork && string.Equals(a.ToString(), ip, StringComparison.Ordinal))
+                        return true;
+                }
+            }
+            catch { }
+            return IsLoopbackIPv4(ip);
         }
     }
 }

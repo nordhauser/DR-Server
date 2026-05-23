@@ -31,6 +31,7 @@ namespace DungeonRunners.Data
 
         // Resolved (flattened) nodes cache — inheritance applied
         private Dictionary<string, GCNode> _resolvedCache = new Dictionary<string, GCNode>(StringComparer.OrdinalIgnoreCase);
+        private Dictionary<string, List<(int levelF32, int valueF32)>> _curveCache = new Dictionary<string, List<(int, int)>>(StringComparer.OrdinalIgnoreCase);
 
         private static readonly Dictionary<string, string> _pathAliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -53,18 +54,23 @@ namespace DungeonRunners.Data
 
         public void Load(string directoryPath)
         {
+            IsLoaded = false;
             if (!Directory.Exists(directoryPath))
             {
                 Debug.LogError($"[GCDatabase] Directory not found: {directoryPath}");
-                return;
+                throw new DirectoryNotFoundException(directoryPath);
             }
 
             _nodes.Clear();
             _pathRegistry.Clear();
             _resolvedCache.Clear();
+            _curveCache.Clear();
+            _xpCurve = null;
 
             string[] files = Directory.GetFiles(directoryPath, "*.gc");
             FileCount = files.Length;
+            if (FileCount == 0)
+                throw new InvalidDataException($"No GC files found in {directoryPath}");
             int parseErrors = 0;
 
             foreach (string file in files)
@@ -90,21 +96,27 @@ namespace DungeonRunners.Data
                 }
             }
 
-            IsLoaded = true;
             Debug.LogError($"[GCDatabase] ═══════════════════════════════════════════════════");
             Debug.LogError($"[GCDatabase] Loaded {FileCount} files, {_pathRegistry.Count} paths registered");
             if (parseErrors > 0)
+            {
                 Debug.LogError($"[GCDatabase] {parseErrors} parse errors");
+                throw new InvalidDataException($"GCDatabase parse errors: {parseErrors}");
+            }
 
-            // Validate critical nodes
             if (GlobalKnobs == null)
-                Debug.LogError("[GCDatabase] WARNING: GlobalKnobs.gc not found!");
+                throw new InvalidDataException("GlobalKnobs.gc not found");
             else
                 Debug.LogError($"[GCDatabase] GlobalKnobs: WeaponDamagePerLevel={GlobalKnobs.GetFloat("WeaponDamagePerLevel")}, MeleeDamagePerStrength={GlobalKnobs.GetFloat("MeleeDamagePerStrength")}");
 
             if (Tables == null)
-                Debug.LogError("[GCDatabase] WARNING: Tables.gc not found!");
+                throw new InvalidDataException("Tables.gc not found");
+            if (Tables.GetChild("Experience") == null || Tables.GetChild("Experience").AnonymousChildren.Count == 0)
+                throw new InvalidDataException("Tables.Experience not found");
+            if (Tables.GetChild("MonsterHealth") == null || Tables.GetChild("MonsterHealth").AnonymousChildren.Count == 0)
+                throw new InvalidDataException("Tables.MonsterHealth not found");
 
+            IsLoaded = true;
             Debug.LogError($"[GCDatabase] ═══════════════════════════════════════════════════");
         }
 
@@ -296,10 +308,10 @@ namespace DungeonRunners.Data
 
             _xpCurve = new List<(int, float)>();
             var tables = GetNode("Tables");
-            if (tables == null) return _xpCurve;
+            if (tables == null) throw new InvalidDataException("Tables.gc not loaded");
 
             var xpTable = tables.GetChild("Experience");
-            if (xpTable == null) return _xpCurve;
+            if (xpTable == null) throw new InvalidDataException("Tables.Experience not found");
 
             foreach (var entry in xpTable.AnonymousChildren)
             {
@@ -310,6 +322,8 @@ namespace DungeonRunners.Data
             }
 
             _xpCurve.Sort((a, b) => a.level.CompareTo(b.level));
+            if (_xpCurve.Count == 0)
+                throw new InvalidDataException("Tables.Experience has no entries");
             Debug.LogError($"[GCDatabase] XP Curve loaded: {_xpCurve.Count} entries");
             foreach (var e in _xpCurve)
                 Debug.LogError($"[GCDatabase]   Level {e.level}: {e.value} kills");
@@ -324,7 +338,7 @@ namespace DungeonRunners.Data
         public float InterpolateXPCurve(int targetLevel)
         {
             var curve = GetXPCurve();
-            if (curve.Count == 0) return 10f;
+            if (curve.Count == 0) throw new InvalidDataException("Tables.Experience has no entries");
 
             for (int i = 0; i < curve.Count; i++)
             {
@@ -338,6 +352,64 @@ namespace DungeonRunners.Data
             return curve[curve.Count - 1].value;
         }
 
+        public int GetCurveValueFixed32(string tableName, int targetLevel, int fallbackF32 = 0)
+        {
+            var curve = GetCurveFixed32(tableName);
+            if (curve.Count == 0) return fallbackF32;
+
+            int levelF32 = ToFixed32(Math.Max(0, targetLevel));
+            if (levelF32 <= curve[0].levelF32) return curve[0].valueF32;
+
+            int last = curve.Count - 1;
+            if (levelF32 >= curve[last].levelF32) return curve[last].valueF32;
+
+            for (int i = 0; i < last; i++)
+            {
+                var lo = curve[i];
+                var hi = curve[i + 1];
+                if (levelF32 > hi.levelF32) continue;
+                if (hi.levelF32 == lo.levelF32) return hi.valueF32;
+
+                long ratioQ16 = ((long)(levelF32 - lo.levelF32) * 0x10000L) / (hi.levelF32 - lo.levelF32);
+                long delta = (long)(hi.valueF32 - lo.valueF32) * ratioQ16;
+                return lo.valueF32 + (int)(delta / 0x10000L);
+            }
+
+            return curve[last].valueF32;
+        }
+
+        public float GetCurveValue(string tableName, int targetLevel, float fallback = 0f)
+        {
+            int fallbackF32 = ToFixed32(fallback);
+            return GetCurveValueFixed32(tableName, targetLevel, fallbackF32) / 256f;
+        }
+
+        private List<(int levelF32, int valueF32)> GetCurveFixed32(string tableName)
+        {
+            if (_curveCache.TryGetValue(tableName, out var cached)) return cached;
+
+            var curve = new List<(int levelF32, int valueF32)>();
+            var table = Tables?.GetChild(tableName);
+            if (table?.AnonymousChildren != null)
+            {
+                foreach (var entry in table.AnonymousChildren)
+                {
+                    float level = entry.GetFloat("Level", 0f);
+                    float value = entry.GetFloat("Value", 0f);
+                    if (entry.HasProperty("Level") && level >= 0f)
+                        curve.Add((ToFixed32(level), ToFixed32(value)));
+                }
+            }
+            curve.Sort((a, b) => a.levelF32.CompareTo(b.levelF32));
+            _curveCache[tableName] = curve;
+            return curve;
+        }
+
+        private static int ToFixed32(float value)
+        {
+            return (int)(value * 256f);
+        }
+
         // ═══════════════════════════════════════════════════════════════
         // CONVENIENCE: Weapon properties
         // ═══════════════════════════════════════════════════════════════
@@ -346,12 +418,13 @@ namespace DungeonRunners.Data
         /// Get weapon Description properties from a resolved weapon node.
         /// Walks inheritance to find Damage, DamageVolatility, Range, CoolDown, WeaponClass.
         /// </summary>
-        public (float damage, float volatility, float range, float cooldown, string weaponClass)
+        public (float damage, float volatility, float range, float cooldown, string weaponClass, float weaponSpeed,
+                string weaponCategory, bool useProjectile, float projectileSpeed, float projectileSize, int burstCount)
             GetWeaponStats(string weaponGCPath)
         {
             var node = ResolveWithInheritance(weaponGCPath);
             if (node == null)
-                return (1.0f, 0.5f, 8f, 1.75f, "1HMELEE");
+                return (1.0f, 0.5f, 8f, 0f, "1HMELEE", 0f, "1HMACE", false, 0f, 0f, 1);
 
             var desc = node.GetChild("Description");
             if (desc == null) desc = node; // Some files put props at top level
@@ -360,9 +433,25 @@ namespace DungeonRunners.Data
                 damage: desc.GetFloat("Damage", 1.0f),
                 volatility: desc.GetFloat("DamageVolatility", 0.5f),
                 range: desc.GetFloat("Range", 8f),
-                cooldown: desc.GetFloat("CoolDown", 1.75f),
-                weaponClass: desc.GetString("WeaponClass", "1HMELEE")
+                cooldown: desc.GetFloat("CoolDown", 0f),
+                weaponClass: desc.GetString("WeaponClass", "1HMELEE"),
+                weaponSpeed: desc.GetFloat("WeaponSpeed", 0f),
+                weaponCategory: desc.GetString("WeaponCategory", "1HMACE"),
+                useProjectile: desc.GetBool("UseProjectile", false),
+                projectileSpeed: desc.GetFloat("ProjectileSpeed", 0f),
+                projectileSize: desc.GetFloat("ProjectileSize", 0f),
+                burstCount: Math.Max(1, desc.GetInt("BurstCount", 1))
             );
+        }
+
+        public float GetArmorDefenseRating(string armorGCPath)
+        {
+            var node = ResolveWithInheritance(armorGCPath);
+            if (node == null) return 0f;
+
+            var desc = node.GetChild("Description");
+            if (desc == null) desc = node;
+            return desc.GetFloat("DefenseRating", 0f);
         }
 
         // ═══════════════════════════════════════════════════════════════

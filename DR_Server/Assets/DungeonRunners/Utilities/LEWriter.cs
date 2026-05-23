@@ -10,14 +10,17 @@ namespace DungeonRunners.Utilities
     public class LEWriter
     {
         private readonly List<byte> _buffer = new List<byte>();
+        private bool _aborted;
 
         public void WriteByte(byte value)
         {
+            if (_aborted) return;
             _buffer.Add(value);
         }
 
         public void WriteBytes(byte[] bytes)
         {
+            if (_aborted) return;
             if (bytes != null && bytes.Length > 0)
             {
                 _buffer.AddRange(bytes);
@@ -26,13 +29,14 @@ namespace DungeonRunners.Utilities
 
         public void WriteUInt16(ushort value)
         {
+            if (_aborted) return;
             _buffer.Add((byte)(value & 0xFF));
             _buffer.Add((byte)((value >> 8) & 0xFF));
         }
 
-        // ✅ NEW METHOD - Write UInt16 at specific position (for backfilling size field)
         public void WriteUInt16At(int position, ushort value)
         {
+            if (_aborted) return;
             if (position < 0 || position + 1 >= _buffer.Count)
             {
                 throw new ArgumentOutOfRangeException(nameof(position),
@@ -45,6 +49,7 @@ namespace DungeonRunners.Utilities
 
         public void WriteUInt24(int value)
         {
+            if (_aborted) return;
             _buffer.Add((byte)(value & 0xFF));
             _buffer.Add((byte)((value >> 8) & 0xFF));
             _buffer.Add((byte)((value >> 16) & 0xFF));
@@ -52,6 +57,7 @@ namespace DungeonRunners.Utilities
 
         public void WriteUInt32(uint value)
         {
+            if (_aborted) return;
             _buffer.Add((byte)(value & 0xFF));
             _buffer.Add((byte)((value >> 8) & 0xFF));
             _buffer.Add((byte)((value >> 16) & 0xFF));
@@ -60,6 +66,7 @@ namespace DungeonRunners.Utilities
 
         public void WriteInt32(int value)
         {
+            if (_aborted) return;
             int before = _buffer.Count;
             WriteUInt32((uint)value);
             int after = _buffer.Count;
@@ -71,6 +78,7 @@ namespace DungeonRunners.Utilities
 
         public void WriteUInt64(ulong value)
         {
+            if (_aborted) return;
             _buffer.Add((byte)(value & 0xFF));
             _buffer.Add((byte)((value >> 8) & 0xFF));
             _buffer.Add((byte)((value >> 16) & 0xFF));
@@ -83,6 +91,7 @@ namespace DungeonRunners.Utilities
 
         public void WriteFloat(float value)
         {
+            if (_aborted) return;
             byte[] bytes = BitConverter.GetBytes(value);
             if (!BitConverter.IsLittleEndian)
             {
@@ -93,6 +102,7 @@ namespace DungeonRunners.Utilities
 
         public void WriteString(string value)
         {
+            if (_aborted) return;
             if (string.IsNullOrEmpty(value))
             {
                 WriteUInt16(0);
@@ -106,6 +116,7 @@ namespace DungeonRunners.Utilities
 
         public void WriteCString(string value)
         {
+            if (_aborted) return;
             if (!string.IsNullOrEmpty(value))
             {
                 byte[] bytes = Encoding.UTF8.GetBytes(value);
@@ -116,12 +127,13 @@ namespace DungeonRunners.Utilities
 
         public byte[] ToArray()
         {
+            if (_aborted) return Array.Empty<byte>();
             return _buffer.ToArray();
         }
 
-        // ✅ ADDED: Get raw buffer for advanced operations
         public byte[] GetBuffer()
         {
+            if (_aborted) return Array.Empty<byte>();
             return _buffer.ToArray();
         }
 
@@ -129,9 +141,18 @@ namespace DungeonRunners.Utilities
 
         public int Position => _buffer.Count;
 
+        public bool Aborted => _aborted;
+
+        public void Abort()
+        {
+            _buffer.Clear();
+            _aborted = true;
+        }
+
         public void Clear()
         {
             _buffer.Clear();
+            _aborted = false;
         }
     }
 }

@@ -275,7 +275,7 @@ namespace DungeonRunners.Networking
             // Connected + Roster as the sole path. HandleConnect fires before PlayerOnline
             // so GetCharacterName returns wrong name. Responding here creates duplicate
             // Connected packets that collide with SendLoginSocialInit's Connected + Roster.
-            DRLog.Social($"HandleConnect: suppressed (SendLoginSocialInit handles it)");
+            DRLog.Social($"HandleConnect: skipped (SendLoginSocialInit handles it)");
         }
 
         private void HandleRequestRosters(RRConnection conn, Action<RRConnection, byte, byte, byte[]> sendCompressed)

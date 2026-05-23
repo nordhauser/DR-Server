@@ -157,8 +157,14 @@ namespace DungeonRunners.Combat
                 DamageType = DamageElement.FIRE,
                 DamageMod = 0.75f,
                 DamageVolatility = 0.60f,
+                CriticalChance = 1.0f,
                 Cooldown = 0f,
                 Range = 300,
+                ProjectileSpeed = 200f,
+                ProjectileSize = 8f,
+                ProjectileLifespan = 30.5f,
+                RepeatCount = 1,
+                AnimationLengthFrames = 30,
                 ManaCostMod = 3.0f,
                 MaxSkillLevel = 20,
                 ProfessionType = "MAGE",
@@ -477,15 +483,35 @@ namespace DungeonRunners.Combat
                 DisplayName = "Poison Shot",
                 AttackType = AttackType.RANGED,
                 DamageType = DamageElement.POISON,
-                DamageMod = 0.43f,
-                DamageVolatility = 0.30f,
-                CriticalChance = 0.25f,
+                DamageMod = 0f,
+                DamageVolatility = 0f,
+                CriticalChance = 0f,
                 Cooldown = 1.0f,
                 Range = 176,
+                ProjectileSpeed = 200f,
+                ProjectileSize = 8f,
+                ProjectileLifespan = 23f,
                 ManaCostMod = 1.0f,
                 MaxSkillLevel = 20,
                 ProfessionType = "RANGER",
-                SkillCategory = SkillCategory.Offensive
+                SkillCategory = SkillCategory.Offensive,
+                AdjustCooldownByWeapon = true,
+                HasImmediateWeaponDamageEffect = true,
+                ARModMin = 300,
+                ARModMax = 300,
+                WeaponEffectDamageModMin = 0,
+                WeaponEffectDamageModMax = 0,
+                ProjectileEffectId = "skills.generic.PoisonShot.ProjectileEffect",
+                ProjectileModifierId = "skills.generic.PoisonShot.PoisonModifier",
+                ProjectileModifierEffectId = "skills.generic.PoisonShot.PoisonModifierEffect",
+                ProjectileModifierAttackType = AttackType.MAGIC,
+                ProjectileModifierDamageType = DamageElement.POISON,
+                ProjectileModifierDuration = 4f,
+                ProjectileModifierFrequency = 1f,
+                ProjectileModifierStackRule = "UNIQUEBYSOURCE",
+                ProjectileModifierDamageMod = 0.43f,
+                ProjectileModifierDamageVolatility = 0.30f,
+                ProjectileModifierCriticalChance = 0.25f
             });
 
             Register("PlagueShot", new SpellData
@@ -614,9 +640,13 @@ namespace DungeonRunners.Combat
                 MaxSkillLevel = 20,
                 ProfessionType = "FIGHTER",
                 SkillCategory = SkillCategory.WeaponSkill,
+                AdjustCooldownByWeapon = true,
                 SkillDamageModMin = -60,
                 SkillDamageModMax = 300,
-                SkillDamageModInc = 5
+                SkillDamageModInc = 5,
+                ARModMin = 20,
+                ARModMax = 250,
+                ARModInc = 5
             });
 
             Register("Cleave", new SpellData
@@ -634,9 +664,13 @@ namespace DungeonRunners.Combat
                 MaxSkillLevel = 15,
                 ProfessionType = "FIGHTER",
                 SkillCategory = SkillCategory.WeaponSkill,
+                AdjustCooldownByWeapon = true,
                 SkillDamageModMin = -75,
                 SkillDamageModMax = 0,
                 SkillDamageModInc = 10,
+                ARModMin = 20,
+                ARModMax = 100,
+                ARModInc = 5,
                 NumTargetsMin = 3.5f,
                 NumTargetsMax = 8f,
                 NumTargetsInc = 0.5f
@@ -990,7 +1024,7 @@ namespace DungeonRunners.Combat
             foreach (var spell in GetAllSpells())
             {
                 if ((spell.SkillCategory == SkillCategory.Offensive ||
-                     spell.SkillCategory == SkillCategory.WeaponSkill) && spell.DamageMod > 0)
+                     spell.SkillCategory == SkillCategory.WeaponSkill) && spell.HasAnyDamage)
                     yield return spell;
             }
         }
@@ -1001,7 +1035,7 @@ namespace DungeonRunners.Combat
             var spell = GetSpell(name);
             if (spell == null) return false;
             return (spell.SkillCategory == SkillCategory.Offensive ||
-                    spell.SkillCategory == SkillCategory.WeaponSkill) && spell.DamageMod > 0;
+                    spell.SkillCategory == SkillCategory.WeaponSkill) && spell.HasAnyDamage;
         }
 
         /// <summary>Get first offensive spell for a class.</summary>
@@ -1020,7 +1054,7 @@ namespace DungeonRunners.Combat
             {
                 if (kvp.Value.ProfessionType == prof &&
                     kvp.Value.SkillCategory == SkillCategory.Offensive &&
-                    kvp.Value.DamageMod > 0)
+                    kvp.Value.HasAnyDamage)
                     return kvp.Value;
             }
             return null;
@@ -1034,11 +1068,17 @@ namespace DungeonRunners.Combat
         public string DisplayName;
         public AttackType AttackType;
         public DamageElement DamageType;
+        public int ChanceF32 = 0x6400;
         public float DamageMod;
         public float DamageVolatility;
         public float CriticalChance;
         public float Cooldown;
         public int Range;
+        public float ProjectileSpeed;
+        public float ProjectileSize;
+        public float ProjectileLifespan;
+        public int RepeatCount = 1;
+        public int AnimationLengthFrames = 30;
         public float ManaCostMod;
         public int MaxSkillLevel;
         public int RequiredLevel;
@@ -1052,6 +1092,25 @@ namespace DungeonRunners.Combat
         public bool HasKnockdown;
         public bool HasFear;
         public bool HasSlow;
+        public bool AdjustCooldownByWeapon;
+        public bool HasImmediateWeaponDamageEffect;
+        public string ProjectileEffectId;
+        public string ProjectileModifierId;
+        public string ProjectileModifierEffectId;
+        public AttackType? ProjectileModifierAttackType;
+        public DamageElement? ProjectileModifierDamageType;
+        public float ProjectileModifierDuration;
+        public float ProjectileModifierFrequency;
+        public string ProjectileModifierStackRule;
+        public float ProjectileModifierDamageMod;
+        public float ProjectileModifierDamageVolatility;
+        public float ProjectileModifierCriticalChance;
+        public int ARModMin;
+        public int ARModMax;
+        public int ARModInc;
+        public int WeaponEffectDamageModMin;
+        public int WeaponEffectDamageModMax;
+        public int WeaponEffectDamageModInc;
 
         // ── Weapon skill level scaling (from GC SpellWeaponDamageEffect) ──
         // skillMod = (100 + DamageModMin + skillLevel * DamageModInc) / 100
@@ -1068,6 +1127,18 @@ namespace DungeonRunners.Combat
         public float NumTargetsMax;
         public float NumTargetsInc;
         public float AoERadius;         // Override from GC RadiusMin (0 = use Range)
+
+        public bool HasDirectDamageEffect => DamageMod > 0f || IsWeaponSkill;
+
+        public bool HasDeferredProjectileModifierDamage =>
+            !string.IsNullOrEmpty(ProjectileModifierEffectId) &&
+            ProjectileModifierDamageMod > 0f &&
+            ProjectileModifierFrequency > 0f;
+
+        public bool HasProjectileModifierDamage => HasDeferredProjectileModifierDamage;
+        public bool HasAnyDamage => HasDirectDamageEffect || HasDeferredProjectileModifierDamage;
+        public AttackType EffectiveProjectileModifierAttackType => ProjectileModifierAttackType ?? AttackType;
+        public DamageElement EffectiveProjectileModifierDamageType => ProjectileModifierDamageType ?? DamageType;
     }
 
     public enum AttackType { MELEE, MAGIC, RANGED }

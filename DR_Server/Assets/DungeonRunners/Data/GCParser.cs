@@ -431,8 +431,8 @@ namespace DungeonRunners.Data
             }
 
             int start = pos;
-            // Word characters: letters, digits, underscore, dot (for extends paths), *, :
-            while (pos < text.Length && (char.IsLetterOrDigit(text[pos]) || text[pos] == '_' || text[pos] == '.' || text[pos] == '*' || text[pos] == ':'))
+            // Word characters: letters, digits, underscore, dot (for extends paths), hyphenated item tiers, *, :
+            while (pos < text.Length && (char.IsLetterOrDigit(text[pos]) || text[pos] == '_' || text[pos] == '.' || text[pos] == '-' || text[pos] == '*' || text[pos] == ':'))
             {
                 pos++;
             }

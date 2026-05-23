@@ -1,6 +1,7 @@
 // PathMapManager.cs - Manages PathMaps for all zones
 using System.Collections.Generic;
 using UnityEngine;
+using DungeonRunners.Managers;
 
 namespace DungeonRunners.Core
 {
@@ -10,6 +11,7 @@ namespace DungeonRunners.Core
         public static PathMapManager Instance => _instance ??= new PathMapManager();
 
         private Dictionary<string, PathMap> _pathMaps = new Dictionary<string, PathMap>();
+        private HashSet<string> _proceduralInstancePathMapMissLogged = new HashSet<string>();
         private bool _loaded = false;
 
         /// <summary>
@@ -58,7 +60,17 @@ namespace DungeonRunners.Core
             string key = zoneName.ToLowerInvariant();
             if (_pathMaps.TryGetValue(key, out var pathMap)) return pathMap;
             int instIndex = key.IndexOf("_inst", System.StringComparison.OrdinalIgnoreCase);
-            if (instIndex > 0 && _pathMaps.TryGetValue(key.Substring(0, instIndex), out pathMap)) return pathMap;
+            if (instIndex > 0)
+            {
+                string baseKey = key.Substring(0, instIndex);
+                if (DungeonMazeSpawner.IsProceduralZone(baseKey))
+                {
+                    if (_proceduralInstancePathMapMissLogged.Add(key))
+                        Debug.LogError($"[PathMapManager] Procedural instance '{zoneName}' has no generated PathMap; not using base static PathMap '{baseKey}' for reach checks");
+                    return null;
+                }
+                if (_pathMaps.TryGetValue(baseKey, out pathMap)) return pathMap;
+            }
             return pathMap;
         }
 

@@ -791,6 +791,99 @@ namespace DungeonRunners.Managers
             return cells;
         }
 
+        /// <summary>
+        /// Dump the post-Generate grid state to a deterministic text format for diffing
+        /// against client-captured grids. Phase 2 of Option 1-full (geometry parity verify).
+        /// Format is machine-friendly: one line per cell, sorted by (y, x), no timestamps
+        /// or hostname so two dumps from same seed should byte-equal each other.
+        ///
+        /// Header includes seed + dimensions + maze params + placed-room-node list.
+        /// Body has one CELL line per (x, y) with: room flag, connection mask, tile type.
+        ///
+        /// Compatible with the planned `MazeGridDiff` tool which reads two dump files
+        /// and reports the first cell that disagrees.
+        /// </summary>
+        public string DumpGrid()
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("# MazeGenerator grid dump v1");
+            sb.AppendLine($"seed=0x{Seed:X8}");
+            sb.AppendLine($"width={Width}");
+            sb.AppendLine($"height={Height}");
+            sb.AppendLine($"randomness={Randomness}");
+            sb.AppendLine($"sparseness={Sparseness}");
+            sb.AppendLine($"deadEndRemoval={DeadEndRemovalChance}");
+            sb.AppendLine($"tileSize={TILE_SIZE}");
+            sb.AppendLine($"placedRoomNodes={_placedRoomNodes.Count}");
+            for (int i = 0; i < _placedRoomNodes.Count; i++)
+            {
+                var p = _placedRoomNodes[i];
+                sb.AppendLine($"  ROOMNODE idx={i} src={p.SourceIndex} tileSet='{p.TileSet}' tileType='{p.TileType}' grid=({p.GridX},{p.GridY})");
+            }
+            sb.AppendLine("# cells: x y room dirs tileType");
+            for (int y = 0; y < Height; y++)
+            {
+                for (int x = 0; x < Width; x++)
+                {
+                    byte bits = _cells[y, x];
+                    bool room = _occupied[y, x];
+                    string dirs = "";
+                    if ((bits & DIR_NORTH) != 0) dirs += "N";
+                    if ((bits & DIR_EAST) != 0) dirs += "E";
+                    if ((bits & DIR_SOUTH) != 0) dirs += "S";
+                    if ((bits & DIR_WEST) != 0) dirs += "W";
+                    if (dirs.Length == 0) dirs = "-";
+                    string tileType = _roomTileTypes[y, x] ?? "";
+                    sb.AppendLine($"CELL x={x} y={y} room={(room ? 1 : 0)} dirs={dirs} raw=0x{bits:X2} tile='{tileType}'");
+                }
+            }
+            sb.AppendLine("# end");
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// Render a human-readable ASCII picture of the grid. Walls and corridors as
+        /// box-drawing-ish characters; rooms marked with 'R'. Useful for visual sanity
+        /// check; DumpGrid() output is the source of truth for machine diffs.
+        /// </summary>
+        public string AsciiGridPicture()
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"# Maze ASCII picture (seed=0x{Seed:X8})");
+            // Iterate top to bottom (north = high y in grid; we want to show north up)
+            for (int y = Height - 1; y >= 0; y--)
+            {
+                // First row: cell top + north opening
+                var top = new System.Text.StringBuilder();
+                var mid = new System.Text.StringBuilder();
+                for (int x = 0; x < Width; x++)
+                {
+                    byte bits = _cells[y, x];
+                    bool room = _occupied[y, x];
+                    bool n = (bits & DIR_NORTH) != 0;
+                    bool s = (bits & DIR_SOUTH) != 0;
+                    bool e = (bits & DIR_EAST) != 0;
+                    bool w = (bits & DIR_WEST) != 0;
+                    top.Append('+');
+                    top.Append(n ? "   " : "---");
+                    mid.Append(w ? ' ' : '|');
+                    mid.Append(' ');
+                    mid.Append(room ? 'R' : ' ');
+                    mid.Append(' ');
+                }
+                top.Append('+');
+                mid.Append('|');
+                sb.AppendLine(top.ToString());
+                sb.AppendLine(mid.ToString());
+            }
+            // Bottom edge
+            var bottom = new System.Text.StringBuilder();
+            for (int x = 0; x < Width; x++) bottom.Append("+---");
+            bottom.Append('+');
+            sb.AppendLine(bottom.ToString());
+            return sb.ToString();
+        }
+
         public string GetConnections(int gx, int gy)
         {
             if (!InBounds(gx, gy)) return null;

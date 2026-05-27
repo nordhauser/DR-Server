@@ -681,7 +681,9 @@ namespace DungeonRunners.Combat
                     else
                     {
                     NativeWeaponDamageInput damageInput = CreatePlayerNativeWeaponDamageInput(rng, cycle.PlayerState, cycle.Monster, "WeaponCycle");
+                    Debug.LogError($"[RNG-COMBAT] melee swing#{cycle.SwingCount} START seed=0x{rng.LastSeed:X8} rngPosBefore={rng.CallsSinceReseed}");
                     NativeWeaponDamageResult damageResult = DamageComputer.ResolveNativeWeaponDamage(damageInput);
+                    Debug.LogError($"[RNG-COMBAT] melee swing#{cycle.SwingCount} END rngPosAfter={rng.CallsSinceReseed}");
                     uint hitRaw = damageResult.HitRaw;
                     int hitRoll = damageResult.HitRoll;
                     uint blockRaw = damageResult.BlockRaw;
@@ -1194,7 +1196,9 @@ namespace DungeonRunners.Combat
                 : null;
             if (damageInput == null)
                 damageInput = CreatePlayerNativeWeaponDamageInput(rng, pending.PlayerState, pending.Monster, "RangedProjectile");
+            Debug.LogError($"[RNG-COMBAT] projectile swing#{pending.Swing} START seed=0x{rng.LastSeed:X8} rngPosBefore={rng.CallsSinceReseed}");
             NativeWeaponDamageResult damageResult = DamageComputer.ResolveNativeWeaponDamage(damageInput);
+            Debug.LogError($"[RNG-COMBAT] projectile swing#{pending.Swing} END rngPosAfter={rng.CallsSinceReseed}");
             uint hitRaw = damageResult.HitRaw;
             int hitRoll = damageResult.HitRoll;
             uint blockRaw = damageResult.BlockRaw;

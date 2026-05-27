@@ -292,6 +292,63 @@ namespace DungeonRunners.Networking
                 return true;
             }
 
+            // Path C validation: send a 0x02 (processEntityInit) packet with a readInit body
+            // whose Unit::readInit flag has bit 0x02 set, so the client's [Unit+0x2F0] is
+            // overwritten by the server-authoritative HPWire. If Path C is correct, monster HP
+            // bars snap to server's value with NO comm-error 3 (no Validate runs on opcode 0x02).
+            // See memory: project_dr_reborn_hp_sync_path_c_breakthrough.md
+            if (command == "pushhp")
+            {
+                var nearby = CombatManager.Instance.GetMonstersInRange(conn.PlayerPosX, conn.PlayerPosY, 30f);
+                int sent = 0;
+                int skipped = 0;
+                foreach (var m in nearby)
+                {
+                    if (m == null || !m.IsAlive) { skipped++; continue; }
+                    uint hpWire = CombatManager.Instance.GetMonsterCurrentHPWire(m, "ADMIN-PUSHHP");
+                    byte[] packet = CombatPackets.BuildMonsterEntityInitHPRefreshPacket(m, hpWire);
+                    _server.SendToClient(conn, packet);
+                    sent++;
+                    Debug.LogError($"[PUSHHP] {m.Name}#{m.EntityId} hp={hpWire / 256f:F2}/{m.MaxHPWire / 256f:F2} bodyLen={packet.Length}");
+                }
+                sendMessage(conn, $"[PushHP] Sent 0x02 readInit-body refresh to {sent} alive monster(s) (skipped {skipped}). Watch for comm-error 3.");
+                return true;
+            }
+
+            // Diagnostic harness for the 666 NoHP combat-during-movement desync. Sets
+            // CombatManager.MonsterDamageBonusOverride so every monster attack passes this value
+            // as the DamageBonus arg into ComputeNativeWeaponDamageRange. Use 'off' (or any
+            // negative number) to disable. Pair with the [DMG-INPUT] log line in
+            // CreateMonsterNativeWeaponDamageInput to confirm what the server actually used.
+            // See WORK\CHANGELOG_HP_SYNC_DAMAGE_BONUS_DIAGNOSTICS_2026-05-25.md.
+            if (command == "setdmgbonus" || command.StartsWith("setdmgbonus "))
+            {
+                string arg = command.Length > 11 ? command.Substring(11).Trim() : "";
+                if (string.IsNullOrEmpty(arg))
+                {
+                    sendMessage(conn, $"[SetDmgBonus] current override = {(CombatManager.MonsterDamageBonusOverride >= 0 ? CombatManager.MonsterDamageBonusOverride.ToString() : "off")}. Usage: @setdmgbonus <int|off>");
+                    return true;
+                }
+                if (string.Equals(arg, "off", StringComparison.OrdinalIgnoreCase))
+                {
+                    int prev = CombatManager.MonsterDamageBonusOverride;
+                    CombatManager.MonsterDamageBonusOverride = -1;
+                    Debug.LogError($"[SETBONUS] disabled (was {(prev >= 0 ? prev.ToString() : "off")})");
+                    sendMessage(conn, "[SetDmgBonus] override disabled — monster DamageBonus is back to 0");
+                    return true;
+                }
+                if (!int.TryParse(arg, out int newVal))
+                {
+                    sendMessage(conn, $"[SetDmgBonus] could not parse '{arg}'. Usage: @setdmgbonus <int|off>");
+                    return true;
+                }
+                int prevVal = CombatManager.MonsterDamageBonusOverride;
+                CombatManager.MonsterDamageBonusOverride = Math.Max(0, newVal);
+                Debug.LogError($"[SETBONUS] {(prevVal >= 0 ? prevVal.ToString() : "off")} -> {CombatManager.MonsterDamageBonusOverride}");
+                sendMessage(conn, $"[SetDmgBonus] override = {CombatManager.MonsterDamageBonusOverride} (monster DamageBonus input to ComputeNativeWeaponDamageRange)");
+                return true;
+            }
+
             // ═══════════════════════════════════════════════════════════════════
             // ZONE LIST
             // ═══════════════════════════════════════════════════════════════════

@@ -47,6 +47,7 @@ namespace DungeonRunners.Combat
             writer.WriteUInt32(currentHPWire);
             if ((unitFlags & 0x04) != 0)
                 writer.WriteUInt32(currentManaWire);
+            Debug.LogError($"[SPAWN-BODY-HP] WriteUnitReadInit lvl={level} unitFlags=0x{unitFlags:X2} hpWire={currentHPWire} hpInt={currentHPWire/256f:F2} manaWire={currentManaWire} writerLen={writer.Length}");
         }
 
         private static void WriteBehaviorReadInitNoActions(LEWriter writer, byte endByte)
@@ -285,9 +286,18 @@ namespace DungeonRunners.Combat
             writer.WriteUInt32(0);
 
             // ========== OP7: SpawnAction ==========
+            // Fix C ATTEMPTED + REVERTED 2026-05-27: tried sub=0x01 (case 1 primary-slot action
+            // create) but the wire format is INCOMPATIBLE with case 4's. Case 1 reads 2 bytes
+            // before Action::Registry::createAction; case 4 reads only 1. Changing the sub-byte
+            // alone shifts every subsequent read by 1 byte → EntitySynchInfo at end was
+            // misaligned → garbage HPWire/Flags → Validate failure → "EntityManager error: 1"
+            // on EVERY monster spawn (player couldn't even enter the dungeon).
+            // To make Fix C work safely, the body would need to be restructured to match case 1's
+            // shape: probably 2 header bytes (instead of 0x04/0xFF) then the Action body. Needs
+            // dedicated Ghidra investigation of case 1's exact byte layout before retrying.
             writer.WriteByte(0x35);
             writer.WriteUInt16((ushort)behaviorId);
-            writer.WriteByte(0x04);
+            writer.WriteByte(0x04);  // (was momentarily 0x01 for Fix C, reverted)
             writer.WriteByte(0x04);
             writer.WriteByte(0xFF);
             writer.WriteInt32(posX);
@@ -316,6 +326,12 @@ namespace DungeonRunners.Combat
             return packet;
         }
 
+        // Death-refresh-only as of Stage 0 cleanup 2026-05-27: only caller is the kill path
+        // at UnityGameServer.cs:~10508 which sends HP=0 to all players in the dying mob's zone
+        // so client's [Unit+0x2F0] = 0 immediately (without this the corpse "ghost-aliveed" for
+        // 20s while CorpseLingerTicks ran). Mob is about to despawn so FSM tail bytes are zero
+        // — there's no Fix-A state=6 / bit-17 bandaid here anymore (those covered live-mob
+        // FSM clobber from Path C auto-refresh, which is gone).
         public static byte[] BuildMonsterEntityInitHPRefreshPacket(Monster monster, uint currentHPWire)
         {
             var writer = new LEWriter();
@@ -331,46 +347,34 @@ namespace DungeonRunners.Combat
             writer.WriteByte(0x07);
             writer.WriteByte(0x02);
             writer.WriteUInt16((ushort)monster.EntityId);
-            writer.WriteUInt32(0x06);
+            writer.WriteUInt32(0x6u);                            // [+0xa0] WorldEntity flags
             writer.WriteInt32(posX);
             writer.WriteInt32(posY);
             writer.WriteInt32(posZ);
             writer.WriteInt32(heading);
             writer.WriteByte(0x00);
             WriteUnitReadInit(writer, lvl, currentHPWire, currentManaWire);
-            writer.WriteByte(0x00);
-            writer.WriteUInt16(0);
-            writer.WriteUInt16(0);
-            writer.WriteByte(0x00);
-            writer.WriteUInt16(0);
-            writer.WriteUInt32(0);
-            writer.WriteByte(0x00);
-            writer.WriteUInt32(0);
-            writer.WriteUInt32(0);
-            writer.WriteUInt32(0);
-            writer.WriteByte(0x06);
+            // StockUnit::readInit tail (Ghidra @ 0x00503bf0) — 25 bytes, all zero. Mob is
+            // dying; FSM state byte (+0x33e) = 0 is fine because despawn follows immediately.
+            writer.WriteByte(0x00);     // [+0x33e] currentState
+            writer.WriteUInt16(0);      // [+0x338] tick counter
+            writer.WriteUInt16(0);      // [+0x33a] tick counter max
+            writer.WriteByte(0x00);     // [+0x33f]
+            writer.WriteUInt16(0);      // [+0x33c]
+            writer.WriteUInt32(0);      // [+0x334]
+            writer.WriteByte(0x00);     // [+0x340]
+            writer.WriteUInt32(0);      // [+0x320] cached pos X
+            writer.WriteUInt32(0);      // [+0x324] cached pos Y
+            writer.WriteUInt32(0);      // [+0x328] cached pos Z
+            writer.WriteByte(0x06);     // EndStream
             return writer.ToArray();
         }
 
-        /// <summary>
-        /// Build interval packet (opcode 0x0D) - triggers client component reporting cycle.
-        /// Original server sent this every 4th tick via writeIntervals@ServerEntityManager.
-        /// Without this, client never activates position/state reporting for entities.
-        /// </summary>
-        public static byte[] BuildIntervalPacket(uint updateNumber, uint entityUpdateNum,
-            ushort nodeCountA, ushort nodeCountB)
-        {
-            var writer = new LEWriter();
-            writer.WriteByte(0x0D);                 // interval opcode
-            writer.WriteUInt32(updateNumber);       // SEM+0xB28: global update number
-            writer.WriteUInt32(updateNumber);       // SEM+0xB14: sync counter
-            writer.WriteUInt32(0);                  // SEM+0xB10: sync counter
-                                                    // Per-entity interval data (entity+0x20, +0x54, +0x58)
-            writer.WriteUInt32(entityUpdateNum);    // entity update counter
-            writer.WriteUInt16(nodeCountA);         // component node count A
-            writer.WriteUInt16(nodeCountB);         // component node count B
-            return writer.ToArray();
-        }
+        // BuildIntervalPacket removed 2026-05-27 (audit Phase 1) — dead (no callers) AND
+        // broken: missing the 0x07 BeginStream prefix and 0x06 EndStream byte, so the
+        // packet would have been rejected by the client's outer framing layer if anyone
+        // had used it. Documented as bug #4 in AUDIT_SERVER/07_SYNTHESIS.md.
+
         public static byte[] BuildMonsterDespawnPacket(uint entityId)
         {
             var writer = new LEWriter();
@@ -416,55 +420,29 @@ namespace DungeonRunners.Combat
             return writer.ToArray();
         }
 
-        public static byte[] BuildDamagePacket(DamageEvent evt)
-        {
-            var writer = new LEWriter();
+        // BuildDamagePacket + BuildHPUpdatePacket removed 2026-05-27 (audit Phase 1).
+        // Both emitted opcode 0x28, which is not in ClientEntityManager::processMessage's
+        // switch — it falls to default → CrashLog + [+0xac0]=3 → desync popup.
+        // Only callers were OnDamageDealt/OnEntityDeath in UGS, which were already dead
+        // (event subscriptions commented out at UGS:1551-1552, events never invoked).
 
-            writer.WriteByte(0x07);
-            writer.WriteByte(0x28);
-            writer.WriteUInt16((ushort)evt.DefenderId);
-            writer.WriteByte(0x1A);
-
-            writer.WriteUInt32(evt.AttackerId);
-            writer.WriteUInt32(evt.DefenderId);
-            writer.WriteInt32((int)evt.DamageWire);
-
-            writer.WriteByte(0x00);
-            byte flags = 0;
-            if (evt.IsCritical) flags |= 0x01;
-            writer.WriteByte(flags);
-
-            writer.WriteFloat(evt.PosX);
-            writer.WriteFloat(evt.PosY);
-            writer.WriteFloat(evt.PosZ);
-
-            writer.WriteByte(0x06);
-
-            return writer.ToArray();
-        }
-
-        public static byte[] BuildHPUpdatePacket(uint entityId, uint currentHPWire, uint maxHPWire)
-        {
-            var writer = new LEWriter();
-
-            writer.WriteByte(0x07);
-            writer.WriteByte(0x28);
-            writer.WriteUInt16((ushort)entityId);
-            writer.WriteByte(0x0F);
-
-            writer.WriteUInt32(currentHPWire);
-            writer.WriteUInt32(maxHPWire);
-
-            writer.WriteByte(0x06);
-
-            return writer.ToArray();
-        }
         /// <summary>
         /// Build opcode 0x36 (processUpdateComponent) packet.
-        /// Binary: handler at 0x5DB6A0 reads componentID(2), calls vtable+0xB8 (readUpdate, 
-        /// which is a no-op for ALL component types), then EntitySynchInfo::ReadFromStream 
-        /// reads syncFlags(1) + HP(4 if flags&2).
-        /// Wire format: 0x36 + componentID(2) + syncFlags(1) + HP(4)
+        ///
+        /// CORRECTED 2026-05-25 (Ghidra walk): the prior "vtable+0xB8 is a no-op" claim was WRONG.
+        /// Handler at 0x5DB6A0 reads componentID(2), then calls vtable[+0xB8] which for Unit-derived
+        /// classes is `Unit::readInit @ 0x50A580` (NOT a no-op). readInit consumes a full readInit
+        /// body from the stream:
+        ///   WorldEntity::readInit (21B mandatory + optional anim fields)
+        ///   Unit::readInit        (6B mandatory + optional HP/mana/etc. gated by flag byte; bit 0x02 → 4B HP into [+0x2F0])
+        ///   subclass readInit     (StockUnit: +25B, Avatar/Hero: more)
+        /// After readInit, EntitySynchInfo::ReadFromStream reads the suffix and Validate compares
+        /// suffix HPWire to the [+0x2F0] that readInit JUST wrote.
+        ///
+        /// This bare-suffix overload writes 0 bytes of readInit body, so the client's readInit reads
+        /// garbage from the EntitySynchInfo/EndStream bytes. RejectRawAliveHPSuffix gates it off the
+        /// HP path; use BuildMonsterEntityInitHPRefreshPacket (opcode 0x02) for true HP push.
+        /// See memory: [[hp-sync-path-c-breakthrough]] for full vtable layout + wire format.
         /// </summary>
         public static byte[] BuildProcessUpdateComponent(ushort componentId, byte syncFlags, uint syncHPWire)
         {
@@ -477,21 +455,10 @@ namespace DungeonRunners.Combat
             writer.WriteByte(0x06);           // EndStream
             return writer.ToArray();
         }
-        public static byte[] BuildDeathPacket(uint entityId, uint killerId)
-        {
-            var writer = new LEWriter();
+        // BuildDeathPacket removed 2026-05-27 (audit Phase 1) — same reason as
+        // BuildDamagePacket above (0x28 not in client dispatcher → crash → desync popup).
+        // Only caller was OnEntityDeath in UGS, also dead (no subscription/invocation).
 
-            writer.WriteByte(0x07);
-            writer.WriteByte(0x28);
-            writer.WriteUInt16((ushort)entityId);
-            writer.WriteByte(0x20);
-
-            writer.WriteUInt32(killerId);
-
-            writer.WriteByte(0x06);
-
-            return writer.ToArray();
-        }
         /// <summary>
         /// Send 0x64 to monster's BehaviorId to set bit0 at UnitBehavior+0x156.
         /// processUpdate type 0x64 reads 1 byte.

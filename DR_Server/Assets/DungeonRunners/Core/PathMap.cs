@@ -36,6 +36,34 @@ namespace DungeonRunners.Core
         public float MinWorldY => _minWorldY;
         public float MaxWorldY => _maxWorldY;
 
+        /// <summary>
+        /// Builder factory: create an empty PathMap with a known world bounding box, then
+        /// populate via <see cref="SetNode"/>. Used by Phase 3 procedural-instance PathMap
+        /// construction (<see cref="DungeonRunners.Utilities.PathMapBuilder"/>).
+        /// </summary>
+        public static PathMap CreateEmpty(string zoneName, float minX, float maxX, float minY, float maxY)
+        {
+            return new PathMap
+            {
+                ZoneName = zoneName,
+                WorldOffsetX = minX,
+                WorldOffsetY = minY,
+                _minWorldX = minX,
+                _maxWorldX = maxX,
+                _minWorldY = minY,
+                _maxWorldY = maxY,
+            };
+        }
+
+        public void SetNode(PathNode node)
+        {
+            if (node == null) return;
+            _nodeGrid[(node.GridX, node.GridY)] = node;
+        }
+
+        public int NodeCount => _nodeGrid.Count;
+        public float NodeResolution => TILE_SIZE;
+
         public static PathMap LoadFromFile(string filePath)
         {
             if (!File.Exists(filePath))
@@ -224,6 +252,41 @@ namespace DungeonRunners.Core
         {
             _nodeGrid.TryGetValue((gridX, gridY), out var node);
             return node;
+        }
+
+        /// <summary>
+        /// 8-way direction table, clockwise from North. Index matches the client's
+        /// <c>DAT_00920A10</c> ordering — N=0, NE=1, E=2, SE=3, S=4, SW=5, W=6, NW=7.
+        /// </summary>
+        public static readonly (int dx, int dy)[] Directions =
+        {
+            (0, 1), (1, 1), (1, 0), (1, -1),
+            (0, -1), (-1, -1), (-1, 0), (-1, 1),
+        };
+
+        /// <summary>
+        /// Per-step cost for each direction, matching client's <c>mCostTable</c> @ 0x00920988.
+        /// Cardinal = 10, diagonal = 14 (≈ sqrt(2)·10).
+        /// </summary>
+        public static readonly int[] DirectionCosts = { 10, 14, 10, 14, 10, 14, 10, 14 };
+
+        /// <summary>
+        /// Discrete direction from <paramref name="a"/> to <paramref name="b"/>.
+        /// Returns 0..7 matching <see cref="Directions"/> ordering, or -1 if a == b.
+        /// Ports client's <c>PathMap::GetDirFromAToB</c> @ 0x004C4920 (sign-of-delta lookup).
+        /// </summary>
+        public static int GetDirFromAToB(PathNode a, PathNode b)
+        {
+            int dxRaw = b.GridX - a.GridX;
+            int dyRaw = b.GridY - a.GridY;
+            int dx = dxRaw < 0 ? -1 : (dxRaw > 0 ? 1 : 0);
+            int dy = dyRaw < 0 ? -1 : (dyRaw > 0 ? 1 : 0);
+            for (int i = 0; i < 8; i++)
+            {
+                if (Directions[i].dx == dx && Directions[i].dy == dy)
+                    return i;
+            }
+            return -1;
         }
 
         public PathNode GetNodeAtWorld(float worldX, float worldY)

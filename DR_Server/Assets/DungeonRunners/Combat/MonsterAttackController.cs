@@ -1,0 +1,203 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace DungeonRunners.Combat
+{
+    /// <summary>
+    /// Section 10 task S10.4 — per-mob attack-swing controller. Driven from the
+    /// CombatManager 30Hz tick. When a mob has aggro on a player and the swing
+    /// cooldown ticks down to zero, calls <see cref="MonsterDamageComputer.ComputeSwing"/>
+    /// and emits the result.
+    ///
+    /// <para>
+    /// <b>v1 scope:</b> the controller computes swings + emits diagnostic logs. It does
+    /// NOT yet apply damage to the player's HP — that's S10.5 (<see cref="PlayerState"/>
+    /// integration). For now the controller is a "shadow" of what a future authoritative
+    /// damage pipeline would do.
+    /// </para>
+    ///
+    /// <para>
+    /// <b>Swing period approximation:</b> the audit spec says the period =
+    /// <c>animationDurationTicks × 100 / attackSpeedMod256</c>, where animation duration
+    /// is per (mob class, weapon) from the AnimationList .gc subtree. We don't have the
+    /// AnimationList parser yet, so v1 approximates via weapon CoolDown:
+    /// <code>periodTicks = (CoolDown_sec × 30) / (AttackSpeed × MonsterAttackSpeed/100)</code>
+    /// For Abba_Labba (AttackSpeed=0.8, CoolDown=1.75): periodTicks ≈ 65 ticks ≈ 2.2 sec.
+    /// </para>
+    /// </summary>
+    public sealed class MonsterAttackController
+    {
+        private static MonsterAttackController _instance;
+        public static MonsterAttackController Instance => _instance ??= new MonsterAttackController();
+
+        public sealed class MobCombatState
+        {
+            public uint MobEntityId;
+            public MonsterUnitStats Stats;
+            public int SwingPeriodTicks;
+            public int CooldownTicks;
+            public uint TargetPlayerEntityId;       // 0 = no target
+            public int SwingCount;
+            public int LastDamageDealt;
+            public float AttackRangeSquared;        // weapon attack range² for the range gate (0 = unset)
+            public int OutOfRangeSkipCount;         // diagnostic counter for skipped swings
+        }
+
+        private readonly Dictionary<uint, MobCombatState> _states =
+            new Dictionary<uint, MobCombatState>();
+
+        /// <summary>
+        /// Section 10 task S10.5: when true, swings actually apply damage to the player's
+        /// PlayerState via <see cref="IDamageTargetProvider.ApplyDamage"/>. Default false —
+        /// shadow-mode while we validate roll-by-roll against client captures. Flip to true
+        /// once <c>[MOB-SWING]</c> logs prove the server's damage values match the client's.
+        /// </summary>
+        public static bool EnableServerMobDamage = false;
+
+        public int ActiveMobCount => _states.Count;
+
+        /// <summary>Number of registered mobs that have an aggro target.</summary>
+        public int AttackingMobCount
+        {
+            get
+            {
+                int n = 0;
+                foreach (var s in _states.Values) if (s.TargetPlayerEntityId != 0) n++;
+                return n;
+            }
+        }
+
+        /// <summary>Register a mob for combat-tick attention.</summary>
+        public void Register(uint mobEntityId, MonsterUnitStats stats, float weaponCoolDownSec, float attackSpeedScalar, int monsterAttackSpeedKnob, float attackRange = 0f)
+        {
+            float speedRatio = (attackSpeedScalar <= 0f ? 1f : attackSpeedScalar)
+                             * (monsterAttackSpeedKnob <= 0 ? 1f : monsterAttackSpeedKnob / 100f);
+            if (speedRatio <= 0f) speedRatio = 1f;
+            int period = Mathf.Max(1, Mathf.RoundToInt(weaponCoolDownSec * 30f / speedRatio));
+
+            // Pre-square the attack range so Tick avoids sqrt on the hot path.
+            // 0 = unset (no range gate; behaves like pre-S11.2 — swings whenever target set).
+            float attackRangeSquared = attackRange > 0f ? attackRange * attackRange : 0f;
+
+            _states[mobEntityId] = new MobCombatState
+            {
+                MobEntityId = mobEntityId,
+                Stats = stats,
+                SwingPeriodTicks = period,
+                CooldownTicks = period,    // first swing waits one full period
+                TargetPlayerEntityId = 0,
+                AttackRangeSquared = attackRangeSquared,
+            };
+        }
+
+        public void Unregister(uint mobEntityId) => _states.Remove(mobEntityId);
+
+        public void SetTarget(uint mobEntityId, uint targetPlayerEntityId)
+        {
+            if (_states.TryGetValue(mobEntityId, out var s))
+                s.TargetPlayerEntityId = targetPlayerEntityId;
+        }
+
+        public void ClearTarget(uint mobEntityId)
+        {
+            if (_states.TryGetValue(mobEntityId, out var s))
+                s.TargetPlayerEntityId = 0;
+        }
+
+        public bool TryGetState(uint mobEntityId, out MobCombatState state) =>
+            _states.TryGetValue(mobEntityId, out state);
+
+        /// <summary>
+        /// Drive all registered mobs by one tick. Returns the number of swings that
+        /// fired this tick (typically 0; bursts during simultaneous engagements).
+        /// </summary>
+        public int Tick(MersenneTwister rng, IDamageTargetProvider targets)
+        {
+            int swings = 0;
+            foreach (var s in _states.Values)
+            {
+                if (s.TargetPlayerEntityId == 0) continue;
+                if (s.CooldownTicks > 0)
+                {
+                    s.CooldownTicks--;
+                    continue;
+                }
+
+                // Cooldown expired: swing now
+                if (!targets.TryGetTarget(s.TargetPlayerEntityId, out var targetStats))
+                {
+                    // Target left zone / died — drop target
+                    s.TargetPlayerEntityId = 0;
+                    continue;
+                }
+
+                // S12 range gate: skip swing if mob is out of attack range. Aggro keeps the
+                // target set even when mob is far away (no out-of-range clear). Without this
+                // check, the simulator hallucinates swings for mobs that never engaged the
+                // player on the client. Cooldown stays at 0 so the first in-range tick fires
+                // immediately (matches typical MMO "queued swing on approach" behavior).
+                if (s.AttackRangeSquared > 0f &&
+                    targets.TryGetEngagementDistanceSquared(s.MobEntityId, s.TargetPlayerEntityId, out float distSq) &&
+                    distSq > s.AttackRangeSquared)
+                {
+                    s.OutOfRangeSkipCount++;
+                    // Throttled log — only on first skip and every 30th after to avoid spam
+                    if (s.OutOfRangeSkipCount == 1 || s.OutOfRangeSkipCount % 30 == 0)
+                    {
+                        Debug.LogError(
+                            $"[MOB-SWING-SKIP] mob={s.MobEntityId} -> player={s.TargetPlayerEntityId} " +
+                            $"distSq={distSq:F1} rangeSq={s.AttackRangeSquared:F1} skipCount={s.OutOfRangeSkipCount}");
+                    }
+                    continue;
+                }
+                s.OutOfRangeSkipCount = 0;
+                var result = MonsterDamageComputer.ComputeSwing(s.Stats, targetStats, rng);
+                s.SwingCount++;
+                s.LastDamageDealt = result.Damage;
+                Debug.LogError(
+                    $"[MOB-SWING] mob={s.MobEntityId} -> player={s.TargetPlayerEntityId} " +
+                    $"hit={result.Hit} blocked={result.Blocked} crit={result.Crit} dmg={result.Damage} " +
+                    $"AR={result.AttackerAR} DR={result.TargetDR} hitChance={result.HitChanceScaled} " +
+                    $"r1={result.R1Hit:X8} r2={result.R2Block:X8} r3={result.R3Damage:X8} " +
+                    $"hitRoll={result.HitRoll} blockRoll={result.BlockRoll} dmgRange=[{result.DamageMin}..{result.DamageMax}] " +
+                    $"applyDamage={EnableServerMobDamage}");
+
+                // Section 10 task S10.5: apply damage to the player when feature flag is on
+                // and the swing landed unblocked. The wire damage value is in 256-fixed-point
+                // (256 = 1 HP); PlayerState.TakeRuntimeDamage expects this format directly.
+                if (EnableServerMobDamage && result.Hit && !result.Blocked && result.Damage > 0)
+                {
+                    targets.ApplyDamage(s.TargetPlayerEntityId, (uint)result.Damage);
+                }
+
+                s.CooldownTicks = s.SwingPeriodTicks;
+                swings++;
+            }
+            return swings;
+        }
+
+        /// <summary>
+        /// Provider for damage targets — abstracts whether the target is a CombatPlayer,
+        /// a Player struct, or a test stub.
+        /// </summary>
+        public interface IDamageTargetProvider
+        {
+            bool TryGetTarget(uint entityId, out PlayerUnitStats stats);
+
+            /// <summary>
+            /// Apply <paramref name="wireDamage"/> (256 = 1 HP) to the player. Called only
+            /// when <see cref="MonsterAttackController.EnableServerMobDamage"/> is true and
+            /// the swing actually landed. v1 impl should route to
+            /// <c>PlayerState.TakeRuntimeDamage(wireDamage)</c>.
+            /// </summary>
+            void ApplyDamage(uint entityId, uint wireDamage);
+
+            /// <summary>
+            /// S12 range gate: distance² between mob and player on the XY plane (world units).
+            /// Returns false if either entity is unknown (caller will skip range check rather
+            /// than treat as out-of-range). Squared to avoid sqrt on the hot path.
+            /// </summary>
+            bool TryGetEngagementDistanceSquared(uint mobEntityId, uint playerEntityId, out float distSquared);
+        }
+    }
+}

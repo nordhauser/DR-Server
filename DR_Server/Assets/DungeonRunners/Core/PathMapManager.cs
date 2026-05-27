@@ -52,6 +52,47 @@ namespace DungeonRunners.Core
             Debug.Log($"[PathMapManager] Total PathMaps loaded: {_pathMaps.Count}");
         }
 
+        /// <summary>
+        /// Register a per-instance PathMap built from geometry (Phase 3 of Option 1-full).
+        /// Keyed by the full instance zone name (e.g. <c>dungeon00_level01_inst42</c>) so
+        /// GetPathMap returns this instead of the missing-static-pathmap warning.
+        /// </summary>
+        public void RegisterInstancePathMap(string zoneName, PathMap pathMap)
+        {
+            if (string.IsNullOrWhiteSpace(zoneName) || pathMap == null) return;
+            string key = zoneName.ToLowerInvariant();
+            _pathMaps[key] = pathMap;
+            _proceduralInstancePathMapMissLogged.Remove(key);
+            Debug.Log($"[PathMapManager] Registered instance PathMap '{key}' with {pathMap.NodeCount} nodes");
+        }
+
+        /// <summary>Remove a per-instance PathMap (call on instance teardown to free memory).</summary>
+        public void UnregisterInstancePathMap(string zoneName)
+        {
+            if (string.IsNullOrWhiteSpace(zoneName)) return;
+            string key = zoneName.ToLowerInvariant();
+            if (_pathMaps.Remove(key))
+                Debug.Log($"[PathMapManager] Unregistered instance PathMap '{key}'");
+        }
+
+        /// <summary>
+        /// Find the first registered PathMap whose key starts with <paramref name="prefix"/>.
+        /// Used by Phase 4b parity test to match captured cases to whichever live instance
+        /// of a base zone is currently registered (instance IDs vary per session).
+        /// </summary>
+        public PathMap FindByPrefix(string prefix)
+        {
+            if (string.IsNullOrEmpty(prefix)) return null;
+            if (!_loaded) LoadAllPathMaps();
+            string key = prefix.ToLowerInvariant();
+            foreach (var kv in _pathMaps)
+            {
+                if (kv.Key.StartsWith(key, System.StringComparison.OrdinalIgnoreCase))
+                    return kv.Value;
+            }
+            return null;
+        }
+
         /// <summary>Get PathMap for a specific zone</summary>
         public PathMap GetPathMap(string zoneName)
         {

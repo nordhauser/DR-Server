@@ -298,6 +298,30 @@ namespace DungeonRunners.Networking
 
         public uint MaxHPWire => ClampWire((long)_baseHPWire + _allocatedHPBonusWire + _equipmentHPBonusWire + _modifierHPBonusWire + _passiveHPBonusWire);
         public uint CurrentHPWire => _currentHPWire;
+
+        // Stage 2 of combat simulation: typed alias for the server's simulated player HP.
+        // Today _currentHPWire IS the simulator output (populated by PlayerState.TakeRuntimeDamage,
+        // called from CombatManager.ResolveMonsterAttackDamage). SimulatedHPWire exists so log
+        // sites can name the intent explicitly when comparing vs LastObservedClientHPWire.
+        public uint SimulatedHPWire => _currentHPWire;
+
+        // Stage 2 diagnostic — last server-simulated monster hit on this player. Populated by
+        // CombatManager.ResolveMonsterAttackDamage. Read by UnityGameServer.LogSimulatorDelta
+        // when the client reports HP, so we can attribute the delta to a specific swing.
+        public float LastSimMonsterAttackNativeTime { get; internal set; } = -1f;
+        public uint  LastSimMonsterAttackDamageWire { get; internal set; } = 0;
+        public uint  LastSimMonsterAttackMonsterId { get; internal set; } = 0;
+        public string LastSimMonsterAttackResult { get; internal set; } = null;  // HIT / BLOCK / MISS / IMMUNE
+        public int   LastSimMonsterAttackRoomRngPos { get; internal set; } = 0;
+
+        public void RecordSimMonsterAttack(uint monsterId, string result, uint damageWire, float nativeTime, int rngPos)
+        {
+            LastSimMonsterAttackMonsterId = monsterId;
+            LastSimMonsterAttackResult = result;
+            LastSimMonsterAttackDamageWire = damageWire;
+            LastSimMonsterAttackNativeTime = nativeTime;
+            LastSimMonsterAttackRoomRngPos = rngPos;
+        }
         public uint MaxManaWire => ClampWire((long)_baseManaWire + _equipmentManaBonusWire + _passiveManaBonusWire);
         public uint CurrentManaWire => _currentManaWire;
         public uint MaxHPWireWithoutPassives => ClampWire((long)_baseHPWire + _allocatedHPBonusWire + _equipmentHPBonusWire + _modifierHPBonusWire);

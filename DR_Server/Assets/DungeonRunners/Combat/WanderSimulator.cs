@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using DungeonRunners.Core;
+using DungeonRunners.Utilities;
 using UnityEngine;
 
 namespace DungeonRunners.Combat
@@ -20,7 +21,25 @@ namespace DungeonRunners.Combat
     {
         private static WanderSimulator _instance;
         public static WanderSimulator Instance => _instance ??= new WanderSimulator();
-        private static readonly bool VerboseWanderLogs = IsTruthy(Environment.GetEnvironmentVariable("DR_SERVER_VERBOSE_WANDER_LOGS"));
+        // Stage 3 temp diagnostic — default true so [WANDER-RNG]/[WANDER-AUDIT]/[WANDER-MOVE]
+        // surface during the proximity-aggro debugging. Env var override still honored if set
+        // to "0"/"false"/"off". Revert default to false after Stage 3 entry is settled.
+        public static bool VerboseWanderLogs = IsFalsy(Environment.GetEnvironmentVariable("DR_SERVER_VERBOSE_WANDER_LOGS")) ? false : true;
+
+        private static bool IsFalsy(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return false;
+            switch (value.Trim().ToLowerInvariant())
+            {
+                case "0":
+                case "false":
+                case "no":
+                case "off":
+                    return true;
+                default:
+                    return false;
+            }
+        }
 
         private List<WanderState> _entities = new List<WanderState>();
         private List<uint> _tickOrder = new List<uint>();
@@ -64,6 +83,17 @@ namespace DungeonRunners.Combat
             Debug.LogError($"[WANDER-SIM] Registered entity {entityId} (total: {_entities.Count})");
         }
 
+        /// <summary>Phase 6 shadow-mode toggle. When true, a parallel UnitMoverSim runs alongside
+        /// the legacy interpolation and logs <c>[MOVER-DIFF]</c> divergence. Authoritative
+        /// position remains the legacy ClientX/Y until cutover.</summary>
+        public static bool EnableMoverShadow = true;
+        private const int ShadowDiffLogInterval = 5;
+
+        /// <summary>Phase 6 cutover toggle. When true, sim's PosX/Y overrides legacy
+        /// ClientX/Y after each state-2 tick. Default false — flip to true to make sim
+        /// authoritative for mob position. Requires <see cref="EnableMoverShadow"/> = true.</summary>
+        public static bool UseNativeMoverSim = false;
+
         public void RegisterMonster(Monster monster, bool canWander = true)
         {
             if (monster == null) return;
@@ -82,9 +112,33 @@ namespace DungeonRunners.Combat
                 TargetX = monster.PosX,
                 TargetY = monster.PosY
             };
+
+            if (EnableMoverShadow)
+            {
+                var pathMap = !string.IsNullOrEmpty(monster.ZoneName)
+                    ? PathMapManager.Instance.GetPathMap(monster.ZoneName)
+                    : null;
+                var mover = new UnitMoverSim
+                {
+                    PosX = Fixed32.FromFloat(monster.PosX),
+                    PosY = Fixed32.FromFloat(monster.PosY),
+                    PosZ = Fixed32.Zero,
+                    PathMap = pathMap,
+                    Pathfinder = pathMap != null ? new Pathfinder(pathMap) : null,
+                    // WalkSpeed is world-units-per-second; combat tick = 30Hz; per-tick speed = walkSpeed/30.
+                    Speed = Fixed32.FromFloat((monster.WalkSpeed > 0f ? monster.WalkSpeed : monster.MoveSpeed) / 30f),
+                    ArriveRadius = Fixed32.FromInt(5),
+                };
+                state.ShadowMover = mover;
+                // PA1.1: also publish to Monster so CombatManager can drive the same
+                // instance during active chase (post PA1.3). The two references are
+                // the same object — both paths read/write identical state.
+                monster.Mover = mover;
+            }
+
             _entities.Add(state);
             _tickOrder.Add(monster.EntityId);
-            Debug.LogError($"[WANDER-SIM] Registered monster {monster.EntityId} walk={monster.WalkSpeed:F1} range={monster.WanderRange:F1} canWander={canWander} (total: {_entities.Count})");
+            Debug.LogError($"[WANDER-SIM] Registered monster {monster.EntityId} walk={monster.WalkSpeed:F1} range={monster.WanderRange:F1} canWander={canWander} shadowMover={(state.ShadowMover != null)} (total: {_entities.Count})");
         }
 
         public void UnregisterEntity(uint entityId)
@@ -187,6 +241,18 @@ namespace DungeonRunners.Combat
                         ws.MoveTicksRemaining = speed > 0f ? Mathf.Max(1, Mathf.CeilToInt(dist / speed * 30f)) : 1;
                         LogVerboseWander($"[WANDER-AUDIT] entity={ws.EntityId} state=1 attempt={ws.TargetAttempt} canWander={ws.CanWander} anchor=({baseX:F1},{baseY:F1}) current=({ws.ClientX:F1},{ws.ClientY:F1}) rawX=0x{rawX:X8} rawY=0x{rawY:X8} target=({ws.TargetX:F1},{ws.TargetY:F1}) pathValid={pathValid} accepted=True travelTicks={ws.MoveTicksRemaining} rng={rngBeforeTarget}->{rng.CallsSinceReseed}");
                         ws.HasTarget = true;
+
+                        // Phase 6 shadow-mode: issue path to the same target via UnitMoverSim.
+                        if (ws.ShadowMover != null)
+                        {
+                            // Sync shadow position to legacy position at the moment a new target is picked
+                            // (legacy interpolation is authoritative; shadow needs to start from same place).
+                            ws.ShadowMover.PosX = Fixed32.FromFloat(ws.ClientX);
+                            ws.ShadowMover.PosY = Fixed32.FromFloat(ws.ClientY);
+                            int tx = Fixed32.FromFloat(ws.TargetX).RawValue;
+                            int ty = Fixed32.FromFloat(ws.TargetY).RawValue;
+                            ws.ShadowMover.MoveToPoint(tx, ty);
+                        }
                     }
                     else
                     {
@@ -205,6 +271,13 @@ namespace DungeonRunners.Combat
                     // 0x531618: mov byte ptr [ebp+0x75], 3 — if arrived, state=3
                     if (ws.Monster != null && ws.HasTarget)
                     {
+                        // Phase 6 shadow-mode: tick the parallel mover before legacy interpolation.
+                        // Mover's PosX/PosY advance per tick via heading × speed + collision slide.
+                        if (ws.ShadowMover != null)
+                        {
+                            ws.ShadowMover.UpdateMovement();
+                        }
+
                         float dx = ws.TargetX - ws.ClientX;
                         float dy = ws.TargetY - ws.ClientY;
                         float dist = Mathf.Sqrt(dx * dx + dy * dy);
@@ -218,12 +291,46 @@ namespace DungeonRunners.Combat
                             ws.ClientY = ws.TargetY;
                             ws.HasTarget = false;
                             ws.State = 3;
+                            // Phase 6: resync sim to target on wander arrival to prevent the
+                            // "sim arrives early, freezes, wander overshoots" drift pattern
+                            // identified in shadow-mode observation.
+                            if (ws.ShadowMover != null)
+                            {
+                                ws.ShadowMover.PosX = Fixed32.FromFloat(ws.TargetX);
+                                ws.ShadowMover.PosY = Fixed32.FromFloat(ws.TargetY);
+                                ws.ShadowMover.State = UnitMoverSim.MoveStateEnum.Idle;
+                                ws.ShadowMover.Waypoints.Clear();
+                            }
                             LogVerboseWander($"[WANDER-MOVE] entity={ws.EntityId} arrived visual=({ws.ClientX:F1},{ws.ClientY:F1}) target=({ws.TargetX:F1},{ws.TargetY:F1})");
                         }
                         else
                         {
                             ws.ClientX += dx / dist * step;
                             ws.ClientY += dy / dist * step;
+                        }
+
+                        // Phase 6 shadow-mode diff logging (every ShadowDiffLogInterval ticks).
+                        if (ws.ShadowMover != null)
+                        {
+                            ws.ShadowDiffTickCounter++;
+                            if (ws.ShadowDiffTickCounter >= ShadowDiffLogInterval)
+                            {
+                                ws.ShadowDiffTickCounter = 0;
+                                float simX = ws.ShadowMover.PosX.ToFloat();
+                                float simY = ws.ShadowMover.PosY.ToFloat();
+                                float ddx = simX - ws.ClientX;
+                                float ddy = simY - ws.ClientY;
+                                float dlen = Mathf.Sqrt(ddx * ddx + ddy * ddy);
+                                Debug.LogError($"[MOVER-DIFF] entity={ws.EntityId} wander=({ws.ClientX:F1},{ws.ClientY:F1}) sim=({simX:F1},{simY:F1}) delta={dlen:F2} simState={(int)ws.ShadowMover.State}");
+                            }
+                        }
+
+                        // Phase 6 cutover: sim is authoritative when the feature flag is on.
+                        // Override the legacy interpolation result with sim's PosX/Y.
+                        if (UseNativeMoverSim && ws.ShadowMover != null && ws.State == 2)
+                        {
+                            ws.ClientX = ws.ShadowMover.PosX.ToFloat();
+                            ws.ClientY = ws.ShadowMover.PosY.ToFloat();
                         }
                     }
                     else
@@ -382,5 +489,12 @@ namespace DungeonRunners.Combat
         public bool HasTarget;
         public int TargetAttempt;
         public int MoveTicksRemaining;
+
+        // Phase 6 shadow-mode: per-mob UnitMoverSim running in parallel with the
+        // legacy interpolation. NOT used for authoritative position; logged via
+        // [MOVER-DIFF] for divergence analysis. Cutover (when ready) will switch
+        // ClientX/Y to read from ShadowMover.PosX/Y.
+        public UnitMoverSim ShadowMover;
+        public int ShadowDiffTickCounter;
     }
 }

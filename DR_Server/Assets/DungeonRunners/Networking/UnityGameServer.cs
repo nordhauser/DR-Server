@@ -772,6 +772,9 @@ namespace DungeonRunners.Networking
         // thread pool callbacks via OnUDPReceive — UnityEngine.Random would throw).
         private static readonly System.Random _lootRng = new System.Random();
 
+        // _lastRefreshHPWire / _lastDamageRefreshAt / OnMonsterDamagedByPlayer stub all
+        // removed Stage 0 cleanup 2026-05-27 alongside Path C refresh paths.
+
         private void OnMonsterDespawned(Monster monster)
         {
             if (monster == null) return;
@@ -791,26 +794,9 @@ namespace DungeonRunners.Networking
             _monsterOwnerConnId.Remove(entityId);
         }
 
-        private void OnDamageDealt(DamageEvent evt)
-        {
-            var packet = CombatPackets.BuildDamagePacket(evt);
-            // Send only to the connection that owns this monster
-            if (_monsterOwnerConnId.TryGetValue(evt.DefenderId, out int ownerConnId) && _connections.TryGetValue(ownerConnId, out var ownerConn))
-            {
-                SendCompressedA(ownerConn, 0x01, 0x0f, packet);
-                var monster = CombatManager.Instance.GetMonster(evt.DefenderId);
-                if (monster != null)
-                {
-                    if (ResolveEntitySynchInfoForComponent(ownerConn, 0, 0, SyncContext.MonsterDamage, evt.DefenderId, "DAMAGE-HP", false, out EntitySynchInfoDecision decision)
-                        && (decision.Flags & 0x02) != 0
-                        && TryPrimeMonsterHPBeforeSync(ownerConn, monster, decision.HPWire, "DAMAGE-HP"))
-                    {
-                        var hpPacket = CombatPackets.BuildHPUpdatePacket(evt.DefenderId, decision.HPWire, monster.MaxHPWire);
-                        SendCompressedA(ownerConn, 0x01, 0x0f, hpPacket);
-                    }
-                }
-            }
-        }
+        // OnDamageDealt removed 2026-05-27 (audit Phase 1). Was dead — no event subscription
+        // (CombatManager.OnDamageDealt has no .Invoke caller). Emitted BuildDamagePacket +
+        // BuildHPUpdatePacket which both used the invalid opcode 0x28.
 
         private void PrimeMonsterHPBeforeSync(Monster monster)
         {
@@ -870,7 +856,11 @@ namespace DungeonRunners.Networking
             HpSyncService.Instance.RecordMonsterOutboundHP(monster, hpWire, $"{packetName} direct-runtime-hp {reason}");
             Debug.LogError($"[SYNC-SUFFIX-RECOVER] packet={packetName} owner=Monster entity={monster.EntityId} hp={hpWire} reason={reason}");
             GetNativeValidationCutoff(out uint validationCutoffTick, out float validationCutoffTime);
-            return EntitySynchInfoDecision.HP(EntitySynchInfoOwner.Monster, hpWire, $"{packetName} direct-runtime-hp {reason}", monster.EntityId, monster.BehaviorId, 0x04, GetNativeCombatNow(), $"direct-runtime-recovery; validationCutoffTick={validationCutoffTick} validationCutoffTime={validationCutoffTime:F3}", validationCutoffTick, validationCutoffTime);
+            // CORRECTED 2026-05-25: [+0x2F0] is CurrentHPWire, NOT MaxHP cache (Ghidra-verified via Unit::onApplyDamage etc.).
+            // Suffix must equal the client's actual current HP. We send the just-resolved runtime HP and rely on Path C
+            // (BuildMonsterEntityInitHPRefreshPacket) to make the client's [+0x2F0] match before this suffix arrives.
+            uint suffixHPWire = hpWire;
+            return EntitySynchInfoDecision.HP(EntitySynchInfoOwner.Monster, suffixHPWire, $"{packetName} direct-runtime-hp {reason}", monster.EntityId, monster.BehaviorId, 0x04, GetNativeCombatNow(), $"direct-runtime-recovery; validationCutoffTick={validationCutoffTick} validationCutoffTime={validationCutoffTime:F3}", validationCutoffTick, validationCutoffTime);
         }
 
         private void OnMonsterAttackStarted(Monster monster, CombatPlayer target, byte sessionId)
@@ -1113,13 +1103,10 @@ namespace DungeonRunners.Networking
             return false;
         }
 
-        private void OnEntityDeath(uint deadId, uint killerId)
-        {
-            var packet = CombatPackets.BuildDeathPacket(deadId, killerId);
-            if (_monsterOwnerConnId.TryGetValue(deadId, out int ownerConnId) && _connections.TryGetValue(ownerConnId, out var ownerConn))
-                SendCompressedA(ownerConn, 0x01, 0x0f, packet);
-            Debug.LogError($"[Combat] Entity {deadId} killed by {killerId}");
-        }
+        // OnEntityDeath removed 2026-05-27 (audit Phase 1). Was dead — no event subscription
+        // (CombatManager.OnEntityDeath has no .Invoke caller). Emitted BuildDeathPacket which
+        // used the invalid opcode 0x28. LootManager.cs:400 comment "Call from UGS.OnEntityDeath()"
+        // is stale — actual loot generation happens in ProcessMonsterKill at UGS:10584.
 
         private void OnMonsterMoved(Monster monster)
         {
@@ -1344,49 +1331,9 @@ namespace DungeonRunners.Networking
             SendEncryptedUDP(session, packet);
             Debug.LogError($"[UDP-COMBAT] Sent CombatTick type=12 to cid={componentId}, target={targetEntityId}");
         }
-        /// <summary>
-        /// Send Type 9 (Aggro) message to trigger client combat state.
-        /// CRITICAL: Type 9 handler in client HAS network send code (at 0x511380)
-        /// Type 10 handler does NOT have send code - this is why 0x0A wasn't working properly!
-        /// </summary>
-        public void SendAggroType9UDP(RRConnection conn, ushort componentId, uint targetEntityId)
-        {
-            var session = GetUDPSessionForConnection(conn);
-            if (session == null || !session.IsEstablished)
-            {
-                Debug.LogError($"[UDP-AGGRO9] No UDP session for componentId={componentId}");
-                return;
-            }
-
-            if (!ResolveEntitySynchInfoForComponent(conn, componentId, 0x64, SyncContext.MonsterAction, 0, "UDP-AGGRO9", false, out EntitySynchInfoDecision decision))
-                return;
-
-            var writer = new LEWriter();
-            writer.WriteByte(0x07);           // BeginStream
-            writer.WriteByte(0x35);           // ComponentUpdate
-            writer.WriteUInt16(componentId);
-            writer.WriteByte(0x64);           // subMessage = StateMachineMessage
-            writer.WriteByte(0x03);                // flags = HAS TARGET
-            writer.WriteUInt16(0x09);         // TYPE 9 = Aggro
-            writer.WriteUInt16(0x0006);       // scope/state
-            writer.WriteUInt32(0);            // value = 0
-            writer.WriteUInt16((ushort)targetEntityId);  // TARGET ID
-            if (!TryWriteResolvedEntitySynchInfo(writer, componentId, 0x64, SyncContext.MonsterAction, "UDP-AGGRO9", decision))
-                return;
-            writer.WriteByte(0x06);           // EndStream
-
-            byte[] packet = writer.ToArray();
-            int padLen = (8 - (packet.Length % 8)) % 8;
-            if (padLen > 0)
-            {
-                byte[] padded = new byte[packet.Length + padLen];
-                Array.Copy(packet, padded, packet.Length);
-                packet = padded;
-            }
-
-            SendEncryptedUDP(session, packet);
-            Debug.LogError($"[UDP-AGGRO9] 🔴 Sent Type 9 (Aggro) to componentId={componentId}, target={targetEntityId}");
-        }
+        // SendAggroType9UDP removed 2026-05-27 (audit Phase 1, scope-expanded into Phase 3).
+        // Was fix #5 from 2026-05-25 — provably ineffective per AUDIT_COMBAT findings: did not
+        // set behavior[+0x70] as theorized. Only caller was HandleMonsterAggro (also removed).
         public void SendCombatType10UDP(RRConnection conn, ushort componentId, uint targetEntityId)
         {
             var session = GetUDPSessionForConnection(conn);
@@ -1421,21 +1368,10 @@ namespace DungeonRunners.Networking
             Debug.LogError($"[UDP-COMBAT10] 🔥 Sent Type 10 (Combat) to componentId={componentId}");
         }
 
-        private void HandleMonsterAggro(Monster monster, CombatPlayer player)
-        {
-            if (monster.AggroTriggered) return;
-
-            var conn = _connections.Values.FirstOrDefault(c => c.Avatar?.Id == player.EntityId);
-            if (conn == null) return;
-
-            Debug.LogError($"[SERVER-AGGRO] {monster.Name} -> {player.Name}");
-            monster.AggroTriggered = true;
-            monster.TargetId = player.EntityId;
-            monster.State = MonsterState.Combat;
-            monster.AttackPending = false;
-            monster.LastAttackTime = GetNativeCombatNow();
-            Debug.LogError($"[SERVER-AGGRO] state-only existingBehavior={monster.BehaviorId}");
-        }
+        // HandleMonsterAggro removed 2026-05-27 (audit Phase 1, scope-expanded into Phase 3).
+        // Was fix #5 from 2026-05-25 — the "Type 9 sets behavior+0x70" theory was disproved
+        // by x32dbg HW bp evidence (see [[hp-sync-2026-05-26]] memory). Subscribed to the now-
+        // removed OnMonsterAggro event.
         void Start()
         {
             //Debug.unityLogger.logEnabled = false;  // ADD THIS LINE FIRST
@@ -1461,6 +1397,14 @@ namespace DungeonRunners.Networking
 #endif
             DungeonRunners.Data.GCDatabase.Instance.Load(gcPath);
 
+            // Stage 1 of combat simulation: cache GlobalKnobs combat multipliers from .gc.
+            // Per-mob profiles load lazily via MonsterAttackData.TryGetProfile(gcType).
+            // Dormant — no live consumers until Stage 2 (MonsterAttackController) lands.
+            DungeonRunners.Combat.MonsterAttackData.Instance.Init();
+            DungeonRunners.Combat.MonsterAttackDataSelfTest.RunAll();
+            DungeonRunners.Combat.MonsterDamageComputerSelfTest.RunAll();
+            DungeonRunners.Combat.MonsterAttackControllerSelfTest.RunAll();
+
             // Load item stat lookups from existing game database
             DungeonRunners.Data.ItemStatDatabase.Instance.Load();
             DatabaseLoader.LoadAll();
@@ -1485,10 +1429,10 @@ namespace DungeonRunners.Networking
             CombatManager.Instance.OnMonsterAttackStarted += OnMonsterAttackStarted;
             CombatManager.Instance.OnMonsterAttackResolved += OnMonsterAttackResolved;
             CombatManager.Instance.OnMonsterPositionChanged += OnMonsterMoved;
-            // CombatManager.Instance.OnDamageDealt += OnDamageDealt;
-            // CombatManager.Instance.OnEntityDeath += OnEntityDeath;
-            // Add subscription with other combat subscriptions
-            //  CombatManager.Instance.OnMonsterAttack += OnMonsterAttack;
+            // OnMonsterDamagedByPlayer subscription removed Stage 0 cleanup 2026-05-27
+            // (removed 2026-05-27 audit Phase 1: OnDamageDealt and OnEntityDeath subscriptions
+            // were already commented out; OnDamageDealt/OnEntityDeath handlers are now also
+            // deleted; OnMonsterAttack/related lines below were always commented-out scaffolding.)
             // Wire up UDP RNG seed sync for monster attacks
             /*  Monster.OnPreAttackSeedSync = (monster, target, seed) =>
               {
@@ -1528,8 +1472,8 @@ namespace DungeonRunners.Networking
             QuestManager.Instance.SetEntitySynchCallback(WritePlayerEntitySynch);
             StartServer();
             // MerchantManager.ResetAllTimers();  // Add this
-            // 🔥 Subscribe to monster aggro event
-            //CombatManager.Instance.OnMonsterAggro += HandleMonsterAggro;
+            // (OnMonsterAggro subscription removed 2026-05-27 audit Phase 1 — Type-9 packet chain
+            // was provably ineffective per [[hp-sync-2026-05-26]] x32dbg evidence.)
         }
 
         void OnDestroy()
@@ -3150,7 +3094,9 @@ namespace DungeonRunners.Networking
             }
 
             GetNativeValidationCutoff(out uint fallbackCutoffTick, out float fallbackCutoffTime);
-            return TryWriteResolvedEntitySynchInfo(writer, 0, 0, context, packetName, EntitySynchInfoDecision.HP(EntitySynchInfoOwner.Avatar, hpWire, packetName, conn?.Avatar != null ? (uint)conn.Avatar.Id : 0u, 0, 0, GetNativeCombatNow(), $"player-fallback; validationCutoffTick={fallbackCutoffTick} validationCutoffTime={fallbackCutoffTime:F3}", fallbackCutoffTick, fallbackCutoffTime));
+            // CORRECTED 2026-05-25: [+0x2F0] is CurrentHPWire, NOT MaxHP cache. Send the resolved runtime HP, not MaxHP.
+            uint avatarSuffixHPWire = hpWire;
+            return TryWriteResolvedEntitySynchInfo(writer, 0, 0, context, packetName, EntitySynchInfoDecision.HP(EntitySynchInfoOwner.Avatar, avatarSuffixHPWire, packetName, conn?.Avatar != null ? (uint)conn.Avatar.Id : 0u, 0, 0, GetNativeCombatNow(), $"player-fallback; validationCutoffTick={fallbackCutoffTick} validationCutoffTime={fallbackCutoffTime:F3}", fallbackCutoffTick, fallbackCutoffTime));
         }
 
         private bool TryWriteEntitySynchForComponent(RRConnection conn, LEWriter writer, ushort componentId, byte subtype, string tag, bool advanceClientSync)
@@ -3199,6 +3145,15 @@ namespace DungeonRunners.Networking
             return TryWriteResolvedEntitySynchInfo(writer, componentId, subtype, context, packetName, decision);
         }
 
+        // S11.3 / Path γ kill-switch — DEFAULT FALSE after live test 2026-05-27 showed
+        // stripping the HP bit makes things worse, not better. The client's Validate
+        // UNCONDITIONALLY compares streamed [+0x18] to local entity [+0x2F0] regardless
+        // of our flag — stripping the bit makes us send HP=0, which mismatches a healthy
+        // entity at max HP and fires popup on every spawn. Pre-γ behavior was at least
+        // correct when no damage had been taken. Keep false unless you have a specific
+        // reason to test.
+        public static bool SuppressAvatarHPSuffix = false;
+
         private bool TryWriteResolvedEntitySynchInfo(LEWriter writer, ushort componentId, byte subtype, SyncContext context, string packetName, EntitySynchInfoDecision decision)
         {
             if (!decision.Allow)
@@ -3207,7 +3162,15 @@ namespace DungeonRunners.Networking
                 return false;
             }
 
-            if (decision.Owner == EntitySynchInfoOwner.Avatar && (decision.Flags & 0x02) == 0 && !ShouldKeepPlayerComponentSyncEmpty(context))
+            // Path γ: strip HP bit from Avatar suffix so client's Validate skips HP check.
+            if (SuppressAvatarHPSuffix && decision.Owner == EntitySynchInfoOwner.Avatar && (decision.Flags & 0x02) != 0)
+            {
+                decision.Flags = (byte)(decision.Flags & ~0x02);  // clear HP bit
+                decision.HPWire = 0u;                              // zero HP value (not sent anyway)
+                decision.Reason = (decision.Reason ?? "") + "; pathγ-strip-hp";
+            }
+
+            if (decision.Owner == EntitySynchInfoOwner.Avatar && (decision.Flags & 0x02) == 0 && !ShouldKeepPlayerComponentSyncEmpty(context) && !SuppressAvatarHPSuffix)
             {
                 Debug.LogError($"[SYNC-SUFFIX-BLOCK] Avatar suffix without HP packet={packetName} context={context} component={componentId} sub=0x{subtype:X2} flags=0x{decision.Flags:X2} reason={decision.Reason}");
                 return false;
@@ -3284,9 +3247,16 @@ namespace DungeonRunners.Networking
                     monsterHPReason = $"{monsterHPReason}; direct-runtime-hp";
                     Debug.LogError($"[SYNC-SUFFIX-RECOVER] packet={packetName} owner=Monster entity={monster.EntityId} hp={monsterHPWire} reason={monsterHPReason}");
                 }
+
+                // Monster Path C auto-refresh removed Stage 0 cleanup 2026-05-27. HP sync flows
+                // via EntitySynchInfo suffix on natural 0x35 packets (set below). Server's monster
+                // HP becomes wire-truthful once the combat simulator (proposal Stage 3) makes
+                // PlayerState._currentHPWire authoritative. Death-refresh HP=0 path still lives
+                // at UGS:~10508 and uses the trimmed BuildMonsterEntityInitHPRefreshPacket.
                 HpSyncService.Instance.RecordMonsterOutboundHP(monster, monsterHPWire, monsterPacketName);
                 string provenance = $"{monsterHPReason}; validationCutoffTick={validationCutoffTick} validationCutoffTime={validationCutoffTime:F3}";
-                decision = EntitySynchInfoDecision.HP(EntitySynchInfoOwner.Monster, monsterHPWire, $"{monsterPacketName} {monsterHPReason}", monster.EntityId, componentId != 0 ? componentId : monster.BehaviorId, subtype, suffixNativeNow, provenance, validationCutoffTick, validationCutoffTime);
+                uint suffixHPWire = monsterHPWire;
+                decision = EntitySynchInfoDecision.HP(EntitySynchInfoOwner.Monster, suffixHPWire, $"{monsterPacketName} {monsterHPReason}", monster.EntityId, componentId != 0 ? componentId : monster.BehaviorId, subtype, suffixNativeNow, provenance, validationCutoffTick, validationCutoffTime);
                 return true;
             }
 
@@ -3307,7 +3277,16 @@ namespace DungeonRunners.Networking
             }
 
             GetNativeValidationCutoff(out uint avatarCutoffTick, out float avatarCutoffTime);
-            decision = EntitySynchInfoDecision.HP(EntitySynchInfoOwner.Avatar, avatarHPWire, packetName, conn.Avatar != null ? (uint)conn.Avatar.Id : 0u, componentId, subtype, GetNativeCombatNow(), $"avatar-hp; validationCutoffTick={avatarCutoffTick} validationCutoffTime={avatarCutoffTime:F3}", avatarCutoffTick, avatarCutoffTime);
+
+            // Avatar Path C auto-refresh removed Stage 0 cleanup 2026-05-27. The Option A
+            // investigation proved it was firing with state.SynchHP=MaxHP between client HP
+            // reports (server had no way to track monster→player damage) — every refresh wrote
+            // MaxHP into client's [Avatar+0x2F0], guaranteeing the next 0x35 suffix Validate
+            // failure when client's local damage had reduced its real HP. Suffix carries the
+            // resolved avatar HP; once the simulator (proposal Stage 3) makes server-side
+            // PlayerState._currentHPWire authoritative, the suffix will match client truth.
+            uint avatarSuffixHPWire = avatarHPWire;
+            decision = EntitySynchInfoDecision.HP(EntitySynchInfoOwner.Avatar, avatarSuffixHPWire, packetName, conn.Avatar != null ? (uint)conn.Avatar.Id : 0u, componentId, subtype, GetNativeCombatNow(), $"avatar-hp; validationCutoffTick={avatarCutoffTick} validationCutoffTime={avatarCutoffTime:F3}", avatarCutoffTick, avatarCutoffTime);
             return true;
         }
 
@@ -9460,6 +9439,14 @@ namespace DungeonRunners.Networking
 
         private bool ObserveClientPlayerHP(RRConnection conn, uint clientHP, string source)
         {
+            // T1 diagnostic — fires on EVERY entry to ObserveClientPlayerHP, regardless of any
+            // gating below. This measures the actual rate at which the client is autonomously
+            // reporting its HP to the server, which is the load-bearing assumption for Path X.
+            // If we see <2 reports per 30s of combat, Path X is infeasible as designed.
+            Debug.LogError(
+                $"[CLIENT-REPORT-FREQ] source={source} reportedHP={clientHP} " +
+                $"conn={conn?.LoginName ?? conn?.ConnId.ToString() ?? "?"} t={Time.time:F2}");
+
             if (conn == null) return false;
             PlayerState state = GetPlayerState(conn.ConnId.ToString());
             if (state == null) return false;
@@ -9502,7 +9489,51 @@ namespace DungeonRunners.Networking
                 Debug.LogError($"[{source}] CLIENT PLAYER HP higher observed: {(acceptedClientHP - oldHP) / 256f:F2} HP ({oldHP}->{acceptedClientHP}) serverHP={state.CurrentHPWire}");
             else
                 Debug.LogError($"[{source}] Player HP unchanged: {acceptedClientHP / 256f:F2} wire={acceptedClientHP}");
+
+            LogSimulatorDelta(conn, state, acceptedClientHP, source);
             return true;
+        }
+
+        // Stage 2 diagnostic — fired whenever the client reports its HP to the server.
+        // Compares the just-observed client HP against the server-side simulator's HP value
+        // (state.SimulatedHPWire == _currentHPWire, populated by CombatManager.ResolveMonsterAttackDamage
+        // when a server-simulated monster swing lands). Captures enough context (last sim attack
+        // mob+result+damage+RNG-pos, max HP, time since last attack) to attribute the delta to
+        // a specific simulator bug class:
+        //
+        //   delta ≈ 0                                     → simulator agrees with client (good)
+        //   delta > 0, no recent sim attack               → server missed a swing the client landed
+        //   delta > 0, recent sim attack with HIT result  → server damage value diverges
+        //   delta > 0, recent sim attack with MISS/BLOCK  → server's hit roll diverges
+        //   delta < 0                                     → server applied damage client didn't (timing/cadence ahead)
+        //
+        // Read alongside the [PLAYER-DAMAGE] / [COMBAT-EVENT] log lines from CombatManager
+        // and an x32dbg breakpoint capture of client's Weapon::applyDamage @ 0x00597e50 to
+        // pinpoint which roll diverged.
+        private void LogSimulatorDelta(RRConnection conn, PlayerState state, uint clientHPWire, string source)
+        {
+            if (state == null || conn == null) return;
+            uint simHP = state.SimulatedHPWire;
+            long delta = (long)simHP - (long)clientHPWire;
+            string verdict;
+            if (Math.Abs(delta) <= 256) verdict = "AGREE";        // within 1 wire-HP — fine
+            else if (delta > 0)         verdict = "SERVER-HIGH";  // server thinks player has MORE HP — missed a swing
+            else                        verdict = "SERVER-LOW";   // server thinks player has LESS HP — phantom damage
+            float nativeNow = GetNativeCombatNow();
+            float timeSinceAttack = state.LastSimMonsterAttackNativeTime >= 0f
+                ? nativeNow - state.LastSimMonsterAttackNativeTime
+                : -1f;
+            Debug.LogError(
+                $"[SIM-DELTA] {verdict} player={conn.LoginName ?? conn.ConnId.ToString()} " +
+                $"reported={clientHPWire} simulated={simHP} delta={delta} (wire) | " +
+                $"max={state.MaxHPWire} sync={state.SynchHP} | " +
+                $"lastSimAttack mob={state.LastSimMonsterAttackMonsterId} " +
+                $"result={state.LastSimMonsterAttackResult ?? "none"} " +
+                $"dmg={state.LastSimMonsterAttackDamageWire} " +
+                $"rngPos={state.LastSimMonsterAttackRoomRngPos} " +
+                $"sinceAttack={timeSinceAttack:F3}s | " +
+                $"source={source} roomSeed=0x{CombatManager.Instance.RoomSeed:X8} " +
+                $"roomRngPos={CombatManager.Instance.RoomRngCallsSinceReseed}");
         }
 
         private bool TryConsumeClientSyncSuffix(RRConnection conn, LEReader reader, string source)
@@ -9920,8 +9951,49 @@ namespace DungeonRunners.Networking
             }
         }
 
+        // Tick-rate diagnostic — measures how often the combat tick actually fires per wall-clock second.
+        // If much higher than 30Hz, the projectile flight / chase speed / RNG consumption rate divergences
+        // are all explained by Unity's Update() running at frame rate rather than fixed 30Hz.
+        // The fix is wall-clock-based scheduling (DueTime = FireTime + seconds) rather than tick-discrete.
+        private int _combatTickCounter = 0;
+        private float _combatTickRateLogTime = -1f;
+        private float _combatTickRateMinDt = float.MaxValue;
+        private float _combatTickRateMaxDt = 0f;
+        private float _combatTickRateLastTick = -1f;
+
         private void TickCombatDeterministicSystems(float tickNow, bool allowNewMonsterAttacks)
         {
+            // Per-tick measurement
+            float wallNow = Time.time;
+            _combatTickCounter++;
+            if (_combatTickRateLastTick >= 0f)
+            {
+                float dt = wallNow - _combatTickRateLastTick;
+                if (dt < _combatTickRateMinDt) _combatTickRateMinDt = dt;
+                if (dt > _combatTickRateMaxDt) _combatTickRateMaxDt = dt;
+            }
+            _combatTickRateLastTick = wallNow;
+
+            // Per-second summary
+            if (_combatTickRateLogTime < 0f) _combatTickRateLogTime = wallNow;
+            float elapsed = wallNow - _combatTickRateLogTime;
+            if (elapsed >= 1.0f)
+            {
+                float ticksPerSec = _combatTickCounter / elapsed;
+                float avgDt = elapsed / _combatTickCounter;
+                Debug.LogError(
+                    $"[TICK-RATE] combat-ticks={_combatTickCounter} elapsed={elapsed:F3}s " +
+                    $"rate={ticksPerSec:F1}Hz avg-dt={avgDt * 1000f:F1}ms " +
+                    $"dt-min={_combatTickRateMinDt * 1000f:F1}ms " +
+                    $"dt-max={_combatTickRateMaxDt * 1000f:F1}ms " +
+                    $"COMBAT_TICK-const={COMBAT_TICK * 1000f:F1}ms ratio-to-30Hz={ticksPerSec / 30f:F2}x " +
+                    $"tickNow={tickNow:F3}");
+                _combatTickCounter = 0;
+                _combatTickRateLogTime = wallNow;
+                _combatTickRateMinDt = float.MaxValue;
+                _combatTickRateMaxDt = 0f;
+            }
+
             var rng = CombatManager.Instance.RoomRng;
             if (rng == null)
             {
@@ -10411,6 +10483,34 @@ namespace DungeonRunners.Networking
             Debug.LogError($"[KILL] ★ KILL #{_serverKillCount}: {monster.Name} via [{source}]");
             Debug.LogError($"[KILL] EntityId={monster.EntityId} GCType={monster.GCType} Level={monster.Level}");
             CombatManager.Instance.BeginNativeMonsterDeathLifecycle(monster, source);
+
+            // Send a Path C readInit-body refresh with HP=0 to all connected players in the
+            // monster's zone, so client's [Unit+0x2F0] = 0 immediately. Without this, the
+            // dead mob lingers "ghost-alive" on the client (last refresh HP > 0, no further
+            // refreshes fire because the mob stops moving/attacking, despawn packet doesn't
+            // arrive for ~30s of CorpseLingerTicks). Verified 2026-05-25 via server.log:
+            // mob 50012 died at HP=0 but client kept targeting it for 20s ("shots went
+            // through it"). Refresh fires before BeginNativeMonsterDeathLifecycle's normal
+            // despawn timer, so client sees the kill snap to 0 HP and the death animation
+            // can play, then corpse fades and despawn packet arrives at the lifecycle end.
+            try
+            {
+                byte[] deathRefresh = Combat.CombatPackets.BuildMonsterEntityInitHPRefreshPacket(monster, 0u);
+                foreach (var zoneConn in _connections.Values)
+                {
+                    if (zoneConn == null || !zoneConn.IsConnected || !zoneConn.IsSpawned) continue;
+                    string zoneKey = GetInstanceZoneKey(zoneConn);
+                    if (!string.Equals(zoneKey, monster.ZoneName, StringComparison.OrdinalIgnoreCase) &&
+                        !string.Equals(zoneConn.CurrentZoneName, monster.ZoneName, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    SendCompressedA(zoneConn, 0x01, 0x0F, deathRefresh, SyncContext.MonsterAction, "MON-DEATH-REFRESH");
+                    Debug.LogError($"[KILL] sent HP=0 refresh to conn={zoneConn.ConnId} bodyLen={deathRefresh.Length} entity={monster.EntityId}");
+                }
+            }
+            catch (Exception killRefreshEx)
+            {
+                Debug.LogError($"[KILL-ERROR] death refresh failed for {monster.Name}#{monster.EntityId}: {killRefreshEx.Message}");
+            }
             PlayerState playerState = conn != null ? GetPlayerState(conn.ConnId.ToString()) : null;
             if (playerState != null)
             {
@@ -11491,71 +11591,11 @@ namespace DungeonRunners.Networking
             writer.WriteBytes(ackWriter.ToArray());
             return true;
         }
-        private void HandlePlayerAttack(RRConnection conn, ushort componentId, ushort targetEntityId, byte responseId, byte sessionId)
-        {
-            Debug.LogError($"[ATTACK] Player {conn.LoginName} attacking target {targetEntityId}");
+        // HandlePlayerAttack removed 2026-05-27 (audit Phase 1). Dead — no callers anywhere.
+        // The live player-attack handler is HandlePlayerAttackMonster (called from line ~12587
+        // in the HandleComponentUpdate dispatch). The removed function emitted the now-deleted
+        // BuildDamagePacket (opcode 0x28 → desync popup on 666 client).
 
-            // Check if target is a monster
-            var monster = CombatManager.Instance.GetMonster(targetEntityId);
-            if (monster == null)
-            {
-                Debug.LogError($"[ATTACK] Target {targetEntityId} is not a monster");
-                return;
-            }
-
-            if (!monster.IsAlive)
-            {
-                Debug.LogError($"[ATTACK] Monster {monster.Name} is already dead");
-                return;
-            }
-
-            // Get player's avatar ID for combat
-            uint avatarId = GetPlayerAvatarId(conn.LoginName);
-
-            // HP DESYNC FIX: Do NOT calculate damage server-side!
-            // Client calculates damage locally via Mersenne Twister RNG.
-            // Server must use client-reported values (from 0x36 sync and 0x08 CombatTick).
-            int damage = 0; // Real damage comes from client
-            var result = new DamageResult { Success = true, DamageDealt = 0, DefenderDied = false, NewHPWire = 0 };
-            var monster_check = CombatManager.Instance.GetMonster(targetEntityId);
-            if (monster_check != null)
-            {
-                result.NewHPWire = CombatManager.Instance.GetMonsterCurrentHPWire(monster_check, "HANDLE-PLAYER-ATTACK");
-                result.DefenderDied = !monster_check.IsAlive;
-            }
-
-            if (result.Success)
-            {
-                Debug.LogError($"[ATTACK] Hit {monster.Name} for {damage} damage! HP: {CombatManager.Instance.PeekMonsterCurrentHPWire(monster) / 256}/{monster.MaxHPWire / 256}");
-
-                // Send damage event to client
-                var damageEvt = new DamageEvent
-                {
-                    AttackerId = avatarId,
-                    DefenderId = targetEntityId,
-                    DamageAmount = damage,
-                    DamageWire = (uint)(damage * 256),
-                    IsCritical = false,
-                    PosX = monster.PosX,
-                    PosY = monster.PosY,
-                    PosZ = monster.PosZ
-                };
-
-                // Send damage to attacking player only (multiplayer: shared monster IDs needed for broadcast)
-                byte[] damagePacket = CombatPackets.BuildDamagePacket(damageEvt);
-                SendCompressedA(conn, 0x01, 0x0F, damagePacket);
-
-                // If monster died, handle death
-                if (result.DefenderDied)
-                {
-                    TryFinalizeMonsterKill(conn, monster, "HandlePlayerAttack");
-                }
-            }
-        }
-
-
-
-        // 🔥 ADD THIS NEW METHOD:
         private void HandleComponentUpdate(RRConnection conn, LEReader reader)
         {
             try
@@ -19233,10 +19273,14 @@ namespace DungeonRunners.Networking
                 Debug.LogError($"[ZONE] CurrentZoneGcType set to: {conn.CurrentZoneGcType}");
                 AssignInstanceId(conn);
 
-                // Send procedural seed, NOT zone ID! Dungeons use this to generate terrain.
-                // Send procedural seed - matches Go server exactly
-                zoneWriter.WriteUInt32(0xBEEFBEEF);  // Fixed seed - Go server uses this
-                Debug.LogError($"[ZONE-MSG] Sending seed: 0xBEEFBEEF");
+                // 2026-05-27: bug fix — was hardcoded 0xBEEFBEEF, but UGS:16569 (zone-change path)
+                // already correctly uses ResolveZoneConnectSeed which returns the server's actual
+                // layoutSeed. Initial-login path here must do the same so server's MazeGenerator
+                // and client's DungeonGenerator use identical seeds → matching layouts. Without
+                // this fix, mobs spawn in client-rendered walls/trees because layouts diverge.
+                uint procSeed = ResolveZoneConnectSeed(conn, zoneName);
+                zoneWriter.WriteUInt32(procSeed);
+                Debug.LogError($"[ZONE-MSG] Sending procedural seed: 0x{procSeed:X8} for zone={zoneName}");
                 zoneWriter.WriteByte(0x01);                              // Flag - WAS MISSING!
                 zoneWriter.WriteByte(0xFF);                              // Flag - WAS MISSING!
                 zoneWriter.WriteCString("");      // Quest zone source - WAS MISSING!

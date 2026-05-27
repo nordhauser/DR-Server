@@ -138,7 +138,7 @@ namespace DungeonRunners.Managers
                 if ((layoutMismatch || roomMismatch) && !_spawnedZones.Contains(key))
                 {
                     Debug.LogError($"[DUNGEON-SNAPSHOT] rebuild instance='{key}' zone={zoneName} oldLayout=0x{snapshot.LayoutSeed:X8} newLayout=0x{nativeLayoutSeed:X8} requestedLayout=0x{layoutSeed:X8} oldRoom=0x{snapshot.RoomSeed:X8} newRoom=0x{roomSeed:X8}");
-                    snapshot = DungeonMazeSpawner.GenerateSnapshot(zoneName, nativeLayoutSeed, roomSeed);
+                    snapshot = DungeonMazeSpawner.GenerateSnapshot(zoneName, nativeLayoutSeed, roomSeed, key);
                     _proceduralSnapshots[key] = snapshot;
                 }
                 else
@@ -155,7 +155,7 @@ namespace DungeonRunners.Managers
                 return snapshot;
             }
 
-            snapshot = DungeonMazeSpawner.GenerateSnapshot(zoneName, nativeLayoutSeed, roomSeed);
+            snapshot = DungeonMazeSpawner.GenerateSnapshot(zoneName, nativeLayoutSeed, roomSeed, key);
             _proceduralSnapshots[key] = snapshot;
             Debug.LogError($"[DUNGEON-SNAPSHOT] cache instance='{key}' zone={zoneName} layoutSeed=0x{nativeLayoutSeed:X8} requestedLayout=0x{layoutSeed:X8} roomSeed=0x{roomSeed:X8} entry=({snapshot.EntryGridX},{snapshot.EntryGridY}) tile='{snapshot.EntryTileType}' player=({snapshot.PlayerSpawn.x:F1},{snapshot.PlayerSpawn.y:F1},{snapshot.PlayerSpawn.z:F1}) entryPortal=({snapshot.EntryPortalSpawn.x:F1},{snapshot.EntryPortalSpawn.y:F1},{snapshot.EntryPortalSpawn.z:F1}) exit=({snapshot.ExitGridX},{snapshot.ExitGridY}) tile='{snapshot.ExitTileType}' exitPortal=({snapshot.ExitPortalSpawn.x:F1},{snapshot.ExitPortalSpawn.y:F1},{snapshot.ExitPortalSpawn.z:F1}) cells={snapshot.Cells.Count} roomNodes={snapshot.RoomNodes.Count} spawns={snapshot.Spawns.Count} yTransform=worldGridY=gridY/native-BuildWorld");
             return snapshot;

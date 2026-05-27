@@ -1189,7 +1189,7 @@ namespace DungeonRunners.Managers
             return GenerateSnapshot(zoneName, seed).Spawns;
         }
 
-        public static ProceduralDungeonSnapshot GenerateSnapshot(string zoneName, uint seed = 0xBEEFBEEF, uint roomSeed = 0)
+        public static ProceduralDungeonSnapshot GenerateSnapshot(string zoneName, uint seed = 0xBEEFBEEF, uint roomSeed = 0, string instanceKey = null)
         {
             string baseZone = NormalizeBaseZone(zoneName);
             var snapshot = new ProceduralDungeonSnapshot
@@ -1231,6 +1231,50 @@ namespace DungeonRunners.Managers
             var cells = maze.Generate();
 
             Debug.LogError($"[MazeSpawner]   Generated {cells.Count} cells");
+
+            // Phase 2 (Option 1-full): dump the maze grid to disk for diffing against
+            // x32dbg-captured client grids. One file per (zone, seed) pair. Keeps the
+            // last 8 dumps per zone so re-runs don't drown the disk; older files removed.
+            // Path: <persistent>/maze_dumps/<zone>_<seed>.txt
+            try
+            {
+                string dumpDir = System.IO.Path.Combine(UnityEngine.Application.persistentDataPath, "maze_dumps");
+                System.IO.Directory.CreateDirectory(dumpDir);
+                string dumpPath = System.IO.Path.Combine(dumpDir, $"{baseZone}_0x{seed:X8}.txt");
+                string body = maze.DumpGrid();
+                string ascii = maze.AsciiGridPicture();
+                System.IO.File.WriteAllText(dumpPath, body + "\n" + ascii);
+                Debug.LogError($"[MAZE-DUMP] wrote {dumpPath} ({body.Length + ascii.Length} bytes) zone={baseZone} seed=0x{seed:X8}");
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogError($"[MAZE-DUMP] failed to write dump for zone={baseZone} seed=0x{seed:X8}: {ex.Message}");
+            }
+
+            // Phase 3 (Option 1-full): build a per-instance PathMap from the placed tile
+            // geometry and register it so WanderSimulator etc. stop hitting the "procedural
+            // instance has no PathMap" warning. Build cost is ~1-15s per zone-in depending
+            // on dungeon size; paid once. Registration key is the full instance name (e.g.
+            // dungeon00_level01_inst2147483649) when provided; falls back to zoneName for
+            // legacy callers. Since LayoutSeed is now per-instance, each instance gets its
+            // own PathMap.
+            try
+            {
+                string pathMapKey = string.IsNullOrEmpty(instanceKey) ? zoneName : instanceKey;
+                var builtPathMap = DungeonRunners.Utilities.PathMapBuilder.Build(pathMapKey, cells);
+                if (builtPathMap != null)
+                {
+                    DungeonRunners.Core.PathMapManager.Instance.RegisterInstancePathMap(pathMapKey, builtPathMap);
+                    // Phase 4b: re-fire the parity test now that we have a real dungeon PathMap.
+                    // The boot-time run hits zero matching PathMaps; the post-zone-in run can
+                    // actually validate captured cases.
+                    DungeonRunners.Core.PathfinderClientParityTest.RunAll();
+                }
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogError($"[PATHMAP-BUILD] failed for zone={zoneName} seed=0x{seed:X8}: {ex.Message}");
+            }
 
             // 2. Place encounters at tile encounter markers
             int encIdx = 0;

@@ -60,6 +60,13 @@ namespace DungeonRunners.Combat
         public byte SessionId;
         public float Heading;
 
+        // PA1.1: Shared UnitMoverSim instance. Owned conceptually by the Monster;
+        // assigned by WanderSimulator.RegisterMonster (which constructs it). Both
+        // WanderSimulator (idle wander) and CombatManager.ProcessMonsterMovement
+        // (active chase) read/write the same instance once PA1.3 lands. Null until
+        // the mob is registered with WanderSimulator.
+        public UnitMoverSim Mover;
+
         public float AggroRange = 50f;
         public float PerceptionRange = 0f;
         public float ShoutRange = 0f;
@@ -97,6 +104,13 @@ namespace DungeonRunners.Combat
         public float WalkSpeed = 25f;
         public float WanderRange = 0f;
         public uint LastStateCounter;
+
+        // Two-stage aggro (matches client's [Desc+0x86]==2 alerted runtime byte):
+        // Default false. Becomes true when a nearby aggro'd mob shouts within ShoutRange.
+        // When true, ResolveMonsterTargetSearchRange returns ShoutRange instead of AggroRange,
+        // letting this mob aggro the player from greater distance (chain-aggro mechanic).
+        // Reset to false when the mob loses aggro (lose-target / leash / etc).
+        public bool AlertedByShout { get; set; }
 
         // Per-entity RNG for deterministic combat (seeded via opcode 0x0C at spawn)
         public uint RngSeed;

@@ -5,6 +5,7 @@ using DungeonRunners.Networking;
 using DungeonRunners.Networking.Sync;
 using DungeonRunners.Core;
 using DungeonRunners.Data;
+using DungeonRunners.Utilities;
 using System.Linq;
 using System.IO;
 namespace DungeonRunners.Combat
@@ -13,6 +14,32 @@ namespace DungeonRunners.Combat
     {
         private static CombatManager _instance;
         public static CombatManager Instance => _instance ??= new CombatManager();
+
+        // Diagnostic runtime override for monster DamageBonus input to ResolveNativeWeaponDamage.
+        // -1 = disabled (server uses 0 like before). Any value >= 0 = pass it as DamageBonus to
+        // ComputeNativeWeaponDamageRange so we can empirically tune until client/server damage
+        // rolls converge on the 666 NoHP combat-during-movement scenario. Set via @setdmgbonus N.
+        public static int MonsterDamageBonusOverride = -1;
+
+        // Off by default — 2026-05-25 Unity crash from log buffer pressure. This trace fires
+        // ~1Hz with a foreach over all monsters; useful for combat scope debugging but spammy.
+        public static bool VerboseCombatTick = false;
+
+        // Off by default — 2026-05-25 Unity froze on combat from log spam. [MON-STATE] fired
+        // ~584 lines per session (21% of log) with heavy string interpolation. The trace is
+        // useful for AI/state debugging but not for HP-sync work. Re-enable per investigation.
+        public static bool VerboseMonsterStateTrace = false;
+
+        // PA1.3: route active-chase position update through the same UnitMoverSim that
+        // already drives idle wander. Default false → legacy float math is authoritative.
+        // Flip true (in ServerManager) once shadow-mode validation (PA1.4) confirms parity.
+        public static bool UseUnitMoverForChase = false;
+
+        // PA1.4: run UnitMoverSim chase in parallel with legacy each tick; log delta.
+        // Authoritative position stays legacy until UseUnitMoverForChase=true. Default
+        // false — flip true only during validation sessions to avoid log spam.
+        public static bool EnableChaseMoverShadow = false;
+        private const int CHASE_MOVER_DIFF_LOG_INTERVAL = 5;
 
         private Dictionary<uint, Monster> _activeMonsters = new Dictionary<uint, Monster>();
         private Dictionary<uint, CombatPlayer> _players = new Dictionary<uint, CombatPlayer>();
@@ -206,12 +233,13 @@ namespace DungeonRunners.Combat
 
         public event Action<Monster> OnMonsterSpawned;
         public event Action<Monster> OnMonsterDespawned;
-        public event Action<DamageEvent> OnDamageDealt;
-        public event Action<uint, uint> OnEntityDeath;
+        // OnDamageDealt + OnEntityDeath removed 2026-05-27 (audit Phase 1):
+        // events were declared but never .Invoke()'d AND never subscribed (only handlers
+        // were dead-code in UGS emitting invalid 0x28 packets).
         public event Action<Monster> OnMonsterPositionChanged;
         public event Action<Monster, CombatPlayer, byte> OnMonsterAttackStarted;
         public event Action<Monster, CombatPlayer, bool, uint> OnMonsterAttackResolved;
-
+        // OnMonsterDamagedByPlayer event removed Stage 0 cleanup 2026-05-27 alongside Path C refresh.
         // OnMonsterAttack and OnMonsterAggro REMOVED.
         // Client is authoritative on combat — sends type 9 for aggro.
         // Server-side aggro used monster.PosX which was always spawn position (never updated).
@@ -580,6 +608,26 @@ namespace DungeonRunners.Combat
             {
                 ResetMonsterHPRegenClock(monster, now);
                 _monsterHPRegenCooldownTicks.Remove(monster.EntityId);
+                return hp;
+            }
+
+            // Block regen while the monster is in active combat. The existing 10-second
+            // damage-cooldown (NATIVE_DAMAGE_REGEN_COOLDOWN_TICKS) wasn't enough: if the
+            // player engages a mob but stops hitting it for 10s (e.g. while dodging the
+            // mob's attacks), regen kicks in and the mob's HP climbs back up. Path C
+            // refreshes the client every regen tick, so the player sees the mob's HP bar
+            // visibly growing — appears as "HP reset to full" if the climb is big enough.
+            // Verified via server.log 2026-05-25: mob 50000 had +1040 wire regen between
+            // mob-attack ticks during sustained combat. Solution: don't regen at all
+            // while AggroTriggered or in Combat/Attacking state. Mob still regens during
+            // the chase home (Return state) or once aggro fully drops.
+            MonsterState s = monster.State;
+            if (monster.AggroTriggered
+                || s == MonsterState.Combat
+                || s == MonsterState.Attacking
+                || s == MonsterState.Chase)
+            {
+                ResetMonsterHPRegenClock(monster, now);
                 return hp;
             }
 
@@ -1129,6 +1177,7 @@ namespace DungeonRunners.Combat
             _monsterFarTargetActionLogTime.Remove(monster.EntityId);
             RemoveMonsterModifiersForTarget(monster.EntityId, source ?? "death");
             WanderSimulator.Instance.UnregisterEntity(monster.EntityId);
+            MonsterAttackController.Instance.ClearTarget(monster.EntityId);
 
             if (hadRuntimeState)
                 Debug.LogError($"[MON-DEATH-STATE] cleared action/move target for {monster.Name}#{monster.EntityId} source={source ?? "unknown"}");
@@ -1285,6 +1334,7 @@ namespace DungeonRunners.Combat
 
             Debug.LogError($"[MONSTER-DAMAGE] source={source ?? "unknown"} target={monster.Name}#{monster.EntityId} damageWire={damageWire} adjustedWire={adjustedDamageWire} hp={oldHPWire}->{newHPWire}/{monster.MaxHPWire} died={died} nativeDamageTime={damageTime:F3}");
             Debug.LogError($"[MON-HP-TRUTH] COMPUTED {monster.Name}#{monster.EntityId} source={source ?? "unknown"} hp={oldHPWire / 256f:F2}->{newHPWire / 256f:F2}/{monster.MaxHPWire / 256f:F2} dmg={damageWire / 256f:F2}");
+
             return true;
         }
 
@@ -1323,13 +1373,14 @@ namespace DungeonRunners.Combat
             monster.AlertSourceEntityId = 0;
             monster.State = MonsterState.Combat;
             if (alignForCombat) AlignMonsterForClientCombat(monster, player);
+            MonsterAttackController.Instance.SetTarget(monster.EntityId, player.EntityId);
             if (firstAggro)
             {
                 WanderSimulator.Instance.UnregisterEntity(monster.EntityId);
                 monster.AttackPending = false;
                 monster.AttackSoundPending = false;
                 Debug.LogError($"[SERVER-AGGRO] {monster.Name} -> {player.Name} reason={reason}");
-                OnMonsterAggro?.Invoke(monster, player);
+                // OnMonsterAggro invocation removed 2026-05-27 (audit Phase 1) — event had no subscribers.
                 PropagateMonsterShout(monster, player);
             }
             TraceMonsterState(monster, "aggro", player, Distance2D(monster.PosX, monster.PosY, player.PosX, player.PosY), ResolveMonsterEffectiveAttackRange(monster), reason);
@@ -1463,7 +1514,11 @@ namespace DungeonRunners.Combat
             {
                 if (monster == null) continue;
                 bool touchesPlayer = monster.TargetId == entityId || monster.CombatContactTargetId == entityId;
-                if (monster.TargetId == entityId) monster.TargetId = 0;
+                if (monster.TargetId == entityId)
+                {
+                    monster.TargetId = 0;
+                    MonsterAttackController.Instance.ClearTarget(monster.EntityId);
+                }
                 if (monster.CombatContactTargetId == entityId) monster.CombatContactTargetId = 0;
                 if (touchesPlayer || monster.AttackPending)
                 {
@@ -1511,10 +1566,14 @@ namespace DungeonRunners.Combat
         public void InitializeRoomRng(uint seed)
         {
             _roomSeed = seed;
-            _roomRng = new MersenneTwister(seed);
+            // Client's processRandomSeed @ 0x005da870 applies +0x44 before passing to
+            // Random::seed. Server must mirror this transform to keep the MT19937 state
+            // aligned with the client (otherwise every roll diverges).
+            uint mtSeed = seed + 0x44;
+            _roomRng = new MersenneTwister(mtSeed);
             _roomRngInitialized = true;
-            Debug.LogError($"[ROOM-RNG] ★ Room RNG initialized with seed: 0x{seed:X8}");
-            Debug.LogError($"[RNG-SEED] room initialize seed=0x{seed:X8} rngPos=0 monsters={_activeMonsters.Count} players={_players.Count}");
+            Debug.LogError($"[ROOM-RNG] ★ Room RNG initialized with wireSeed=0x{seed:X8} mtSeed=0x{mtSeed:X8}");
+            Debug.LogError($"[RNG-SEED] room initialize wire=0x{seed:X8} mt=0x{mtSeed:X8} rngPos=0 monsters={_activeMonsters.Count} players={_players.Count}");
         }
 
         public void AdvanceRoomRng(int count, string source)
@@ -1542,16 +1601,18 @@ namespace DungeonRunners.Combat
             uint previousSeed = _roomSeed;
             int previousPos = _roomRng?.CallsSinceReseed ?? 0;
             _roomSeed = seed;
+            // Apply +0x44 transform to match client's processRandomSeed (see InitializeRoomRng).
+            uint mtSeed = seed + 0x44;
             if (_roomRng == null)
             {
-                _roomRng = new MersenneTwister(seed);
+                _roomRng = new MersenneTwister(mtSeed);
                 _roomRngInitialized = true;
             }
             else
             {
-                _roomRng.Seed(seed);
+                _roomRng.Seed(mtSeed);
             }
-            Debug.LogError($"[RNG-SEED] room reseed previous=0x{previousSeed:X8} seed=0x{seed:X8} previousPos={previousPos} rngPos={_roomRng?.CallsSinceReseed ?? 0}");
+            Debug.LogError($"[RNG-SEED] room reseed previous=0x{previousSeed:X8} wire=0x{seed:X8} mt=0x{mtSeed:X8} previousPos={previousPos} rngPos={_roomRng?.CallsSinceReseed ?? 0}");
         }
         /// <summary>Legacy alias for old code paths.</summary>
         public void InitializeRandomSeed(uint seed)
@@ -1564,7 +1625,8 @@ namespace DungeonRunners.Combat
             }
             InitializeRoomRng(seed);
         }
-        public event Action<Monster, CombatPlayer> OnMonsterAggro;
+        // OnMonsterAggro event removed 2026-05-27 (audit Phase 1) — comment at :238 said
+        // "REMOVED" but the event was only half-deleted; no subscribers in WORK tree.
         public CombatPlayer GetPlayer(uint entityId)
         {
             return _players.TryGetValue(entityId, out var p) ? p : null;
@@ -1775,11 +1837,24 @@ namespace DungeonRunners.Combat
                 return null;
             }
 
-            // Calculate level from tier + zone base
-            byte tierLevel = GetLevelForTier(creatureDifficulty);
-            byte zoneBase = GetZoneBaseLevel(zoneName);
-            byte calculatedLevel = (byte)Math.Min(110, tierLevel + zoneBase);
-            Debug.LogError($"[Combat] Level calc: tier={creatureDifficulty}({tierLevel}) + zone={zoneName}({zoneBase}) = {calculatedLevel}");
+            // S10h 2026-05-27: prefer rank-based level when the spawn GC path matches
+            // retail's `world.dungeon00.mob.melee0N.rankM` aliasing pattern. From video
+            // evidence in dungeon00 (zone range 1..5): rank1=L1, rank2=L4, rank3=L5.
+            // Falls back to legacy (tier + zoneBase) when no rank info is available.
+            byte rankLevel = ResolveMobLevelFromRank(spawnGcType, zoneName);
+            byte calculatedLevel;
+            if (rankLevel > 0)
+            {
+                calculatedLevel = rankLevel;
+                Debug.LogError($"[Combat] Level calc: rank-based spawn='{spawnGcType}' zone='{zoneName}' = {calculatedLevel}");
+            }
+            else
+            {
+                byte tierLevel = GetLevelForTier(creatureDifficulty);
+                byte zoneBase = GetZoneBaseLevel(zoneName);
+                calculatedLevel = (byte)Math.Min(110, tierLevel + zoneBase);
+                Debug.LogError($"[Combat] Level calc: tier={creatureDifficulty}({tierLevel}) + zone={zoneName}({zoneBase}) = {calculatedLevel}");
+            }
 
             uint entityId = _nextMonsterId++;
             uint behaviorId = _nextMonsterId++;
@@ -1912,6 +1987,28 @@ namespace DungeonRunners.Combat
             if (ShouldRegisterWander(idleAction, zoneName))
                 WanderSimulator.Instance.RegisterMonster(monster, true);
 
+            // PA1.3 hoist: every mob gets a UnitMoverSim, not just wander-registered ones.
+            // Dungeon mobs with IdleAction=STAND/GUARD wouldn't go through WanderSimulator,
+            // but they still need a Mover for chase to route through ProcessMonsterMovement's
+            // UnitMoverSim path. WanderSimulator's RegisterMonster may have already created
+            // one — only construct if not already assigned.
+            if (monster.Mover == null)
+            {
+                var pathMap = !string.IsNullOrEmpty(monster.ZoneName)
+                    ? PathMapManager.Instance.GetPathMap(monster.ZoneName)
+                    : null;
+                monster.Mover = new UnitMoverSim
+                {
+                    PosX = Utilities.Fixed32.FromFloat(monster.PosX),
+                    PosY = Utilities.Fixed32.FromFloat(monster.PosY),
+                    PosZ = Utilities.Fixed32.Zero,
+                    PathMap = pathMap,
+                    Pathfinder = pathMap != null ? new Core.Pathfinder(pathMap) : null,
+                    ArriveRadius = Utilities.Fixed32.FromInt(5),
+                };
+                Debug.LogError($"[CHASE-MOVER-CUTOVER] Provisioned Mover for {monster.Name}#{monster.EntityId} zone={monster.ZoneName} pathMap={(pathMap != null)} pos=({monster.PosX:F1},{monster.PosY:F1})");
+            }
+
             int nativeAttackRating = DamageComputer.ResolveNativeMonsterAttackRating(monster);
             int nativeDefenseRating = DamageComputer.ResolveNativeMonsterDefenseRating(monster);
             float monsterDamageTable = ResolveMonsterDamageTable(monster.Level);
@@ -1925,6 +2022,7 @@ namespace DungeonRunners.Combat
             TraceMonsterState(monster, "spawn", null, -1f, monster.AttackRange, "spawn");
 
             OnMonsterSpawned?.Invoke(monster);
+            RegisterMonsterForServerCombat(monster);
             return monster;
         }
         // Family prefix → mob family name. Uses StartsWith (case-insensitive) so ALL
@@ -2651,6 +2749,7 @@ namespace DungeonRunners.Combat
             _monsterStateTraceSignatures.Remove(entityId);
 
             WanderSimulator.Instance.UnregisterEntity(entityId);
+            MonsterAttackController.Instance.Unregister(entityId);
             OnMonsterDespawned?.Invoke(monster);
             UnregisterNativeEntityOrder(entityId);
             _activeMonsters.Remove(entityId);
@@ -3296,20 +3395,49 @@ namespace DungeonRunners.Combat
         {
             if (state == null) return 0;
             float defensePerStrength = GCDatabase.Instance.GetKnob("DefenseRatingPerStrength", 14f);
-            int rating = Mathf.RoundToInt(state.Strength * defensePerStrength) + state.ArmorDefenseRating;
+            // Bug 1 fix 2026-05-27: PlayerState.Strength only carries (BASE + allocated + passive)
+            // — it does NOT include gear's STRENGTH contribution. The client's character sheet
+            // displays effective STR including equipment, so client's DR formula uses the gear-
+            // adjusted value too. Diagnostic 2026-05-27 showed server STR=5 vs sheet STR=6 (Ranger
+            // passive=-5, gear contributed +1). Add gear STR here so server's DR computation
+            // matches what client computes. Same bug likely affects AR (attack rating per AGI)
+            // and any other stat-based formula — flagged for follow-up but not addressed in this
+            // narrow fix.
+            int gearStrength = GetEquipmentStat(state, "STRENGTH");
+            int effectiveStrength = state.Strength + gearStrength;
+            int strBase = Mathf.RoundToInt(effectiveStrength * defensePerStrength);
+            int rating = strBase + state.ArmorDefenseRating;
             int modifier = GetEquipmentStat(state, "DEFENSE_RATING_MOD");
             string weaponClass = ResolveMonsterWeaponClass(attacker);
+            int slotRating, slotModifier;
             if (IsRangedWeaponClass(weaponClass))
             {
-                rating += GetEquipmentStat(state, "RANGE_DEFENSE_RATING");
-                modifier += GetEquipmentStat(state, "RANGE_DEFENSE_RATING_MOD");
+                slotRating = GetEquipmentStat(state, "RANGE_DEFENSE_RATING");
+                slotModifier = GetEquipmentStat(state, "RANGE_DEFENSE_RATING_MOD");
             }
             else
             {
-                rating += GetEquipmentStat(state, "MELEE_DEFENSE_RATING");
-                modifier += GetEquipmentStat(state, "MELEE_DEFENSE_RATING_MOD");
+                slotRating = GetEquipmentStat(state, "MELEE_DEFENSE_RATING");
+                slotModifier = GetEquipmentStat(state, "MELEE_DEFENSE_RATING_MOD");
             }
-            return Mathf.Max(0, (int)(((long)Mathf.Max(0, rating) * (modifier + 100)) / 100));
+            rating += slotRating;
+            modifier += slotModifier;
+            int finalDR = Mathf.Max(0, (int)(((long)Mathf.Max(0, rating) * (modifier + 100)) / 100));
+
+            // Stage 3 diagnostic — dump server's DR breakdown so it can be compared to the
+            // value the client shows on the character sheet. Fires once per monster swing.
+            int generic = GetEquipmentStat(state, "DEFENSE_RATING");
+            Debug.LogError(
+                $"[PLAYER-DR-DETAIL] attacker={attacker?.Name ?? "?"}#{attacker?.EntityId ?? 0} " +
+                $"weaponClass={weaponClass} " +
+                $"STR={state.Strength}+gear{gearStrength}={effectiveStrength}×{defensePerStrength:F1}={strBase} " +
+                $"armorDR={state.ArmorDefenseRating} " +
+                $"slot[{(IsRangedWeaponClass(weaponClass) ? "RANGE" : "MELEE")}]={slotRating} " +
+                $"DEFENSE_RATING(generic_unused)={generic} " +
+                $"DEFENSE_RATING_MOD={GetEquipmentStat(state, "DEFENSE_RATING_MOD")} " +
+                $"slotMod={slotModifier} " +
+                $"→ rating={rating} mod={modifier} finalDR={finalDR}");
+            return finalDR;
         }
 
         private static int GetEquipmentStat(PlayerState state, string key)
@@ -3377,7 +3505,36 @@ namespace DungeonRunners.Combat
             float baseDamage = monster != null ? ResolveMonsterDamageTable(monster.Level) : 1f;
             float damageMod = monster != null ? ResolveMonsterDamageModifier(monster) : 1f;
             float weaponScale = monster != null && monster.WeaponDamage > 0f ? monster.WeaponDamage : 1f;
-            float volatility = monster != null ? Mathf.Clamp(monster.DamageVolatility, 0f, 0.95f) : 0.5f;
+
+            // Monster weapon volatility: hardcoded 0.5 to match the client. The client does NOT
+            // propagate Manipulators-block overrides like
+            // `Whisker_Broodling_Weapons.UnarmedWeapon.DamageVolatility = 0.4` — it uses the
+            // parent class default (`creatures.base.weapons.melee` and `creatures.base.weapons.ranged`,
+            // both at 0.5). Verified 2026-05-25 via x32dbg @ Weapon::computeDamageRange on a live
+            // Whisker Ratling: [EDX+0xF0] = 0x80 (= 0.5) despite the authored 0.4 override. Without
+            // this match, each Rat hit drifts ~1 HP from client, surfacing as visual HP desync on
+            // movement-packet suffix HP even when no Validate kick fires.
+            float volatility = 0.5f;
+
+            // Use FloorToInt (not RoundToInt). Verified via x32dbg @ Weapon::computeDamageRange:
+            // the client passes the curve value truncated, not rounded — so for level-2 Warg Pup
+            // with curve(2) ≈ 15.78, the client uses 15, not the rounded 16. Server was
+            // overstating damageLevel by 1 unit each hit, causing a tiny per-hit divergence
+            // that the avatar Validate could catch on movement packets. Confirmed 2026-05-25.
+            int damageLevel = Mathf.Max(1, Mathf.FloorToInt(baseDamage));
+            int damageBonus = MonsterDamageBonusOverride >= 0 ? MonsterDamageBonusOverride : 0;
+            int damageModInt = Mathf.Max(0, Mathf.RoundToInt(damageMod * 100f));
+            int weaponDamageF32 = DamageComputer.FromFloat(weaponScale);
+            int volatilityF32 = DamageComputer.FromFloat(volatility);
+
+            // Diagnostic gated on the override — only emit when the admin is actively tuning. Default
+            // (override = -1) is silent: no recompute, no log line. Without this gate the per-attack
+            // log + recompute crashed Unity from log-buffer pressure when multiple mobs were engaged.
+            if (MonsterDamageBonusOverride >= 0)
+            {
+                DamageComputer.ComputeNativeWeaponDamageRange(damageLevel, damageBonus, damageModInt, weaponDamageF32, volatilityF32, out int minF32, out int maxF32);
+                Debug.LogError($"[DMG-INPUT] {(monster?.Name ?? "<null>")}#{monster?.EntityId ?? 0u} src={source} lvl={monster?.Level ?? 0} damageLevel={damageLevel} damageBonus={damageBonus} damageMod={damageModInt} weaponDamageF32=0x{weaponDamageF32:X4} volF32=0x{volatilityF32:X4} range=[{minF32 / 256f:F2},{maxF32 / 256f:F2}] HP");
+            }
 
             return new NativeWeaponDamageInput
             {
@@ -3388,11 +3545,11 @@ namespace DungeonRunners.Combat
                 AttackRating = ResolveMonsterAttackRating(monster),
                 DefenseRating = ResolveAvatarDefenseRating(target?.PlayerState, monster),
                 BlockChance = ResolveAvatarBlockChance(target?.PlayerState),
-                DamageLevel = Mathf.Max(1, Mathf.RoundToInt(baseDamage)),
-                DamageBonus = 0,
-                DamageMod = Mathf.Max(0, Mathf.RoundToInt(damageMod * 100f)),
-                WeaponDamageF32 = DamageComputer.FromFloat(weaponScale),
-                WeaponVolatilityF32 = DamageComputer.FromFloat(volatility),
+                DamageLevel = damageLevel,
+                DamageBonus = damageBonus,
+                DamageMod = damageModInt,
+                WeaponDamageF32 = weaponDamageF32,
+                WeaponVolatilityF32 = volatilityF32,
                 CritThreshold = 0,
                 CritDamagePercent = 0
             };
@@ -3429,18 +3586,29 @@ namespace DungeonRunners.Combat
                     Debug.LogError($"[{marker}] {monster.Name}#{monster.EntityId}->{target.Name} immune source={source} dmg={damageWire / 256f:F2} hp={target.PlayerState.CurrentHPWire / 256f:F2}/{target.PlayerState.MaxHPWire / 256f:F2} range=[{minDamage / 256f:F2},{maxDamage / 256f:F2}] avg={averageDamage / 256f:F2} ar={attackRating} dr={defenseRating} levels={attackerLevel}->{defenderLevel} chance={hitChance:F1} rngPos={_roomRng.CallsSinceReseed} anim={monster.AttackAnimationIndex} use=0x{monster.AttackUseRaw:X8} sound=0x{monster.AttackSoundRaw:X8} soundGate=0x{monster.AttackSoundGateRaw:X8} soundRepeat=0x{monster.AttackSoundRepeatRaw:X8} hit=0x{hitRaw:X8}/{hitRoll} block=0x{blockRaw:X8}/{blockRoll}/{blockChance} dmgRaw=0x{damageRaw:X8} dist={dist:F1}");
                     Debug.LogError($"[PLAYER-DAMAGE] source=monster attacker={monster.Name}#{monster.EntityId} target={target.Name}#{target.EntityId} result=IMMUNE damageWire={damageWire} hp={target.PlayerState.CurrentHPWire}->{target.PlayerState.CurrentHPWire}/{target.PlayerState.MaxHPWire} marker={marker} source={source} rngSeed=0x{_roomSeed:X8} rngPos={_roomRng.CallsSinceReseed}");
                     Debug.LogError($"[COMBAT-EVENT] actor=monster actorId={monster.EntityId} target=player targetId={target.EntityId} result=IMMUNE damageWire={damageWire} hp={target.PlayerState.CurrentHPWire}->{target.PlayerState.CurrentHPWire} hitRaw=0x{hitRaw:X8} hitRoll={hitRoll} threshold={hitThreshold} blockRaw=0x{blockRaw:X8} blockRoll={blockRoll} blockChance={blockChance} damageRaw=0x{damageRaw:X8} resist=1 rngAfter={_roomRng.CallsSinceReseed} marker={marker} source={source}");
+                    target.PlayerState.RecordSimMonsterAttack(monster.EntityId, "IMMUNE", damageWire, nativeNow, _roomRng.CallsSinceReseed);
                     OnMonsterAttackResolved?.Invoke(monster, target, false, target.PlayerState.CurrentHPWire);
                 }
                 else
                 {
                     uint currentHPWire = target.PlayerState.CurrentHPWire;
-                    target.PlayerState.TakeDamage(damageWire);
+                    // Use TakeRuntimeDamage (not TakeDamage) so SynchHP does NOT immediately advance to
+                    // the damaged value. The server applies damage instantly but the CLIENT only applies
+                    // it ~200ms later when the mob's attack animation reaches its hit frame and the
+                    // client's MeleeWeapon::doHit @ 0x005921C0 chain runs locally. During that window
+                    // the suffix HP must equal client's still-pre-damage [+0x2F0] for Validate to pass.
+                    // HasPendingClientVisibleMonsterAttack (HpSyncService gating in TryResolvePlayerSynchronizedHP)
+                    // keeps SynchHP frozen until the attack resolves server-side, which approximately
+                    // tracks the client's animation hit timing — at which point AdvanceClientSyncHP
+                    // catches SynchHP up to CurrentHPWire on the next outbound packet.
+                    target.PlayerState.TakeRuntimeDamage(damageWire);
                     uint newHPWire = target.PlayerState.CurrentHPWire;
                     target.IsAlive = newHPWire > 0;
                     uint effectRaw = 0;
                     Debug.LogError($"[{marker}] {monster.Name}#{monster.EntityId}->{target.Name} HIT source={source} dmg={damageWire / 256f:F2} hp={currentHPWire / 256f:F2}->{newHPWire / 256f:F2}/{target.PlayerState.MaxHPWire / 256f:F2} range=[{minDamage / 256f:F2},{maxDamage / 256f:F2}] avg={averageDamage / 256f:F2} ar={attackRating} dr={defenseRating} levels={attackerLevel}->{defenderLevel} chance={hitChance:F1} rngPos={_roomRng.CallsSinceReseed} anim={monster.AttackAnimationIndex} use=0x{monster.AttackUseRaw:X8} sound=0x{monster.AttackSoundRaw:X8} soundGate=0x{monster.AttackSoundGateRaw:X8} soundRepeat=0x{monster.AttackSoundRepeatRaw:X8} hit=0x{hitRaw:X8}/{hitRoll} block=0x{blockRaw:X8}/{blockRoll}/{blockChance} dmgRaw=0x{damageRaw:X8} dist={dist:F1}");
                     Debug.LogError($"[PLAYER-DAMAGE] source=monster attacker={monster.Name}#{monster.EntityId} target={target.Name}#{target.EntityId} result=HIT damageWire={damageWire} hp={currentHPWire}->{newHPWire}/{target.PlayerState.MaxHPWire} marker={marker} source={source} hitRaw=0x{hitRaw:X8} blockRaw=0x{blockRaw:X8} damageRaw=0x{damageRaw:X8} effectRaw=0x{effectRaw:X8} rngSeed=0x{_roomSeed:X8} rngPos={_roomRng.CallsSinceReseed}");
                     Debug.LogError($"[COMBAT-EVENT] actor=monster actorId={monster.EntityId} target=player targetId={target.EntityId} result=HIT damageWire={damageWire} hp={currentHPWire}->{newHPWire} hitRaw=0x{hitRaw:X8} hitRoll={hitRoll} threshold={hitThreshold} blockRaw=0x{blockRaw:X8} blockRoll={blockRoll} blockChance={blockChance} damageRaw=0x{damageRaw:X8} effectRaw=0x{effectRaw:X8} resist=0 rngAfter={_roomRng.CallsSinceReseed} marker={marker} source={source}");
+                    target.PlayerState.RecordSimMonsterAttack(monster.EntityId, "HIT", damageWire, nativeNow, _roomRng.CallsSinceReseed);
                     OnMonsterAttackResolved?.Invoke(monster, target, true, newHPWire);
                 }
             }
@@ -3449,6 +3617,7 @@ namespace DungeonRunners.Combat
                 Debug.LogError($"[{marker}] {monster.Name}#{monster.EntityId}->{target.Name} block source={source} ar={attackRating} dr={defenseRating} levels={attackerLevel}->{defenderLevel} chance={hitChance:F1} rngPos={_roomRng.CallsSinceReseed} anim={monster.AttackAnimationIndex} use=0x{monster.AttackUseRaw:X8} sound=0x{monster.AttackSoundRaw:X8} soundGate=0x{monster.AttackSoundGateRaw:X8} soundRepeat=0x{monster.AttackSoundRepeatRaw:X8} hit=0x{hitRaw:X8}/{hitRoll} block=0x{blockRaw:X8}/{blockRoll}/{blockChance} dist={dist:F1}");
                 Debug.LogError($"[PLAYER-DAMAGE] source=monster attacker={monster.Name}#{monster.EntityId} target={target.Name}#{target.EntityId} result=BLOCK damageWire=0 hp={target.PlayerState.CurrentHPWire}->{target.PlayerState.CurrentHPWire}/{target.PlayerState.MaxHPWire} marker={marker} source={source} hitRaw=0x{hitRaw:X8} blockRaw=0x{blockRaw:X8} rngSeed=0x{_roomSeed:X8} rngPos={_roomRng.CallsSinceReseed}");
                 Debug.LogError($"[COMBAT-EVENT] actor=monster actorId={monster.EntityId} target=player targetId={target.EntityId} result=BLOCK damageWire=0 hp={target.PlayerState.CurrentHPWire}->{target.PlayerState.CurrentHPWire} hitRaw=0x{hitRaw:X8} hitRoll={hitRoll} threshold={hitThreshold} blockRaw=0x{blockRaw:X8} blockRoll={blockRoll} blockChance={blockChance} resist=0 rngAfter={_roomRng.CallsSinceReseed} marker={marker} source={source}");
+                target.PlayerState.RecordSimMonsterAttack(monster.EntityId, "BLOCK", 0, nativeNow, _roomRng.CallsSinceReseed);
                 OnMonsterAttackResolved?.Invoke(monster, target, false, target.PlayerState.CurrentHPWire);
             }
             else
@@ -3456,6 +3625,7 @@ namespace DungeonRunners.Combat
                 Debug.LogError($"[{marker}] {monster.Name}#{monster.EntityId}->{target.Name} miss source={source} ar={attackRating} dr={defenseRating} levels={attackerLevel}->{defenderLevel} chance={hitChance:F1} rngPos={_roomRng.CallsSinceReseed} anim={monster.AttackAnimationIndex} use=0x{monster.AttackUseRaw:X8} sound=0x{monster.AttackSoundRaw:X8} soundGate=0x{monster.AttackSoundGateRaw:X8} soundRepeat=0x{monster.AttackSoundRepeatRaw:X8} hit=0x{hitRaw:X8}/{hitRoll} threshold={hitThreshold} block=0x{blockRaw:X8}/{blockRoll}/{blockChance} dist={dist:F1}");
                 Debug.LogError($"[PLAYER-DAMAGE] source=monster attacker={monster.Name}#{monster.EntityId} target={target.Name}#{target.EntityId} result=MISS damageWire=0 hp={target.PlayerState.CurrentHPWire}->{target.PlayerState.CurrentHPWire}/{target.PlayerState.MaxHPWire} marker={marker} source={source} hitRaw=0x{hitRaw:X8} blockRaw=0x{blockRaw:X8} rngSeed=0x{_roomSeed:X8} rngPos={_roomRng.CallsSinceReseed}");
                 Debug.LogError($"[COMBAT-EVENT] actor=monster actorId={monster.EntityId} target=player targetId={target.EntityId} result=MISS damageWire=0 hp={target.PlayerState.CurrentHPWire}->{target.PlayerState.CurrentHPWire} hitRaw=0x{hitRaw:X8} hitRoll={hitRoll} threshold={hitThreshold} blockRaw=0x{blockRaw:X8} blockRoll={blockRoll} blockChance={blockChance} resist=0 rngAfter={_roomRng.CallsSinceReseed} marker={marker} source={source}");
+                target.PlayerState.RecordSimMonsterAttack(monster.EntityId, "MISS", 0, nativeNow, _roomRng.CallsSinceReseed);
                 OnMonsterAttackResolved?.Invoke(monster, target, false, target.PlayerState.CurrentHPWire);
             }
         }
@@ -3491,6 +3661,7 @@ namespace DungeonRunners.Combat
 
         private void TraceMonsterState(Monster monster, string phase, CombatPlayer target = null, float dist = -1f, float range = -1f, string reason = null)
         {
+            if (!VerboseMonsterStateTrace) return;
             if (monster == null) return;
 
             uint hp = PeekMonsterHPWireForTrace(monster);
@@ -3507,6 +3678,8 @@ namespace DungeonRunners.Combat
 
         private void TraceCombatTick(string phase, float deltaTime, bool allowNewAttacks, Monster onlyMonster = null)
         {
+            if (!VerboseCombatTick) return;
+
             float now = GetNativeCombatTime();
             if (now - _lastCombatTraceSummaryTime < 1f)
                 return;
@@ -3531,13 +3704,72 @@ namespace DungeonRunners.Combat
             Debug.LogError($"[COMBAT-TICK] phase={phase ?? "update"} dt={deltaTime:F3} scope={scope} players={_players.Count} monsters={_activeMonsters.Count} alive={alive} aggro={aggro} pending={pending} attacking={attacking} deathPending={deathPending} allowNew={allowNewAttacks} rngReady={_roomRngInitialized} roomSeed=0x{_roomSeed:X8} rngPos={_roomRng?.CallsSinceReseed ?? 0}");
         }
 
+        // Stage 2 diagnostic: throttle PROXIMITY-* logs to once per second per (mob, reason)
+        private static readonly Dictionary<string, float> _proxiLogLastEmitTime = new Dictionary<string, float>();
+        private static float _proxiTickLastEmitTime = -1f;
+        private const float PROXI_LOG_INTERVAL_S = 1.0f;
+        private const float PROXI_TICK_LOG_INTERVAL_S = 1.0f;
+        private const float PROXI_NEAR_MISS_FACTOR = 3.0f;  // log mobs whose closest player is within 3× aggro range
+
+        private static bool ShouldEmitProxiLog(string key, float now)
+        {
+            if (!_proxiLogLastEmitTime.TryGetValue(key, out float last) || (now - last) >= PROXI_LOG_INTERVAL_S)
+            {
+                _proxiLogLastEmitTime[key] = now;
+                return true;
+            }
+            return false;
+        }
+
         private void ProcessProximityAggro(uint playerEntityId = 0, Monster onlyMonster = null)
         {
-            if (_players.Count == 0) return;
+            // Stage 2 diagnostic: throttled tick-entry log so we can confirm Update is invoking us
+            float diagNow = Time.time;
+
+            // [PLAYER-POS] diagnostic — log server's tracked player position every second per player.
+            // Lets us correlate user's actual movement to server's view. If server's view stops
+            // updating while the user is walking, that confirms position-tracking lag as a separate
+            // root cause from the alerted-range issue.
+            if (ShouldEmitProxiLog("__playerpos__", diagNow))
+            {
+                foreach (var p in _players.Values)
+                {
+                    if (p == null) continue;
+                    Debug.LogError(
+                        $"[PLAYER-POS] {p.Name}#{p.EntityId} " +
+                        $"pos=({p.PosX:F1},{p.PosY:F1}) " +
+                        $"alive={p.IsAlive} hp={(p.PlayerState != null ? p.PlayerState.CurrentHPWire : 0)}/{(p.PlayerState != null ? p.PlayerState.MaxHPWire : 0)} " +
+                        $"immune={(p.PlayerState != null ? p.PlayerState.IsZoneSpawnDamageImmune : false)} " +
+                        $"t={diagNow:F2}");
+                }
+            }
+
+            int totalMobs = 0;
+            int eligibleMobs = 0;
+            int skipAggroTriggered = 0;
+            int skipHasTarget = 0;
+            int skipDead = 0;
+            int skipNoRange = 0;
+            int aggroAcquired = 0;
+
+            if (_players.Count == 0)
+            {
+                if (diagNow - _proxiTickLastEmitTime >= PROXI_TICK_LOG_INTERVAL_S)
+                {
+                    _proxiTickLastEmitTime = diagNow;
+                    Debug.LogError($"[PROXIMITY-TICK] skip reason=no-players-registered playerDict={_players.Count}");
+                }
+                return;
+            }
+
             var pathMaps = new Dictionary<string, PathMap>(StringComparer.OrdinalIgnoreCase);
             foreach (var monster in SelectMonsters(onlyMonster))
             {
-                if (!monster.IsAlive || monster.AggroTriggered || monster.TargetId != 0) continue;
+                totalMobs++;
+                if (!monster.IsAlive) { skipDead++; continue; }
+                if (monster.AggroTriggered) { skipAggroTriggered++; continue; }
+                if (monster.TargetId != 0) { skipHasTarget++; continue; }
+
                 TryGetMonsterWanderClientVisiblePosition(monster, out float monsterX, out float monsterY);
                 PathMap pathMap = null;
                 if (!string.IsNullOrWhiteSpace(monster.ZoneName))
@@ -3549,42 +3781,118 @@ namespace DungeonRunners.Combat
                     }
                 }
                 float range = ResolveMonsterTargetSearchRange(monster, false);
-                if (range <= 0f) continue;
+                if (range <= 0f) { skipNoRange++; continue; }
+                eligibleMobs++;
 
                 CombatPlayer nearest = null;
                 float nearestSq = float.MaxValue;
                 float rangeSq = range * range;
+                CombatPlayer absoluteNearest = null;
+                float absoluteNearestSq = float.MaxValue;
+                string nearMissReason = null;
                 foreach (var player in _players.Values)
                 {
                     if (playerEntityId != 0 && player.EntityId != playerEntityId) continue;
                     if (player == null || !player.IsAlive || player.PlayerState == null) continue;
-                    if (player.PlayerState.IsZoneSpawnDamageImmune) continue;
-                    if (player.PlayerState.CurrentHPWire == 0 && player.PlayerState.SynchHP == 0) continue;
+
+                    float dx0 = player.PosX - monsterX;
+                    float dy0 = player.PosY - monsterY;
+                    float distSq0 = dx0 * dx0 + dy0 * dy0;
+                    if (distSq0 < absoluteNearestSq) { absoluteNearest = player; absoluteNearestSq = distSq0; }
+
+                    if (player.PlayerState.IsZoneSpawnDamageImmune)
+                    { if (nearMissReason == null) nearMissReason = "spawn-immune"; continue; }
+                    if (player.PlayerState.CurrentHPWire == 0 && player.PlayerState.SynchHP == 0)
+                    { if (nearMissReason == null) nearMissReason = "player-zero-hp"; continue; }
                     float dx = player.PosX - monsterX;
                     float dy = player.PosY - monsterY;
                     float distSq = dx * dx + dy * dy;
-                    if (distSq > rangeSq || distSq >= nearestSq) continue;
+                    if (distSq > rangeSq)
+                    { if (nearMissReason == null) nearMissReason = "out-of-range"; continue; }
+                    if (distSq >= nearestSq) continue;
                     if (pathMap != null
                         && pathMap.TryCanReachPoint(monsterX, monsterY, player.PosX, player.PosY, out bool canAggroReach)
-                        && !canAggroReach) continue;
+                        && !canAggroReach)
+                    { if (nearMissReason == null) nearMissReason = "pathmap-unreachable"; continue; }
                     nearest = player;
                     nearestSq = distSq;
                 }
 
                 if (nearest != null)
                 {
+                    aggroAcquired++;
                     SyncMonsterWanderClientVisiblePosition(monster, "proximity-acquire");
                     AggroMonster(monster, nearest, "proximity", false);
+                    PropagateAlertShout(monster, "aggro-acquired");
+                    if (ShouldEmitProxiLog($"aggro-{monster.EntityId}", diagNow))
+                        Debug.LogError($"[PROXIMITY-AGGRO] {monster.Name}#{monster.EntityId} acquired player={nearest.Name}#{nearest.EntityId} dist={(float)System.Math.Sqrt(nearestSq):F1} range={range:F1} alerted={monster.AlertedByShout}");
                 }
+                else if (absoluteNearest != null && nearMissReason != null && absoluteNearestSq <= (PROXI_NEAR_MISS_FACTOR * range) * (PROXI_NEAR_MISS_FACTOR * range))
+                {
+                    if (ShouldEmitProxiLog($"miss-{monster.EntityId}-{nearMissReason}", diagNow))
+                    {
+                        float distActual = (float)System.Math.Sqrt(absoluteNearestSq);
+                        Debug.LogError($"[PROXIMITY-MISS] {monster.Name}#{monster.EntityId} reason={nearMissReason} closestPlayer={absoluteNearest.Name}#{absoluteNearest.EntityId} dist={distActual:F1} range={range:F1} mobPos=({monsterX:F1},{monsterY:F1}) playerPos=({absoluteNearest.PosX:F1},{absoluteNearest.PosY:F1})");
+                    }
+                }
+            }
+
+            if (diagNow - _proxiTickLastEmitTime >= PROXI_TICK_LOG_INTERVAL_S)
+            {
+                _proxiTickLastEmitTime = diagNow;
+                Debug.LogError($"[PROXIMITY-TICK] players={_players.Count} mobs={totalMobs} eligible={eligibleMobs} aggro'd-already={skipAggroTriggered} hasTarget={skipHasTarget} dead={skipDead} noRange={skipNoRange} acquired-this-tick={aggroAcquired}");
             }
         }
 
+        // Shout propagation — when a mob aggros, alert nearby mobs within ShoutRange.
+        // Mirrors retail's "mob shouts when engaging combat" mechanic. Per Ghidra
+        // MonsterBehavior2::AreEnemiesNearby, the alerted flag at [Desc+0x86] widens
+        // the scan to [+0x80] (ShoutRange) instead of [+0x88] (AggroRange). Alerted
+        // mobs become eligible to aggro the player on their next proximity tick if
+        // player is within ShoutRange. The alert is one-hop (doesn't re-propagate to
+        // avoid the entire zone aggroing from a single trigger).
+        private void PropagateAlertShout(Monster shouter, string reason)
+        {
+            if (shouter == null || shouter.ShoutRange <= 0f) return;
+            float shoutRangeSq = shouter.ShoutRange * shouter.ShoutRange;
+            int alertedCount = 0;
+            foreach (var other in _activeMonsters.Values)
+            {
+                if (other == null || other == shouter) continue;
+                if (!other.IsAlive) continue;
+                if (other.AggroTriggered) continue;          // already in combat
+                if (other.AlertedByShout) continue;          // already alerted (one-hop only)
+                if (!string.Equals(other.ZoneName, shouter.ZoneName, StringComparison.OrdinalIgnoreCase)) continue;
+                float dx = other.PosX - shouter.PosX;
+                float dy = other.PosY - shouter.PosY;
+                float distSq = dx * dx + dy * dy;
+                if (distSq > shoutRangeSq) continue;
+                other.AlertedByShout = true;
+                alertedCount++;
+            }
+            if (alertedCount > 0)
+                Debug.LogError($"[ALERT-SHOUT] {shouter.Name}#{shouter.EntityId} reason={reason} shoutRange={shouter.ShoutRange:F0} alerted={alertedCount}");
+        }
+
+        // Two-stage aggro v2 2026-05-27: Ghidra MonsterBehavior2::AreEnemiesNearby uses
+        // [Desc+0x88] (AggroRange ~20) by default and [Desc+0x80] (ShoutRange ~300) when
+        // the mob's runtime alert byte ([Desc+0x86]==2) is set. Alert is set when an
+        // adjacent mob shouts (= aggros and propagates to neighbors within ShoutRange).
+        // First-pass uses bare AggroRange (matches retail's "player must walk into melee"
+        // behavior). When a mob aggros, ApplyAlertShout() propagates the alert to nearby
+        // mobs (mirrors retail shout mechanic). Confirmed via 2026-05-26 user gameplay
+        // reference video: mobs aggro at melee range, then nearby mobs alert and chain-aggro.
         private float ResolveMonsterTargetSearchRange(Monster monster, bool hasPathMap)
         {
             if (monster == null) return 0f;
-            if (!hasPathMap && monster.AggroRange > 0f) return monster.AggroRange;
-            if (monster.PerceptionRange > 0f) return monster.PerceptionRange;
-            return monster.AggroRange;
+            // Alerted mobs (received a shout from a neighbor) use the wider ShoutRange.
+            // We use ShoutRange (~300) here, not PerceptionRange (~500) — the [Desc+0x80]
+            // field is most plausibly ShoutRange per .gc inheritance + spawn log values.
+            if (monster.AlertedByShout && monster.ShoutRange > 0f)
+                return monster.ShoutRange;
+            // Default: tight AggroRange. Player must walk into melee to trigger initial aggro.
+            if (monster.AggroRange > 0f) return monster.AggroRange;
+            return 0f;
         }
 
         private void ProcessMonsterMovement(float deltaTime)
@@ -3661,9 +3969,72 @@ namespace DungeonRunners.Combat
                 float step = Mathf.Min(Mathf.Max(0f, dist - allowedRange), speed * deltaTime);
                 if (step <= 0f) continue;
 
-                monster.PosX += dx / dist * step;
-                monster.PosY += dy / dist * step;
-                monster.Heading = Mathf.Atan2(dy, dx) * Mathf.Rad2Deg;
+                float prevMobX = monster.PosX;
+                float prevMobY = monster.PosY;
+
+                // PA1.3: legacy chase math — plain float, straight-line, no obstacle routing.
+                float legacyNewX = prevMobX + dx / dist * step;
+                float legacyNewY = prevMobY + dy / dist * step;
+                float legacyHeading = Mathf.Atan2(dy, dx) * Mathf.Rad2Deg;
+
+                // PA1.3: optional UnitMoverSim chase — Fixed32, Pathfinder-aware (if a PathMap
+                // is attached), collision-slide. Runs only when the cutover flag is on OR
+                // shadow mode is on. Sync'd from authoritative monster.PosX/Y each tick so
+                // it operates as a pure compute step rather than carrying drift.
+                float moverNewX = legacyNewX, moverNewY = legacyNewY;
+                bool moverRan = false;
+                if (monster.Mover != null && (UseUnitMoverForChase || EnableChaseMoverShadow))
+                {
+                    var mover = monster.Mover;
+                    mover.PosX = Fixed32.FromFloat(prevMobX);
+                    mover.PosY = Fixed32.FromFloat(prevMobY);
+                    // PA1.5b: Pass the LEGACY-CLAMPED step as the mover's per-tick
+                    // Speed, not the raw speed*dt. This makes the mover converge on
+                    // attack range at the same rate as the legacy `step = min(...)`
+                    // computation, eliminating the 2-unit overshoot at the arrive
+                    // boundary that the prior session captured.
+                    mover.Speed = Fixed32.FromFloat(step);
+
+                    int targetXRaw = Fixed32.FromFloat(target.PosX).RawValue;
+                    int targetYRaw = Fixed32.FromFloat(target.PosY).RawValue;
+                    int arriveRadiusRaw = Fixed32.FromFloat(allowedRange).RawValue;
+                    int replanThresholdRaw = Fixed32.FromFloat(3f).RawValue;
+                    const byte replanCooldownTicks = 10;
+
+                    mover.SetChaseTarget(targetXRaw, targetYRaw, arriveRadiusRaw,
+                                         replanCooldownTicks, replanThresholdRaw);
+                    mover.UpdateMovement();
+
+                    moverNewX = mover.PosX.ToFloat();
+                    moverNewY = mover.PosY.ToFloat();
+                    moverRan = true;
+                }
+
+                // PA1.4: shadow-mode delta log (only when shadow is on AND cutover is off).
+                if (moverRan && EnableChaseMoverShadow && !UseUnitMoverForChase
+                    && (_nativeCombatTick % CHASE_MOVER_DIFF_LOG_INTERVAL == 0))
+                {
+                    float ddx = legacyNewX - moverNewX;
+                    float ddy = legacyNewY - moverNewY;
+                    float diff = Mathf.Sqrt(ddx * ddx + ddy * ddy);
+                    Debug.LogError($"[CHASE-MOVER-DIFF] {monster.Name}#{monster.EntityId} " +
+                                   $"legacy=({legacyNewX:F1},{legacyNewY:F1}) " +
+                                   $"mover=({moverNewX:F1},{moverNewY:F1}) " +
+                                   $"delta={diff:F2} dist={dist:F1} range={allowedRange:F1} step={step:F2}");
+                }
+
+                // Authoritative write — cutover routes through mover; default uses legacy.
+                if (moverRan && UseUnitMoverForChase)
+                {
+                    monster.PosX = moverNewX;
+                    monster.PosY = moverNewY;
+                }
+                else
+                {
+                    monster.PosX = legacyNewX;
+                    monster.PosY = legacyNewY;
+                }
+                monster.Heading = legacyHeading;
                 monster.State = MonsterState.Chase;
 
                 float remaining = dist - step;
@@ -3676,14 +4047,42 @@ namespace DungeonRunners.Combat
                 if (emitPositionChanged)
                     OnMonsterPositionChanged?.Invoke(monster);
                 TraceMonsterState(monster, "movement", target, remaining, allowedRange, "move");
+
+                // Stage 3 diagnostic — log chase progress so we can correlate with what user sees
+                // on screen. If server's mob is closing faster than client's visible mob, that's a
+                // source of extra-damage divergence (server starts attacking before client's mob
+                // is in range). Throttled to 1/sec per (mob, target) pair.
+                string chaseKey = $"chase-{monster.EntityId}-{target.EntityId}";
+                if (ShouldEmitProxiLog(chaseKey, Time.time))
+                {
+                    Debug.LogError(
+                        $"[CHASE-TICK] {monster.Name}#{monster.EntityId} → player#{target.EntityId} " +
+                        $"mob=({prevMobX:F1},{prevMobY:F1})→({monster.PosX:F1},{monster.PosY:F1}) " +
+                        $"player=({target.PosX:F1},{target.PosY:F1}) " +
+                        $"dist={dist:F1}→{remaining:F1} step={step:F1} speed={speed:F1} " +
+                        $"attackRange={allowedRange:F1} state={monster.State} dt={deltaTime:F3}");
+                }
             }
         }
 
+        // Chase-context speed resolver. Called only from ProcessMonsterMovement and from the
+        // projectile-impact predictor — both assume the mob is moving toward a combat target,
+        // not wandering. The authored `.gc` data carries TWO speeds per mob:
+        //   * `Speed`     → loaded into Monster.MoveSpeed via GetAuthoredMoveSpeed (chase/run)
+        //   * `WalkSpeed` → loaded into Monster.WalkSpeed via GetAuthoredWalkSpeed (idle wander)
+        // Previously this returned WalkSpeed first, which made server's chase 2.2× slower than
+        // the client's (Pup: 25 walk vs 55 chase). Result: server's mob never closed to melee
+        // range while client's mob was actively swinging on the player — the simulator's first
+        // HIT lagged client's by ~1.6-2.0 seconds on a typical aggro acquisition. Diagnostic
+        // evidence: [CHASE-TICK] logs 2026-05-26 showed server mob at dist=50+ while popup
+        // confirmed client locally took damage in melee.
+        // WanderSimulator handles its own walk speed directly via monster.WalkSpeed; it does
+        // NOT route through this function.
         private static float ResolveMonsterMovementSpeed(Monster monster)
         {
             if (monster == null) return 0f;
-            if (monster.WalkSpeed > 0f) return monster.WalkSpeed;
-            if (monster.MoveSpeed > 0f) return monster.MoveSpeed;
+            if (monster.MoveSpeed > 0f) return monster.MoveSpeed;   // chase/run speed (= authored Speed)
+            if (monster.WalkSpeed > 0f) return monster.WalkSpeed;   // fallback for mobs missing Speed
             return 0f;
         }
 
@@ -4054,6 +4453,79 @@ namespace DungeonRunners.Combat
             UpdateNativeMaintenance(deltaTime);
         }
 
+        // ── Section 10d: server-side mob→player combat tick ────────────────
+        // Drives MonsterAttackController. Aggregates ticks at 30Hz to match the
+        // sim's native rate. Provider+accumulator are lazy/state-only so legacy
+        // damage paths are unaffected (controller's EnableServerMobDamage flag is
+        // false by default, so this only emits [MOB-SWING] logs until validated).
+
+        private CombatPlayerDamageTargetProvider _mobDamageTargetProvider;
+        private float _mobCombatTickAccumulator;
+
+        public bool TryGetCombatPlayerForController(uint entityId, out CombatPlayer player)
+            => _players.TryGetValue(entityId, out player);
+
+        private void RunServerMobCombatTick(float deltaTime)
+        {
+            if (!_roomRngInitialized || _roomRng == null) return;
+            int activeCount = MonsterAttackController.Instance.ActiveMobCount;
+            int attackingCount = MonsterAttackController.Instance.AttackingMobCount;
+
+            if (VerboseMobCtrlTick)
+            {
+                float now = Time.time;
+                if (now - _mobCtrlDiagLastTime >= 3f)
+                {
+                    _mobCtrlDiagLastTime = now;
+                    Debug.LogError($"[MOB-CTRL-DIAG] active={activeCount} attacking={attackingCount} rngReady={_roomRngInitialized}");
+                }
+            }
+
+            if (activeCount == 0) return;
+
+            if (_mobDamageTargetProvider == null)
+                _mobDamageTargetProvider = new CombatPlayerDamageTargetProvider(this);
+
+            _mobCombatTickAccumulator += deltaTime;
+            int ticks = Mathf.FloorToInt(_mobCombatTickAccumulator / NATIVE_UNIT_TICK_INTERVAL);
+            if (ticks <= 0) return;
+            _mobCombatTickAccumulator -= ticks * NATIVE_UNIT_TICK_INTERVAL;
+
+            for (int i = 0; i < ticks; i++)
+                MonsterAttackController.Instance.Tick(_roomRng, _mobDamageTargetProvider);
+        }
+
+        private void RegisterMonsterForServerCombat(Monster monster)
+        {
+            if (monster == null) return;
+            if (!MonsterAttackData.Instance.TryGetProfile(monster.GCType, out var profile))
+            {
+                Debug.LogError($"[MOB-CTRL-REGISTER] no profile for gc='{monster.GCType}' entity={monster.EntityId} — skip");
+                return;
+            }
+            // S10g+S10e: pass monster's rank-resolved authored stats (the spawn pipeline
+            // walks the melee01.rank1 etc. inheritance, so monster.AttackRating reflects
+            // rank1's 0.15 override, not the base creature's 1.0). The Builder uses these
+            // with the MonsterCurves curve lookups to match client-side computeAttributes.
+            var stats = MonsterUnitStatsBuilder.Build(profile, monster.Level,
+                damageModOverride: monster.DamageMod,
+                attackRatingOverride: monster.AttackRating,
+                defenseRatingOverride: monster.DefenseRating);
+            int monsterAttackSpeedKnob = MonsterAttackData.Instance.MonsterAttackSpeed;
+            float weaponCoolDownSec = profile.WeaponCoolDown > 0f ? profile.WeaponCoolDown : monster.AttackCooldown;
+            float attackSpeedScalar = profile.AttackSpeed > 0f ? profile.AttackSpeed : monster.AttackSpeed;
+            // S12: pass monster.AttackRange so the controller can range-gate hallucinated swings
+            // when mob is aggro'd but not actually in melee range of the player.
+            MonsterAttackController.Instance.Register(monster.EntityId, stats, weaponCoolDownSec, attackSpeedScalar, monsterAttackSpeedKnob, monster.AttackRange);
+            Debug.LogError($"[MOB-CTRL-REGISTER] OK gc='{monster.GCType}' entity={monster.EntityId} level={monster.Level} authAR={monster.AttackRating:F2} authDR={monster.DefenseRating:F2} authDmgMod={monster.DamageMod:F2} cool={weaponCoolDownSec:F2}s atkSpeed={attackSpeedScalar:F2} knob={monsterAttackSpeedKnob} stats.AR={stats.BaseAttackRating} stats.DR={stats.BaseDefenseRating} stats.DmgMod={stats.BaseDamageMod}");
+        }
+
+        // Throttled diagnostic — fires every ~3 seconds if any mob is aggro'd, so we
+        // can see whether the controller has registered mobs and a target without
+        // spamming the log per-tick. Set false to silence after diagnosis.
+        public static bool VerboseMobCtrlTick = true;
+        private float _mobCtrlDiagLastTime;
+
         public void UpdateNativeMonsterEntity(uint entityId, float deltaTime, bool allowNewMonsterAttacks)
         {
             UpdateNativeMonsterEntity(entityId, deltaTime, allowNewMonsterAttacks, GetNativeCombatTime());
@@ -4073,6 +4545,7 @@ namespace DungeonRunners.Combat
 
         public void UpdateNativeMaintenance(float deltaTime)
         {
+            RunServerMobCombatTick(deltaTime);
             ProcessNativeDeathLifecycles(deltaTime);
             for (int i = _respawnQueue.Count - 1; i >= 0; i--)
             {
@@ -4145,12 +4618,49 @@ namespace DungeonRunners.Combat
             {
                 if (int.TryParse(lower.Substring(7, 2), out int dungeonNum))
                 {
-                    // dungeon00 = 1, dungeon01 = 5, dungeon02 = 9, etc.
+                    // S10g 2026-05-27: reverted (n+1)*4+1 hypothesis. Two YouTube videos
+                    // confirm Dew Valley mobs are L1 (yellow for L1 player, green for L2 player).
+                    // The x32dbg-captured +0x10C=6 byte is NOT mob level — it's something else.
+                    // baseAR=60 comes from `auth=1.0 × curve(disc=2)=15360 >> 16` independently
+                    // of level. dungeon00 base level stays at 1 to match retail.
                     return (byte)(dungeonNum * 4 + 1);
                 }
             }
 
             return 1;
+        }
+
+        // S10h 2026-05-27: rank-based level lookup. Retail encodes mob level via the
+        // `rankN` suffix on aliased GC paths like `world.dungeon00.mob.melee01.rank1`.
+        // Confirmed by YouTube videos:
+        //   dungeon00_level01 spawns rank1 → mob L1 (zone MinLevel)
+        //   dungeon00_level02 spawns rank2 → mob L4 (zone MaxLevel - 1)
+        //   dungeon00_level03 spawns rank3 → mob L5 (zone MaxLevel)
+        // dungeon00 zone range is 1..5 in `.zone` file. Other dungeons untested —
+        // returns 0 to fall back to legacy logic for non-dungeon00 zones.
+        private byte ResolveMobLevelFromRank(string spawnGcType, string zoneName)
+        {
+            if (string.IsNullOrEmpty(spawnGcType) || string.IsNullOrEmpty(zoneName)) return 0;
+            string spawnLower = spawnGcType.ToLower();
+            string zoneLower = zoneName.ToLower();
+
+            // Only dungeon00 mapping is video-verified so far. Other dungeons fall back.
+            if (!zoneLower.Contains("dungeon00")) return 0;
+
+            // Parse rankN from path tail like "...melee01.rank1"
+            int rankIdx = spawnLower.LastIndexOf(".rank");
+            if (rankIdx < 0 || rankIdx + 5 >= spawnLower.Length) return 0;
+            char digit = spawnLower[rankIdx + 5];
+            if (digit < '1' || digit > '3') return 0;
+
+            // dungeon00 hardcoded mapping (zone MinLevel=1, MaxLevel=5):
+            switch (digit)
+            {
+                case '1': return 1;   // MinLevel
+                case '2': return 4;   // MaxLevel - 1
+                case '3': return 5;   // MaxLevel
+                default: return 0;
+            }
         }
 
         private float GetLeashRangeForTier(string tier)

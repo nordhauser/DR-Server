@@ -1373,6 +1373,10 @@ namespace DungeonRunners.Combat
             monster.AlertSourceEntityId = 0;
             monster.State = MonsterState.Combat;
             if (alignForCombat) AlignMonsterForClientCombat(monster, player);
+            // B5-followup (2026-05-28) position-sync diag: capture mover state at the aggro moment.
+            // If Mover == null at this point, the mob never went through WanderSimulator → ProcessMonsterMovement
+            // will fall into legacy float math (no UnitMoverSim path) which has the in-contact freeze bail.
+            Debug.LogError($"[POS-MOB-MOVER-STATE] mob={monster.EntityId} moverIsNull={monster.Mover == null} state={monster.State} prevPos=({monster.PosX:F1},{monster.PosY:F1}) tgtPos=({player.PosX:F1},{player.PosY:F1})");
             MonsterAttackController.Instance.SetTarget(monster.EntityId, player.EntityId);
             if (firstAggro)
             {
@@ -1456,6 +1460,12 @@ namespace DungeonRunners.Combat
             WanderSimulator.Instance.UnregisterEntity(monster.EntityId);
             monster.AttackPending = false;
             monster.AttackSoundPending = false;
+            // B4.4 fix (2026-05-28): mirror AggroMonster:1376 — register the target with the
+            // deterministic-mirror controller so its Tick() can fire [MOB-SWING]. Without this,
+            // mobs aggro'd via alert/assist (which is most of them in dungeon zones — one mob
+            // triggers proximity, the rest follow via shout/assist) silently bypass the
+            // controller and only the legacy ProcessMonsterAttacks path emits [COMBAT-EVENT].
+            MonsterAttackController.Instance.SetTarget(monster.EntityId, target.EntityId);
             Debug.LogError($"[SERVER-ASSIST] source={alertSource.Name}#{alertSource.EntityId} target={monster.Name}#{monster.EntityId} copiedTarget={target.Name}#{target.EntityId} relation={relation} source={source ?? "unknown"}");
             TraceMonsterState(monster, "assist", target, Distance2D(monster.PosX, monster.PosY, target.PosX, target.PosY), ResolveMonsterEffectiveAttackRange(monster), $"source={alertSource.EntityId} relation={relation}");
             return true;
@@ -1566,10 +1576,14 @@ namespace DungeonRunners.Combat
         public void InitializeRoomRng(uint seed)
         {
             _roomSeed = seed;
-            // Client's processRandomSeed @ 0x005da870 applies +0x44 before passing to
-            // Random::seed. Server must mirror this transform to keep the MT19937 state
-            // aligned with the client (otherwise every roll diverges).
-            uint mtSeed = seed + 0x44;
+            // B4 (2026-05-28) — CORRECTION of prior session's misread.
+            // Client's processRandomSeed @ 0x005DA870 does ADD EAX, 0x44 — but the
+            // x32dbg capture shows EAX is the Random struct base, and 0x44 is the
+            // OFFSET to the inner MT19937 engine (Random_base + 0x44). The seed
+            // VALUE itself goes in raw via ECX, written by Random::seed @ 0x0044B1B0
+            // as `[EAX+0x14] = ECX`. So the MT seed = wireSeed, not wireSeed+0x44.
+            // Captured at BP 0x005DA894: wire=0x50B55876, ECX=0x50B55876.
+            uint mtSeed = seed;
             _roomRng = new MersenneTwister(mtSeed);
             _roomRngInitialized = true;
             Debug.LogError($"[ROOM-RNG] ★ Room RNG initialized with wireSeed=0x{seed:X8} mtSeed=0x{mtSeed:X8}");
@@ -1601,8 +1615,9 @@ namespace DungeonRunners.Combat
             uint previousSeed = _roomSeed;
             int previousPos = _roomRng?.CallsSinceReseed ?? 0;
             _roomSeed = seed;
-            // Apply +0x44 transform to match client's processRandomSeed (see InitializeRoomRng).
-            uint mtSeed = seed + 0x44;
+            // B4 (2026-05-28) — see InitializeRoomRng. 0x44 is a struct offset in
+            // processRandomSeed, NOT a seed-value transform. MT seed = wireSeed raw.
+            uint mtSeed = seed;
             if (_roomRng == null)
             {
                 _roomRng = new MersenneTwister(mtSeed);
@@ -1661,7 +1676,12 @@ namespace DungeonRunners.Combat
             }
             TracePlayerPreSuffixCombatAdvance(playerEntityId, source ?? "FlushPlayerCombatBeforeSync", deltaTime, nativeDelta, elapsed, dueTicks, consumedTicks, previousAdvanceTime, nextAdvanceTime, nativeNow);
             AdvanceMonsterModifierRuntime(_roomRng, nativeNow, source ?? "FlushPlayerCombatBeforeSync");
-            ProcessMonsterAttacks(0f, playerEntityId, false, null, nativeNow);
+            // Phase 3 cutover gate (B4.5, 2026-05-28): when MonsterAttackController is the
+            // authoritative server-side mob damage source, skip legacy ProcessMonsterAttacks to
+            // avoid double-RNG-consumption from _roomRng. MAC becomes the sole consumer →
+            // r1/r2/r3 align with client → B4.2 byte-parity verifiable.
+            if (!MonsterAttackController.EnableServerMobDamage)
+                ProcessMonsterAttacks(0f, playerEntityId, false, null, nativeNow);
         }
 
         private float ResolvePlayerCombatAdvanceDelta(uint playerEntityId, float deltaTime, out float elapsed, out int dueTicks, out int consumedTicks, out float previousAdvanceTime, out float nextAdvanceTime)
@@ -3125,7 +3145,9 @@ namespace DungeonRunners.Combat
         public void FlushPlayerAttackCommitsBeforeSync(uint playerEntityId)
         {
             if (playerEntityId == 0) return;
-            ProcessMonsterAttacks(0f, playerEntityId, false, null, GetNativeCombatTime());
+            // Phase 3 cutover gate (B4.5, 2026-05-28): see FlushPlayerCombatBeforeSync.
+            if (!MonsterAttackController.EnableServerMobDamage)
+                ProcessMonsterAttacks(0f, playerEntityId, false, null, GetNativeCombatTime());
         }
 
         public void CancelMonsterPendingAttack(Monster monster, string reason)
@@ -3726,6 +3748,45 @@ namespace DungeonRunners.Combat
             // Stage 2 diagnostic: throttled tick-entry log so we can confirm Update is invoking us
             float diagNow = Time.time;
 
+            // B5-followup (2026-05-28) position-sync diag: once per 5 seconds, dump the nearest-5 mobs
+            // to each player + the player's own position. Compare against client view (what the user
+            // visually sees attacking them) to identify which specific mob positions are stale on server.
+            if (diagNow - _posMobDumpLastTime >= 5.0f)
+            {
+                _posMobDumpLastTime = diagNow;
+                foreach (var p in _players.Values)
+                {
+                    if (p == null) continue;
+                    var nearest = new List<(Monster m, float distSq)>();
+                    foreach (var m in _activeMonsters.Values)
+                    {
+                        if (m == null || !m.IsAlive) continue;
+                        float dx = m.PosX - p.PosX;
+                        float dy = m.PosY - p.PosY;
+                        nearest.Add((m, dx * dx + dy * dy));
+                    }
+                    nearest.Sort((a, b) => a.distSq.CompareTo(b.distSq));
+                    var sb = new System.Text.StringBuilder();
+                    sb.Append($"[POS-MOB-DUMP] player#{p.EntityId} pos=({p.PosX:F1},{p.PosY:F1}) nearest5=[");
+                    for (int i = 0; i < 5 && i < nearest.Count; i++)
+                    {
+                        var (m, dsq) = nearest[i];
+                        if (i > 0) sb.Append(", ");
+                        sb.Append($"mob#{m.EntityId}@({m.PosX:F1},{m.PosY:F1})d={Mathf.Sqrt(dsq):F1}aggro={m.AggroTriggered}state={m.State}");
+                    }
+                    sb.Append("]");
+                    Debug.LogError(sb.ToString());
+                }
+            }
+
+            // B4.3 (2026-05-28): unconditional entry probe — independent of throttle / players-count
+            // gating below. Tells us whether ProcessProximityAggro is being called at all.
+            if (diagNow - _proxiEntryProbeLastTime >= 3.0f)
+            {
+                _proxiEntryProbeLastTime = diagNow;
+                Debug.LogError($"[PROXIMITY-ENTRY] players={_players.Count} onlyMonster={(onlyMonster != null ? onlyMonster.EntityId.ToString() : "all")} t={diagNow:F2}");
+            }
+
             // [PLAYER-POS] diagnostic — log server's tracked player position every second per player.
             // Lets us correlate user's actual movement to server's view. If server's view stops
             // updating while the user is walking, that confirms position-tracking lag as a separate
@@ -3910,6 +3971,10 @@ namespace DungeonRunners.Combat
             ProcessMonsterMovement(deltaTime, playerEntityId, onlyMonster, true);
         }
 
+        private static int _posTraceCounter;
+        private static int _posMobWriteCounter;
+        private static float _posMobDumpLastTime;
+        private static float _proxiEntryProbeLastTime;
         private void ProcessMonsterMovement(float deltaTime, uint playerEntityId, Monster onlyMonster, bool emitPositionChanged)
         {
             if (deltaTime <= 0f) return;
@@ -3917,14 +3982,46 @@ namespace DungeonRunners.Combat
             var pathMaps = new Dictionary<string, PathMap>(StringComparer.OrdinalIgnoreCase);
             foreach (var monster in SelectMonsters(onlyMonster))
             {
-                if (!monster.IsAlive || !monster.AggroTriggered || monster.TargetId == 0) continue;
-                if (playerEntityId != 0 && monster.TargetId != playerEntityId) continue;
-                if (!_players.TryGetValue(monster.TargetId, out var target) || target == null || !target.IsAlive || target.PlayerState == null) continue;
-                if (target.PlayerState.CurrentHPWire == 0 && target.PlayerState.SynchHP == 0) continue;
-                if (monster.AttackPending) continue;
+                // B4.2 diag (2026-05-28): trace why monster.PosX isn't updating for in-combat mobs.
+                // Trace any mob with a non-zero TargetId (= the one(s) actively engaged) — throttled.
+                bool tracePos = monster != null && monster.TargetId != 0 && (_posTraceCounter++ % 30 == 0);
+                if (!monster.IsAlive || !monster.AggroTriggered || monster.TargetId == 0)
+                {
+                    if (tracePos) Debug.LogError($"[POS-TRACE] mob#{monster?.EntityId} BAIL-A alive={monster?.IsAlive} aggro={monster?.AggroTriggered} targetId={monster?.TargetId}");
+                    continue;
+                }
+                if (playerEntityId != 0 && monster.TargetId != playerEntityId)
+                {
+                    if (tracePos) Debug.LogError($"[POS-TRACE] mob#{monster.EntityId} BAIL-B onlyPid={playerEntityId} myTarget={monster.TargetId}");
+                    continue;
+                }
+                if (!_players.TryGetValue(monster.TargetId, out var target) || target == null || !target.IsAlive || target.PlayerState == null)
+                {
+                    if (tracePos) Debug.LogError($"[POS-TRACE] mob#{monster.EntityId} BAIL-C targetMissing targetId={monster.TargetId}");
+                    continue;
+                }
+                if (target.PlayerState.CurrentHPWire == 0 && target.PlayerState.SynchHP == 0)
+                {
+                    if (tracePos) Debug.LogError($"[POS-TRACE] mob#{monster.EntityId} BAIL-D targetDead");
+                    continue;
+                }
+                // B4.3 fix (2026-05-28): do NOT bail on AttackPending. Combat mobs chain
+                // attacks back-to-back, so AttackPending is true continuously → server's
+                // Monster.PosX/PosY freezes at the position where the attack cycle began.
+                // The in-range check at the next gate (line 3956) already prevents movement
+                // when mob is in attack range, so AttackPending is redundant gating. Per-tick
+                // chase step is tiny (speed × deltaTime, ~0.08u at 60Hz) so position tracks
+                // the player smoothly without disrupting attack animations.
+                // Old behavior preserved for trace visibility only:
+                if (monster.AttackPending && tracePos)
+                    Debug.LogError($"[POS-TRACE] mob#{monster.EntityId} PROCEED-DURING-ATTACK mobPos=({monster.PosX:F1},{monster.PosY:F1}) tgtPos=({target.PosX:F1},{target.PosY:F1})");
 
                 float allowedRange = ResolveMonsterEffectiveAttackRange(monster);
-                if (allowedRange <= 0f) continue;
+                if (allowedRange <= 0f)
+                {
+                    if (tracePos) Debug.LogError($"[POS-TRACE] mob#{monster.EntityId} BAIL-F allowedRange<=0 range={allowedRange}");
+                    continue;
+                }
 
                 float dx = target.PosX - monster.PosX;
                 float dy = target.PosY - monster.PosY;
@@ -3942,6 +4039,7 @@ namespace DungeonRunners.Combat
                     && pathMap.TryCanReachPoint(monster.PosX, monster.PosY, target.PosX, target.PosY, out bool canMoveReach)
                     && !canMoveReach)
                 {
+                    if (tracePos) Debug.LogError($"[POS-TRACE] mob#{monster.EntityId} BAIL-G path-blocked from=({monster.PosX:F1},{monster.PosY:F1}) to=({target.PosX:F1},{target.PosY:F1}) dist={dist:F1}");
                     ClearMonsterCombatContact(monster, target);
                     if (monster.State == MonsterState.Combat)
                         monster.State = MonsterState.Chase;
@@ -3950,6 +4048,7 @@ namespace DungeonRunners.Combat
                 }
                 if (dist <= allowedRange + NATIVE_CONTACT_RANGE_EPSILON || dist <= 0.001f)
                 {
+                    if (tracePos) Debug.LogError($"[POS-TRACE] mob#{monster.EntityId} BAIL-H in-contact dist={dist:F1} range={allowedRange:F1}");
                     if (monster.State == MonsterState.Chase)
                         monster.State = MonsterState.Combat;
                     monster.CombatContactTargetId = target.EntityId;
@@ -3961,13 +4060,19 @@ namespace DungeonRunners.Combat
                 float speed = ResolveMonsterMovementSpeed(monster);
                 if (speed <= 0f)
                 {
+                    if (tracePos) Debug.LogError($"[POS-TRACE] mob#{monster.EntityId} BAIL-I no-speed speed={speed}");
                     monster.State = MonsterState.Chase;
                     TraceMonsterState(monster, "movement", target, dist, allowedRange, "no-speed");
                     continue;
                 }
 
                 float step = Mathf.Min(Mathf.Max(0f, dist - allowedRange), speed * deltaTime);
-                if (step <= 0f) continue;
+                if (step <= 0f)
+                {
+                    if (tracePos) Debug.LogError($"[POS-TRACE] mob#{monster.EntityId} BAIL-J step<=0 step={step:F3} dist={dist:F1} range={allowedRange:F1} speed={speed:F1} dt={deltaTime:F3}");
+                    continue;
+                }
+                if (tracePos) Debug.LogError($"[POS-TRACE] mob#{monster.EntityId} CHASE-STEP dist={dist:F1} range={allowedRange:F1} step={step:F3} speed={speed:F1}");
 
                 float prevMobX = monster.PosX;
                 float prevMobY = monster.PosY;
@@ -4028,11 +4133,16 @@ namespace DungeonRunners.Combat
                 {
                     monster.PosX = moverNewX;
                     monster.PosY = moverNewY;
+                    // B5-followup (2026-05-28) position-sync diag
+                    if (_posMobWriteCounter++ % 30 == 0)
+                        Debug.LogError($"[POS-MOB-WRITE] mob={monster.EntityId} writer=mover pos=({moverNewX:F1},{moverNewY:F1}) prev=({prevMobX:F1},{prevMobY:F1}) tgtPos=({target.PosX:F1},{target.PosY:F1}) dist={dist:F1} step={step:F3}");
                 }
                 else
                 {
                     monster.PosX = legacyNewX;
                     monster.PosY = legacyNewY;
+                    if (_posMobWriteCounter++ % 30 == 0)
+                        Debug.LogError($"[POS-MOB-WRITE] mob={monster.EntityId} writer=legacy pos=({legacyNewX:F1},{legacyNewY:F1}) prev=({prevMobX:F1},{prevMobY:F1}) tgtPos=({target.PosX:F1},{target.PosY:F1}) dist={dist:F1} step={step:F3}");
                 }
                 monster.Heading = legacyHeading;
                 monster.State = MonsterState.Chase;
@@ -4514,9 +4624,13 @@ namespace DungeonRunners.Combat
             int monsterAttackSpeedKnob = MonsterAttackData.Instance.MonsterAttackSpeed;
             float weaponCoolDownSec = profile.WeaponCoolDown > 0f ? profile.WeaponCoolDown : monster.AttackCooldown;
             float attackSpeedScalar = profile.AttackSpeed > 0f ? profile.AttackSpeed : monster.AttackSpeed;
-            // S12: pass monster.AttackRange so the controller can range-gate hallucinated swings
-            // when mob is aggro'd but not actually in melee range of the player.
-            MonsterAttackController.Instance.Register(monster.EntityId, stats, weaponCoolDownSec, attackSpeedScalar, monsterAttackSpeedKnob, monster.AttackRange);
+            // S12: pass effective attack range (= weapon range + mob collision radius + avatar
+            // combat radius) so the controller's range gate aligns with ProcessMonsterMovement's
+            // "in-contact" criterion. Using raw monster.AttackRange (e.g. pup=6u) created a
+            // 10-unit dead zone where movement was satisfied (mob settled at 16u contact) but
+            // the controller never fired because dist > 6 (B4.3 fix, 2026-05-28).
+            float effectiveAttackRange = ResolveMonsterEffectiveAttackRange(monster);
+            MonsterAttackController.Instance.Register(monster.EntityId, stats, weaponCoolDownSec, attackSpeedScalar, monsterAttackSpeedKnob, effectiveAttackRange);
             Debug.LogError($"[MOB-CTRL-REGISTER] OK gc='{monster.GCType}' entity={monster.EntityId} level={monster.Level} authAR={monster.AttackRating:F2} authDR={monster.DefenseRating:F2} authDmgMod={monster.DamageMod:F2} cool={weaponCoolDownSec:F2}s atkSpeed={attackSpeedScalar:F2} knob={monsterAttackSpeedKnob} stats.AR={stats.BaseAttackRating} stats.DR={stats.BaseDefenseRating} stats.DmgMod={stats.BaseDamageMod}");
         }
 
@@ -4535,13 +4649,37 @@ namespace DungeonRunners.Combat
         {
             if (!_activeMonsters.TryGetValue(entityId, out var monster))
                 return;
+            // B5-followup (2026-05-28) position-sync diag: snapshot before all sub-process calls, compare after.
+            float posBeforeX = monster.PosX;
+            float posBeforeY = monster.PosY;
+            // B4.2 RNG-drift diag (2026-05-28): per-phase RNG-position snapshots to pinpoint what's
+            // consuming _roomRng outside the MAC swing (which is the only call we expect for byte-parity).
+            // Throttled per mob @ 30 ticks to avoid flooding.
+            bool traceRng = monster.AggroTriggered && (_rngPhaseCounter++ % 30 == 0);
+            int rngPos0 = _roomRng != null ? _roomRng.CallsSinceReseed : 0;
             TraceCombatTick("UpdateNativeMonsterEntity", deltaTime, allowNewMonsterAttacks, monster);
             ProcessProximityAggro(0, monster);
+            int rngPos1 = _roomRng != null ? _roomRng.CallsSinceReseed : 0;
             ProcessMonsterAssistAlerts(monster);
+            int rngPos2 = _roomRng != null ? _roomRng.CallsSinceReseed : 0;
             ProcessMonsterMovement(deltaTime, 0, monster);
+            int rngPos3 = _roomRng != null ? _roomRng.CallsSinceReseed : 0;
             AdvanceMonsterModifierRuntimeForTarget(entityId, _roomRng, nativeNow, "UpdateNativeMonsterEntity");
-            ProcessMonsterAttacks(deltaTime, 0, allowNewMonsterAttacks, monster, nativeNow);
+            int rngPos4 = _roomRng != null ? _roomRng.CallsSinceReseed : 0;
+            // Phase 3 cutover gate (B4.5, 2026-05-28): when MAC is authoritative, skip legacy.
+            if (!MonsterAttackController.EnableServerMobDamage)
+                ProcessMonsterAttacks(deltaTime, 0, allowNewMonsterAttacks, monster, nativeNow);
+            int rngPos5 = _roomRng != null ? _roomRng.CallsSinceReseed : 0;
+            if (traceRng && rngPos5 != rngPos0)
+                Debug.LogError($"[RNG-PHASE] mob={entityId} pre={rngPos0} ProxAggro+={rngPos1 - rngPos0} Assist+={rngPos2 - rngPos1} MoveSim+={rngPos3 - rngPos2} ModRT+={rngPos4 - rngPos3} LegacyAtk+={rngPos5 - rngPos4} total={rngPos5 - rngPos0}");
+            float dx = monster.PosX - posBeforeX;
+            float dy = monster.PosY - posBeforeY;
+            float deltaSq = dx * dx + dy * dy;
+            if (deltaSq > 1f && monster.AggroTriggered && (_posMobChangedCounter++ % 30 == 0))
+                Debug.LogError($"[POS-MOB-CHANGED] mob={entityId} tick=({posBeforeX:F1},{posBeforeY:F1})->({monster.PosX:F1},{monster.PosY:F1}) delta={Mathf.Sqrt(deltaSq):F2}");
         }
+        private static int _rngPhaseCounter;
+        private static int _posMobChangedCounter;
 
         public void UpdateNativeMaintenance(float deltaTime)
         {

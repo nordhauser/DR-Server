@@ -150,6 +150,14 @@ namespace DungeonRunners.Combat
                 ApplyDamageCalls++;
             }
 
+            public uint TotalReflectedToMob;
+            public int ReflectCalls;
+            public void ApplyReflectedDamageToMob(uint mobEntityId, uint playerEntityId, uint wireDamage)
+            {
+                TotalReflectedToMob += wireDamage;
+                ReflectCalls++;
+            }
+
             // S12: tests don't need range gating — return false so the controller
             // treats the entities as "unknown distance" and skips the range check
             // (preserves existing test behavior where mob always swings when target set).

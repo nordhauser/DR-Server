@@ -613,6 +613,34 @@ namespace DungeonRunners.Core
             "[CHASE-MOVER-DIFF]",     // PA1.4: chase shadow-mode UnitMoverSim vs legacy delta
             "[MOVER-DIFF]",           // Phase 6 wander shadow-mode delta (companion to above)
             "[WANDER-SIM]",           // mob wander-sim registration confirmation
+
+            // ── A1.1 PathMap sub-shape-2 verification (2026-05-28) ──
+            // Added to verify Pillar A.1 of the deterministic-mirror plan
+            // (vivid-marinating-pixel). Low volume: selftest fires once at
+            // boot, build fires once per zone enter. Safe to leave on or
+            // remove after A1 verification.
+            "[PATHMAP-BUILD]",        // PathMapBuilder.Build per-zone summary line
+            "[PATHMAPBUILD-SELFTEST]",// boot-time self-test output
+            "[PATHMAP-SWEEP]",        // A1.2: threshold sweep results (off by default, gate via PathMapThresholdSweep.Enabled)
+            "[PATHFINDER-PARITY]",    // A1.2 diag: per-case verdict from PathfinderClientParityTest
+            "[MDC-SELFTEST]",         // C6 (2026-05-28): MonsterDamageComputer.OnQueryApplyDamage parity + roll-count locks
+            "[MOB-REFLECT]",          // C7 (2026-05-28): reflect/thorns delivery back to mob when player has reflect gear
+            "[POS-DIAG]",             // B4.2 (2026-05-28): server-tracked mob/player positions for range-gate diagnostic
+            "[POS-TRACE]",            // B4.2 (2026-05-28): why ProcessMonsterMovement bails out for a specific mob
+            "[POS-PLAYER-IN]",        // B5-followup (2026-05-28): inbound 0x02 player movement packets
+            "[POS-MOB-IN-0x65]",      // B5-followup (2026-05-28): inbound 0x65 mob position packets (for aggro'd mobs)
+            "[POS-MOB-WRITE]",        // B5-followup (2026-05-28): ProcessMonsterMovement position writes (mover|legacy)
+            "[POS-MOB-CHANGED]",      // B5-followup (2026-05-28): per-tick position-delta race detector
+            "[POS-MOB-MOVER-STATE]",  // B5-followup (2026-05-28): mover state at aggro time (null = no UnitMoverSim path)
+            "[POS-MOB-DUMP]",         // B5-followup (2026-05-28): nearest-5 mobs to each player every 5s (compare to client-visible attackers)
+            "[RNG-PHASE]",            // B4.2 (2026-05-28): per-phase RNG consumption inside UpdateNativeMonsterEntity to find drift source
+            "[PROXIMITY-ENTRY]",      // B4.3 (2026-05-28): unconditional probe to prove ProcessProximityAggro is called
+            "[PROXIMITY-MISS]",       // B4.4 (2026-05-28): per-mob near-miss with gating reason (spawn-immune / out-of-range / pathmap-unreachable / player-zero-hp)
+            "[PROXIMITY-AGGRO]",      // B4.4 (2026-05-28): successful proximity aggro acquisition
+            "[CC-CHECK]",             // C4 skeleton: per-swing CC roll-shape diagnostic (no RNG consumed, no effect)
+            "[WEAPON-CYCLE]",         // C4 verification: confirms player attack reached the swing tick
+            "[LAYOUT-SEED]",          // session diag: maze layout seed for parity comparison
+            "[ATTACK]",               // C4 verification: confirms UseTarget reached the attack handler
         };
 
         private static bool IsFocusedLog(string line)

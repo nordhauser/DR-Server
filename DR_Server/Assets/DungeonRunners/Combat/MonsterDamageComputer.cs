@@ -229,6 +229,134 @@ namespace DungeonRunners.Combat
             return (ushort)(((long)result * attacker.DamageModScale) >> 16);
         }
 
+        /// <summary>
+        /// C6 — port of client <c>Unit::onQueryApplyDamage @ 0x0050b9c0</c>. Applies
+        /// DamageTakenMod (unit[+0x2C4]) and damage-type elemental resistance
+        /// (unit[+0xC8 + resIndex*4] for damage types 3..7) to the inbound damage
+        /// before the HP write. Returns the adjusted damage; sets <paramref name="resisted"/>
+        /// when the elemental check fully nullified the damage.
+        ///
+        /// <para>
+        /// Client formula (decompiled, exact):
+        /// <code>
+        /// if (DamageTakenMod != 100): damage = damage * DamageTakenMod / 100
+        /// switch (damageType):
+        ///   case 3..7: resMult = unit[+0xC8 + resIndex*4]
+        ///     if (resMult != 100):
+        ///       if (resMult &lt; 1): damage = 0; flags |= RESISTED
+        ///       else: damage = damage * resMult / 100
+        ///   default (0..2): no elemental resistance
+        /// </code>
+        /// </para>
+        ///
+        /// <para>
+        /// Server stores resists as percent-resisted (.gc convention: 0 = none, 100 = immune)
+        /// while the client stores them as a damage multiplier (100 = full damage, 0 = immune).
+        /// Inversion happens here: <c>resMult = 100 - percentResisted</c>. The <c>&lt; 1</c>
+        /// branch then triggers naturally when authored resist ≥ 100.
+        /// </para>
+        ///
+        /// <para>
+        /// CheckDamageResist (chance-based, gated by event flag bit 8) is NOT ported here —
+        /// it's modifier-driven and belongs to C7 (shields / reflect). Bit 8 is never set on
+        /// vanilla mob basic attacks.
+        /// </para>
+        /// </summary>
+        public static uint OnQueryApplyDamage(uint damageWire, byte damageType, PlayerUnitStats target, out bool resisted)
+        {
+            resisted = false;
+            if (damageWire == 0 || target == null) return damageWire;
+
+            long damage = damageWire;
+
+            // Step 1 — DamageTakenMod
+            if (target.DamageTakenMod != 100)
+            {
+                damage = (damage * target.DamageTakenMod) / 100;
+            }
+
+            // Step 2 — elemental resistance (types 3..7 only)
+            int authoredResist;
+            switch (damageType)
+            {
+                case 3: authoredResist = target.FireResist; break;
+                case 4: authoredResist = target.IceResist; break;
+                case 5: authoredResist = target.PoisonResist; break;
+                case 6: authoredResist = target.DivineResist; break;
+                case 7: authoredResist = target.ShadowResist; break;
+                default:
+                    return damage < 0 ? 0u : (uint)damage;  // physical types: no elemental res
+            }
+
+            // Invert .gc percent-resisted → client damage multiplier
+            int resMult = 100 - authoredResist;
+            if (resMult != 100)
+            {
+                if (resMult < 1)
+                {
+                    resisted = true;
+                    return 0u;
+                }
+                damage = (damage * resMult) / 100;
+            }
+
+            return damage < 0 ? 0u : (uint)damage;
+        }
+
+        /// <summary>
+        /// C7 — port of client reflect/thorns logic inside <c>Unit::onApplyDamage @ 0x0050BE50</c>.
+        /// When a unit takes damage with <paramref name="eventKind"/> != 4, the unit's reflect
+        /// fields determine how much damage to push back to the attacker.
+        ///
+        /// <para>
+        /// Formula (exact Ghidra port):
+        /// <code>
+        /// if (eventKind == 4) return 0   // already reflected — no recursion
+        /// reflectPct = base
+        /// if (eventKind == 1) reflectPct += meleeBonus
+        /// elif (eventKind == 2) reflectPct += rangedBonus
+        /// if (bothPlayers) reflectPct /= 10  // PvP divide (out of scope here)
+        /// if (reflectPct &lt;= 0) return 0
+        /// reflected = (incoming * reflectPct) / 100
+        /// </code>
+        /// </para>
+        ///
+        /// <para>
+        /// Event-kind mapping from <c>Weapon::applyDamage</c>:
+        ///  - 1 = melee
+        ///  - 2 = ranged
+        ///  - 3 = spell (no separate offset — uses base only)
+        ///  - 4 = "already a reflected damage" sentinel (prevents infinite ping-pong)
+        ///  - 0 / other = base only
+        /// </para>
+        /// </summary>
+        public static uint ComputeReflectedDamage(uint incomingDamageWire, byte eventKind,
+            int baseReflectPct, int meleeReflectBonusPct, int rangedReflectBonusPct)
+        {
+            if (eventKind == 4 || incomingDamageWire == 0) return 0;
+            int reflectPct = baseReflectPct;
+            if (eventKind == 1) reflectPct += meleeReflectBonusPct;
+            else if (eventKind == 2) reflectPct += rangedReflectBonusPct;
+            if (reflectPct <= 0) return 0;
+            long reflected = ((long)incomingDamageWire * reflectPct) / 100;
+            return reflected > 0 ? (uint)reflected : 0;
+        }
+
+        /// <summary>
+        /// Map a MonsterDamageComputer attackStyle byte to the client's event-kind value.
+        /// AttackStyle 1 / 5 / 6 / 8 are melee variants → kind 1. AttackStyle 3 / 9 / 13 are
+        /// ranged → kind 2. Default → 0 (base reflect only).
+        /// </summary>
+        public static byte EventKindFromAttackStyle(byte attackStyle)
+        {
+            switch (attackStyle)
+            {
+                case 1: case 5: case 6: case 8: return 1;  // melee
+                case 3: case 9: case 13: return 2;          // ranged
+                default: return 0;
+            }
+        }
+
         public static void ComputeDamageRange(MonsterUnitStats attacker, ushort dmgMod, ushort dmgBonus, out int min, out int max)
         {
             // x32dbg disasm of computeDamageRange @ 0x00598ED0 + 1 swing capture against
@@ -328,6 +456,12 @@ namespace DungeonRunners.Combat
         public int[] DamageTypeBonus = new int[8];   // +0x234, 0x240, 0x24C, 0x258, 0x268, 0x278, 0x288, 0x298
         public int[] DamageTypeMod = new int[8];     // +0x230, 0x23C, 0x248, 0x254, 0x264, 0x274, 0x284, 0x294
 
+        // C7 — reflect (thorns). Mobs typically don't reflect (no equipment), but some
+        // bosses may carry authored ReflectDamage values. Default 0 for vanilla mobs.
+        public int BaseReflectPct;           // unit[+0x134]
+        public int MeleeReflectBonusPct;     // unit[+0x194]
+        public int RangedReflectBonusPct;    // unit[+0x1B8]
+
         // unit[+0x300]
         public int DamageModScale = 256;  // 256 = 1.0× (no scale)
 
@@ -349,5 +483,24 @@ namespace DungeonRunners.Combat
         public int MeleeDefenseRatingMod;    // +0x190
         public int RangedDefenseRating;      // +0x1B0
         public int RangedDefenseRatingMod;   // +0x1B4
+
+        // C6 — damage-side modifiers, applied via OnQueryApplyDamage before the HP write.
+        // Semantics match the authored .gc convention used by Monster: 0 = no resistance,
+        // 100 = full immunity. The helper inverts to the client's [+0x2DC..+0x2EC] multiplier
+        // form (multiplier = 100 - resist) before applying the formula.
+        public int DamageTakenMod = 100;     // unit[+0x2C4] — 100 = take full damage
+        public int FireResist;               // damage type 3 (Fire) -> unit[+0x2DC] inverted
+        public int IceResist;                // damage type 4 (Cold/Ice) -> unit[+0x2E0]
+        public int PoisonResist;             // damage type 5 (Lightning/Poison) -> unit[+0x2E4]
+        public int DivineResist;             // damage type 6 (Holy/Divine) -> unit[+0x2E8]
+        public int ShadowResist;             // damage type 7 (Dark/Shadow) -> unit[+0x2EC]
+
+        // C7 — reflect (thorns). Populated from equipment modifiers (MeleeDamageReflectB,
+        // RangeDamageReflectB, DamageReflectBonus). Aggregated at attribute-compute time
+        // into unit[+0x134/+0x194/+0x1B8]. Vanilla L1 player = 0 across the board.
+        // Default unit value when no equipment provides it: 0.
+        public int BaseReflectPct;           // unit[+0x134] — applies to all damage kinds
+        public int MeleeReflectBonusPct;     // unit[+0x194] — added to base when event.kind==1 (melee)
+        public int RangedReflectBonusPct;    // unit[+0x1B8] — added to base when event.kind==2 (ranged)
     }
 }

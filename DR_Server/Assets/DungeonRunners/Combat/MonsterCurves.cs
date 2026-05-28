@@ -3,15 +3,19 @@ using UnityEngine;
 namespace DungeonRunners.Combat
 {
     /// <summary>
-    /// Section 10e — retail's `CurveTable` lookups for mob stat caching, extracted
-    /// from `Database/gc/Tables.gc` and verified via x32dbg runtime memory dump.
+    /// Section 10e — retail's `CurveTable` lookups for mob stat caching.
     ///
     /// <para>Mob `Unit::computeAttributes` calls the UnitDesc's getAttackRating /
     /// getDefenseRating / getMaxHealth virtuals, which do:
     /// <code>baseStat = (UnitDesc[+0xD0_or_similar] × CurveTable.GetValue(disc &lt;&lt; 8)) &gt;&gt; 16</code>
     /// where the curve is selected by flag bit 0x10 on `UnitDesc[+0x13C]`:
-    ///  - bit clear: <c>Tables.Monster*</c> (regular mob curves, what we use here)
-    ///  - bit set:   <c>Tables.Henchman*</c> (player-summoned units)
+    ///  - bit clear: PvE units (mobs + player avatars) — use the curves below
+    ///  - bit set:   PvP units (arena/posse) — different curves at <c>0x932dc0/0x932dc8</c>
+    ///
+    /// Note 2026-05-28: bit 0x10 = "PvP context", NOT "player-summoned henchman" as
+    /// the prior comment said. Verified live with HW execute BP on getAttackRating —
+    /// all PvE units (players AND mobs in dungeon00) take the bit-clear branch, the
+    /// Henchman/PvP cache never populates during normal play.
     /// </para>
     ///
     /// <para>Curve "level" input = the unit's discriminator byte shifted left 8 (so disc=2
@@ -21,6 +25,37 @@ namespace DungeonRunners.Combat
     /// <para>Verified empirically: dungeon00_level01 pup with rank1 override AR=0.15
     /// gives cached baseAR = (38 × curve(disc=2)) &gt;&gt; 16 = (38 × 102362) &gt;&gt; 16 = 59
     /// ≈ 60 (matches x32dbg capture).</para>
+    ///
+    /// <para>
+    /// ★ B1 RESOLVED (2026-05-28, late session — full struct walk):
+    /// Walked the live CurveTable tree from <c>0x932da0</c> → parent <c>0x158E0CB8</c>:
+    ///  - Parent vtable <c>0x008A2D98</c>, count=4 children, sorted-entry array at
+    ///    <c>+0x6C/+0x70</c>, min/max level clamps at <c>+0x7C/+0x80</c> (=1.0/110.0 Fixed32).
+    ///  - The 2 sorted entries ARE the leaf sub-CurveTables at parent <c>+0x18/+0x1C</c>
+    ///    (vtable <c>0x008A2E48</c>), each carrying level at <c>+0x68</c> and value at <c>+0x6C</c>.
+    ///  - Entry A: <c>+0x68=0x00000100</c> (L=1.0), <c>+0x6C=0x00006400</c> (V=25,600 Fixed32)
+    ///  - Entry B: <c>+0x68=0x00006E00</c> (L=110.0), <c>+0x6C=0x00802000</c> (V=8,396,800 Fixed32)
+    ///
+    /// THESE EXACTLY MATCH THE ENCODED CURVE BELOW. Prior session's memory misread
+    /// the parent's <c>+0x6C/+0x70</c> as raw values; they're actually pointers to the
+    /// 2 sorted entries. The "60.5 / 5452" numbers in prior memory came from the
+    /// shared-pool struct at parent <c>+0x14</c> (vtable <c>0x008A8A48</c>) which is a
+    /// different table entirely, not part of MonsterAR.
+    ///
+    /// Hand-verification with client's exact <c>CurveTableEntry::getValue @ 0x005d4050</c>:
+    ///   curve(disc=2) = 25,600 + (8,371,200 × 601 / 65,536) = 102,369
+    ///   baseAR(pup, auth=0.15) = (38 × 102,369) >> 16 = 59 ✓ matches Section 10c capture
+    ///
+    /// MonsterDefenseRating walked the same way (parent at <c>0x932da8</c> → leaves):
+    ///   - L1.0, V=8,960  (35 × 256 ✓)
+    ///   - L15.0, V=73,472 (287 × 256 ✓)
+    ///   - L110.0, V=790,272 (3087 × 256 ✓)
+    /// All 3 encoded DR values match the live struct byte-for-byte.
+    ///
+    /// The Interp helper below now uses the client's exact double-truncation formula
+    /// (frac computed and truncated first, then applied to value delta and truncated
+    /// again) instead of single-truncation, for byte-for-byte parity at the edges.
+    /// </para>
     /// </summary>
     public static class MonsterCurves
     {
@@ -58,7 +93,12 @@ namespace DungeonRunners.Combat
             (100 * 256,  5452 * 256),
         };
 
-        // Linear-interpolate a sorted (key, value) table at the given key.
+        // Linear-interpolate a sorted (key, value) table at the given key, using the
+        // client's exact double-truncation formula from CurveTableEntry::getValue
+        // (Ghidra @ 0x005d4050):
+        //   frac65536 = ((key - lo.level) * 65536) / (hi.level - lo.level)   // truncate #1
+        //   delta     = (hi.value - lo.value) * frac65536
+        //   result    = lo.value + delta / 65536                              // truncate #2
         // Both key and value are Fixed32 (× 256). Returns Fixed32.
         private static int Interp(int keyFixed, (int LevelFixed, int ValueFixed)[] curve)
         {
@@ -73,8 +113,9 @@ namespace DungeonRunners.Combat
                     int v0 = curve[i - 1].ValueFixed;
                     int k1 = curve[i].LevelFixed;
                     int v1 = curve[i].ValueFixed;
-                    long frac = (long)(keyFixed - k0) * (long)(v1 - v0) / (k1 - k0);
-                    return v0 + (int)frac;
+                    long frac65536 = ((long)(keyFixed - k0) * 65536L) / (k1 - k0);
+                    long delta = (long)(v1 - v0) * frac65536;
+                    return v0 + (int)(delta / 65536L);
                 }
             }
             return curve[curve.Length - 1].ValueFixed;

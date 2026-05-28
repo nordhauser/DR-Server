@@ -41,6 +41,7 @@ namespace DungeonRunners.Combat
             public int LastDamageDealt;
             public float AttackRangeSquared;        // weapon attack range² for the range gate (0 = unset)
             public int OutOfRangeSkipCount;         // diagnostic counter for skipped swings
+            public int LastSwingRngPos;             // B4.2 diag: _roomRng.CallsSinceReseed after the last swing for this mob
         }
 
         private readonly Dictionary<uint, MobCombatState> _states =
@@ -52,7 +53,7 @@ namespace DungeonRunners.Combat
         /// shadow-mode while we validate roll-by-roll against client captures. Flip to true
         /// once <c>[MOB-SWING]</c> logs prove the server's damage values match the client's.
         /// </summary>
-        public static bool EnableServerMobDamage = false;
+        public static bool EnableServerMobDamage = true;
 
         public int ActiveMobCount => _states.Count;
 
@@ -77,7 +78,12 @@ namespace DungeonRunners.Combat
 
             // Pre-square the attack range so Tick avoids sqrt on the hot path.
             // 0 = unset (no range gate; behaves like pre-S11.2 — swings whenever target set).
-            float attackRangeSquared = attackRange > 0f ? attackRange * attackRange : 0f;
+            // B4.4 fix (2026-05-28): include CombatManager.NATIVE_CONTACT_RANGE_EPSILON (1/16)
+            // tolerance to match the legacy contact check. Without it, mobs settling exactly at
+            // contact-range failed the controller's strict `distSq > rangeSq` by sub-unit
+            // floating-point drift — e.g. range=14, distSq=196.1 > 196.0 → silent SKIP forever.
+            float rangeWithEpsilon = attackRange + 1f / 16f;
+            float attackRangeSquared = attackRange > 0f ? rangeWithEpsilon * rangeWithEpsilon : 0f;
 
             _states[mobEntityId] = new MobCombatState
             {
@@ -151,23 +157,59 @@ namespace DungeonRunners.Combat
                     continue;
                 }
                 s.OutOfRangeSkipCount = 0;
+                // B4.2 diag (2026-05-28): snapshot rng position before and after the swing.
+                // Δ between consecutive swings tells us how many _roomRng calls happened in
+                // between (the controller does exactly 3 per swing; anything extra = drift source).
+                int rngPosBefore = rng.CallsSinceReseed;
                 var result = MonsterDamageComputer.ComputeSwing(s.Stats, targetStats, rng);
+                int rngPosAfter = rng.CallsSinceReseed;
+                int gapSinceLastSwing = s.LastSwingRngPos > 0 ? rngPosBefore - s.LastSwingRngPos : 0;
+                s.LastSwingRngPos = rngPosAfter;
                 s.SwingCount++;
                 s.LastDamageDealt = result.Damage;
+
+                // C6 — apply DamageTakenMod + elemental resistance, mirroring the client's
+                // Unit::onQueryApplyDamage which runs on the target side before HP write.
+                uint preResistDamage = result.Damage > 0 ? (uint)result.Damage : 0u;
+                uint postResistDamage = MonsterDamageComputer.OnQueryApplyDamage(
+                    preResistDamage, result.DamageType, targetStats, out bool resisted);
+
+                // C7 — reflect (thorns). Use the player's reflect fields against the mob's
+                // attack-style-derived event kind. v1: 0 for vanilla L1 player (no equipment
+                // modifiers wired yet); lights up when player gear with MeleeDamageReflectB /
+                // RangeDamageReflectB / DamageReflectBonus modifiers is mirrored into stats.
+                byte eventKind = MonsterDamageComputer.EventKindFromAttackStyle(result.AttackStyle);
+                uint reflectedToMob = MonsterDamageComputer.ComputeReflectedDamage(
+                    postResistDamage, eventKind,
+                    targetStats.BaseReflectPct, targetStats.MeleeReflectBonusPct, targetStats.RangedReflectBonusPct);
+
                 Debug.LogError(
                     $"[MOB-SWING] mob={s.MobEntityId} -> player={s.TargetPlayerEntityId} " +
                     $"hit={result.Hit} blocked={result.Blocked} crit={result.Crit} dmg={result.Damage} " +
                     $"AR={result.AttackerAR} DR={result.TargetDR} hitChance={result.HitChanceScaled} " +
                     $"r1={result.R1Hit:X8} r2={result.R2Block:X8} r3={result.R3Damage:X8} " +
                     $"hitRoll={result.HitRoll} blockRoll={result.BlockRoll} dmgRange=[{result.DamageMin}..{result.DamageMax}] " +
-                    $"applyDamage={EnableServerMobDamage}");
+                    $"rngPosBefore={rngPosBefore} rngPosAfter={rngPosAfter} mobSwingRngGap={gapSinceLastSwing} " +
+                    $"dmgType={result.DamageType} postResist={postResistDamage} resisted={resisted} " +
+                    $"reflected={reflectedToMob} applyDamage={EnableServerMobDamage}");
 
                 // Section 10 task S10.5: apply damage to the player when feature flag is on
                 // and the swing landed unblocked. The wire damage value is in 256-fixed-point
                 // (256 = 1 HP); PlayerState.TakeRuntimeDamage expects this format directly.
-                if (EnableServerMobDamage && result.Hit && !result.Blocked && result.Damage > 0)
+                if (EnableServerMobDamage && result.Hit && !result.Blocked && postResistDamage > 0)
                 {
-                    targets.ApplyDamage(s.TargetPlayerEntityId, (uint)result.Damage);
+                    targets.ApplyDamage(s.TargetPlayerEntityId, postResistDamage);
+
+                    // C7: apply reflected damage to the mob via the player→mob path. Only
+                    // fires when player has non-zero reflect (gated by reflectedToMob > 0).
+                    if (reflectedToMob > 0)
+                    {
+                        Debug.LogError(
+                            $"[MOB-REFLECT] mob={s.MobEntityId} <- player={s.TargetPlayerEntityId} " +
+                            $"incomingToPlayer={postResistDamage} reflectPct={(eventKind == 1 ? targetStats.BaseReflectPct + targetStats.MeleeReflectBonusPct : eventKind == 2 ? targetStats.BaseReflectPct + targetStats.RangedReflectBonusPct : targetStats.BaseReflectPct)} " +
+                            $"reflected={reflectedToMob} eventKind={eventKind}");
+                        targets.ApplyReflectedDamageToMob(s.MobEntityId, s.TargetPlayerEntityId, reflectedToMob);
+                    }
                 }
 
                 s.CooldownTicks = s.SwingPeriodTicks;
@@ -191,6 +233,16 @@ namespace DungeonRunners.Combat
             /// <c>PlayerState.TakeRuntimeDamage(wireDamage)</c>.
             /// </summary>
             void ApplyDamage(uint entityId, uint wireDamage);
+
+            /// <summary>
+            /// C7 reflect (thorns): when the mob's attack lands on a player who carries
+            /// reflect equipment, send <paramref name="wireDamage"/> back to the mob.
+            /// Implementation should route to <see cref="CombatManager.ApplyNativePlayerDamageToMonsterWire"/>
+            /// (which applies the mob's DamageTakenMod + death detection). Called only when
+            /// <see cref="MonsterAttackController.EnableServerMobDamage"/> is true AND the
+            /// player carries non-zero reflect — i.e. once equipment-modifier mirror is wired.
+            /// </summary>
+            void ApplyReflectedDamageToMob(uint mobEntityId, uint playerEntityId, uint wireDamage);
 
             /// <summary>
             /// S12 range gate: distance² between mob and player on the XY plane (world units).

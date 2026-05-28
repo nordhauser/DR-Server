@@ -16,10 +16,13 @@ namespace DungeonRunners.Combat
     /// <para>
     /// Known approximations:
     /// <list type="bullet">
-    /// <item>baseAR = round(AttackRating × level × WeaponDamagePerLevel)</item>
-    /// <item>baseDR = round(DefenseRating × level × WeaponDamagePerLevel)</item>
-    /// <item>baseDamageMod = round(DamageMod × 100) — fraction → percent</item>
-    /// <item>BaseCriticalChance = GlobalKnobs.MonsterCriticalChance</item>
+    /// <item>baseAR = MonsterCurves.ComputeBaseAR via PvE CurveTable + linear interp
+    ///   (curve anchors in MonsterCurves.cs; see B1 follow-up note there)</item>
+    /// <item>baseDR = MonsterCurves.ComputeBaseDR (same shape as AR)</item>
+    /// <item>baseDamageMod = ComputeBaseDamageMod via exact UnitDesc::getDamageMod
+    ///   transform (see comment at the helper body)</item>
+    /// <item>BaseCriticalChance = ComputeBaseCriticalChance from .gc CriticalChance
+    ///   × RPGSettings.MonsterCriticalChance &gt;&gt; 16 (B3 — yields 0 for current mobs)</item>
     /// <item>CritMultiplier = 150 (1.5×) — placeholder</item>
     /// <item>BlockChance = 0 (mobs don't block)</item>
     /// <item>All per-style fields default 0 (vanilla mobs have no special bonuses)</item>
@@ -64,9 +67,12 @@ namespace DungeonRunners.Combat
                 BaseAttackRating = MonsterCurves.ComputeBaseAR(effectiveAttackRating, discriminator),
                 BaseAttackRatingMod = 0,
                 BaseDamageMod = ComputeBaseDamageMod(effectiveDamageMod),  // 10d: exact transform
-                // 10d: monsters cache as 0 per captured pup (despite .gc CritChance=1.25).
-                // RPGSettings monster-disc scalar likely small. Set 0 directly.
-                BaseCriticalChance = 0,
+                // B3 (2026-05-28 plan vivid-marinating-pixel): compute from authored
+                // .gc CritChance via the client's formula instead of hardcoding 0.
+                // For current mobs (CritChance ≤ ~1.25) the result is still 0 because
+                // (1.25 × 256 × 6) >> 16 = 0, matching the captured pup cache value.
+                // For future high-CritChance mobs the formula yields a positive value.
+                BaseCriticalChance = ComputeBaseCriticalChance(profile.CritChance),
                 CritMultiplier = 150,  // placeholder 1.5× — TODO confirm via decompile
                 BaseDamageBonus = 0,
 
@@ -135,12 +141,29 @@ namespace DungeonRunners.Combat
         // 0.5 value already, NOT 1.0 from the .gc inheritance chain). Therefore we apply
         // the formula DIRECTLY to MonsterAttackProfile.DamageMod with no pre-scale —
         // adding a 0.5× pre-scale would double the halving.
-        private static int ComputeBaseDamageMod(float authoredDamageMod)
+        public static int ComputeBaseDamageMod(float authoredDamageMod)
         {
             int authoredFixed = Mathf.RoundToInt(authoredDamageMod * 256f);
             if (authoredFixed - 256 == 256) return 0;  // 2.0 special-case in client
             long delta = (long)(authoredFixed - 256);
             return (int)((delta * 25600L) >> 16);
+        }
+
+        /// <summary>
+        /// Client formula: <c>cachedCritChance = (authoredCritChance_Fixed32 × RPGSettings.MonsterCriticalChance) &gt;&gt; 16</c>.
+        /// <para>
+        /// Per AUDIT_COMBAT/10 and the pup x32dbg capture, the GlobalKnobs
+        /// <c>MonsterCriticalChance</c> scalar (=6 in retail) shrinks small authored
+        /// CritChance values (~1.25) to 0 after the &gt;&gt;16 shift. Yields a positive
+        /// number only when authored ≳ 43 (where 43 × 256 × 6 ≈ 65536).
+        /// </para>
+        /// </summary>
+        private static int ComputeBaseCriticalChance(float authoredCritChance)
+        {
+            if (authoredCritChance <= 0f) return 0;
+            long authoredFixed = (long)Mathf.RoundToInt(authoredCritChance * 256f);
+            long globalScalar = (long)MonsterAttackData.Instance.MonsterCriticalChance;
+            return (int)((authoredFixed * globalScalar) >> 16);
         }
 
     }

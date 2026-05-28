@@ -11403,6 +11403,10 @@ namespace DungeonRunners.Networking
                     if (avatarId != 0)
                     {
                         CombatManager.Instance.UpdatePlayerPosition(avatarId, lastX, lastY);
+                        // B5-followup (2026-05-28) position-sync diag: every 0x02 packet that reaches here
+                        // logs the inbound position. Compare timestamps to detect 0x02-packet starvation
+                        // (no packets during "idle in combat" = no position updates = stale position).
+                        Debug.LogError($"[POS-PLAYER-IN] avatarId={avatarId} pos=({lastX:F1},{lastY:F1}) packetMoves={moveCount} sessionId={sessionId} t={Time.time:F2}");
                     }
                     // Throttled proximity check for goto quest objectives (1x/sec max)
                     CheckGotoProximity(conn);
@@ -11716,6 +11720,12 @@ namespace DungeonRunners.Networking
                                         _allEntityPositions[(ushort)monster.EntityId] = (monster.PosX, monster.PosY, monster.PosZ);
                                     applied++;
                                     if (VerbosePacketLogging) Debug.LogError($"[MONSTER-MOVE-0x65] {monster.Name} cid={componentId} flags=0x{moveFlags:X2} session={sessionId} pos=({monster.PosX:F1},{monster.PosY:F1}) heading={monster.Heading:F1}");
+                                    // B5-followup (2026-05-28) position-sync diag: always log for combat-engaged mobs.
+                                    // If aggro'd mobs RECEIVE 0x65 writes, the race vs ProcessMonsterMovement is live.
+                                    // If they DON'T receive 0x65 writes once aggro'd, the client has gone client-side-local and
+                                    // server-driven mover sim is sole writer.
+                                    if (monster.AggroTriggered)
+                                        Debug.LogError($"[POS-MOB-IN-0x65] mob={monster.EntityId} pos=({monster.PosX:F1},{monster.PosY:F1}) sessionId={sessionId} aggro=true targetId={monster.TargetId} t={Time.time:F2}");
                                 }
                                 if (applied != moveCount)
                                     Debug.LogError($"[MONSTER-MOVE-0x65] {monster.Name} cid={componentId} expected={moveCount} applied={applied} remaining={reader.Remaining}");
@@ -18429,7 +18439,11 @@ namespace DungeonRunners.Networking
             // 0x44 NOT sent — sets member+0x30=1 @0x5F9236 which breaks HP bars.
         }
 
-        /// <summary>Send health/mana (0x4B) for all members to all members.</summary>
+        /// <summary>Send health/mana (0x4B) for all members to all members.
+        /// C9 of plan vivid-marinating-pixel (2026-05-28): real per-member HP/MP from
+        /// PlayerState instead of the previous hardcoded (15, 15) full-HP placeholder.
+        /// Result: party-frame health bars on other members' clients reflect actual
+        /// server-side HP, not always-full.</summary>
         private void SendGroupHealthToAll(Managers.Group group)
         {
             foreach (var m in group.Members)
@@ -18438,7 +18452,8 @@ namespace DungeonRunners.Networking
                 var mc = FindConnectionById(m.ConnId);
                 if (mc == null) continue;
                 uint charSqlId = GetCharSqlId(mc);
-                byte[] healthPacket = GroupPackets.BuildMemberHealthMana(charSqlId, 15, 15);
+                ResolveMemberHpMpFraction(mc, out byte hp15, out byte mp15);
+                byte[] healthPacket = GroupPackets.BuildMemberHealthMana(charSqlId, hp15, mp15);
                 foreach (var target in group.Members)
                 {
                     if (!target.IsOnline) continue;
@@ -18446,6 +18461,47 @@ namespace DungeonRunners.Networking
                     if (tc != null) SendToClient(tc, healthPacket);
                 }
             }
+        }
+
+        /// <summary>C9 follow-up hook point: broadcast ONE player's current HP/MP to
+        /// their group. Call after PlayerState.TakeRuntimeDamage / regen tick / heal /
+        /// any event that mutates the player's HP or mana enough to bump the 1/15
+        /// fraction. Safe no-op if the player isn't grouped.</summary>
+        public void BroadcastPlayerHealthToGroup(RRConnection conn)
+        {
+            if (conn == null) return;
+            var group = Managers.GroupManager.Instance.GetGroupForConn(conn.ConnId);
+            if (group == null || group.Members.Count == 0) return;
+
+            uint charSqlId = GetCharSqlId(conn);
+            ResolveMemberHpMpFraction(conn, out byte hp15, out byte mp15);
+            byte[] healthPacket = GroupPackets.BuildMemberHealthMana(charSqlId, hp15, mp15);
+            foreach (var target in group.Members)
+            {
+                if (!target.IsOnline) continue;
+                var tc = FindConnectionById(target.ConnId);
+                if (tc != null) SendToClient(tc, healthPacket);
+            }
+        }
+
+        /// <summary>Resolve a connection's current HP/MP into the 1/15 fractions the
+        /// 0x4B packet format expects. Falls back to (15, 15) if PlayerState is
+        /// unavailable (matches the previous hardcoded behavior — safe default for
+        /// joins before stats finalize).</summary>
+        private void ResolveMemberHpMpFraction(RRConnection conn, out byte hp15, out byte mp15)
+        {
+            hp15 = 15;
+            mp15 = 15;
+            if (conn == null) return;
+            PlayerState ps = GetPlayerState(conn.ConnId.ToString());
+            if (ps == null) return;
+
+            uint maxHp = ps.MaxHPWire;
+            uint maxMp = ps.MaxManaWire;
+            if (maxHp > 0)
+                hp15 = (byte)System.Math.Min(15u, (ulong)ps.CurrentHPWire * 15UL / maxHp);
+            if (maxMp > 0)
+                mp15 = (byte)System.Math.Min(15u, (ulong)ps.CurrentManaWire * 15UL / maxMp);
         }
 
         private void HandleGroupChannel(RRConnection conn, byte messageType, byte[] data)

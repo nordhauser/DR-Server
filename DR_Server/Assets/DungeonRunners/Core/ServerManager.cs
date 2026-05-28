@@ -80,6 +80,9 @@ namespace DungeonRunners.Core
                 DungeonRunners.Core.PathfinderSelfTest.RunAll();
                 DungeonRunners.Combat.UnitMoverSimSelfTest.RunAll();
                 DungeonRunners.Core.PathfinderClientParityTest.RunAll();
+                // C6 — lock in OnQueryApplyDamage semantics + roll-count / determinism
+                // (touched 2026-05-28 to force Unity domain reload after first attempt cached old DLL)
+                DungeonRunners.Combat.MonsterDamageComputerSelfTest.RunAll();
             }
             catch (Exception ex)
             {

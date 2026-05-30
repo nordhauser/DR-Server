@@ -81,9 +81,9 @@ namespace DungeonRunners.Core
 
         // ─── Case execution ─────────────────────────────────────────────────
 
-        private enum CaseStatus { StrongPass, SoftPass, Fail, Skipped }
+        internal enum CaseStatus { StrongPass, SoftPass, Fail, Skipped }
 
-        private struct Verdict
+        internal struct Verdict
         {
             public CaseStatus Status;
             public string Detail;
@@ -97,6 +97,16 @@ namespace DungeonRunners.Core
             var pm = PathMapManager.Instance.GetPathMap(c.Zone);
             if (pm == null && !string.IsNullOrEmpty(c.BaseZone))
                 pm = PathMapManager.Instance.FindByPrefix(c.BaseZone);
+            return RunCaseAgainst(c, pm);
+        }
+
+        /// <summary>
+        /// Score a single capture against an arbitrary <see cref="PathMap"/>. Used by
+        /// <see cref="PathMapThresholdSweep"/> to evaluate candidate builds without
+        /// mutating <see cref="PathMapManager"/>.
+        /// </summary>
+        internal static Verdict RunCaseAgainst(Capture c, PathMap pm)
+        {
             if (pm == null)
                 return new Verdict { Status = CaseStatus.Skipped, Detail = $"no PathMap for zone='{c.Zone}' or baseZone='{c.BaseZone}'" };
 
@@ -145,7 +155,7 @@ namespace DungeonRunners.Core
 
         // ─── Capture loading ─────────────────────────────────────────────────
 
-        private sealed class Capture
+        internal sealed class Capture
         {
             public string Name = "";
             public string Zone = "";
@@ -157,7 +167,7 @@ namespace DungeonRunners.Core
             public List<(int x, int y)> Waypoints = new List<(int, int)>();
         }
 
-        private static List<Capture> LoadCaptures(string path)
+        internal static List<Capture> LoadCaptures(string path)
         {
             var cases = new List<Capture>();
             Capture current = null;
@@ -229,7 +239,7 @@ namespace DungeonRunners.Core
             return cases;
         }
 
-        private static string ResolveCapturePath()
+        internal static string ResolveCapturePath()
         {
             string envPath = Environment.GetEnvironmentVariable("DR_PATHFINDER_CAPTURES");
             if (!string.IsNullOrEmpty(envPath) && File.Exists(envPath)) return envPath;

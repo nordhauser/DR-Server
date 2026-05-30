@@ -41,6 +41,23 @@ namespace DungeonRunners.Combat
         public static bool EnableChaseMoverShadow = false;
         private const int CHASE_MOVER_DIFF_LOG_INTERVAL = 5;
 
+        // 2026-05-29 deprecation cleanup: position-sync + proximity diagnostics that were
+        // load-bearing during yesterday's B5 stand-up are now gated behind this flag. Keep
+        // false during normal play; flip true only to repro a position-tracking bug.
+        // Gates: [POS-MOB-DUMP], [POS-TRACE] (10+ sites), [PROXIMITY-MISS], [PROXIMITY-AGGRO],
+        // [RNG-PHASE], [MOB-CTRL-DIAG], [MDC-SELFTEST] runtime body (boot self-test still runs).
+        public static bool VerbosePositionTrace = false;
+
+        // 2026-05-29 deterministic-mirror via client RNG-state sharing. When true,
+        // server fast-forwards _roomRng to match client's reported Random::generate
+        // call counter (via opcode 0x66 from DungeonRunners_RNG.exe) before each
+        // MonsterAttackController swing, achieving byte-identical r1/r2/r3 without
+        // mirroring every client RNG consumer (behavior states, fidgets, etc.).
+        // Latest observed client absolute call count for the room RNG.
+        public static bool UseClientRngSync = true;
+        private uint _latestClientRoomRngCount;
+        public uint LatestClientRoomRngCount => _latestClientRoomRngCount;
+
         private Dictionary<uint, Monster> _activeMonsters = new Dictionary<uint, Monster>();
         private Dictionary<uint, CombatPlayer> _players = new Dictionary<uint, CombatPlayer>();
         private readonly List<uint> _nativeEntityOrder = new List<uint>();
@@ -1373,10 +1390,6 @@ namespace DungeonRunners.Combat
             monster.AlertSourceEntityId = 0;
             monster.State = MonsterState.Combat;
             if (alignForCombat) AlignMonsterForClientCombat(monster, player);
-            // B5-followup (2026-05-28) position-sync diag: capture mover state at the aggro moment.
-            // If Mover == null at this point, the mob never went through WanderSimulator → ProcessMonsterMovement
-            // will fall into legacy float math (no UnitMoverSim path) which has the in-contact freeze bail.
-            Debug.LogError($"[POS-MOB-MOVER-STATE] mob={monster.EntityId} moverIsNull={monster.Mover == null} state={monster.State} prevPos=({monster.PosX:F1},{monster.PosY:F1}) tgtPos=({player.PosX:F1},{player.PosY:F1})");
             MonsterAttackController.Instance.SetTarget(monster.EntityId, player.EntityId);
             if (firstAggro)
             {
@@ -1564,6 +1577,208 @@ namespace DungeonRunners.Combat
 
         public int RoomRngCallsSinceReseed => _roomRng?.CallsSinceReseed ?? 0;
 
+        /// <summary>
+        /// Called from opcode 0x66 handler when DungeonRunners_RNG.exe reports its
+        /// absolute Random::generate call counter. Stores latest value for use by
+        /// FastForwardRoomRngToClient. Older state values are ignored (counter is
+        /// monotonically increasing on the client).
+        /// </summary>
+        public void ObserveClientRoomRngState(uint clientCount)
+        {
+            if (clientCount > _latestClientRoomRngCount)
+                _latestClientRoomRngCount = clientCount;
+        }
+
+        /// <summary>
+        /// Reset client state tracker on room re-seed (opcode 0x0C). Called from
+        /// InitializeRoomRng. After reseed, both server and client start from 0.
+        /// </summary>
+        public void ResetClientRngStateOnReseed()
+        {
+            _latestClientRoomRngCount = 0;
+            _playerRngMirrors.Clear();   // P1: per-player RNG mirrors reset with the room seed
+        }
+
+        // ───────────────── P1: Client-event-replay (per-player RNG mirrors) ─────────────────
+        // 2026-05-29. Real combat is always multi-mob with the player moving/attacking, so the
+        // single shared _roomRng + "fast-forward to latest count" model cannot byte-match. The
+        // RNG.exe client reports each mob→player swing as (mobId, absoluteRngCount); the server
+        // replays it against THAT player's own RNG mirror, seeded with the room's 0x0C seed.
+        // This decouples players (multiplayer-capable) and removes multi-mob batch misalignment.
+        // Gated OFF by default; flip true (+ run the event source) to enable client-event-replay.
+        // RNG/replay is byte-match-PROVEN (2026-05-30, r1 identical client↔server). Remaining gap:
+        // wire the replayed per-swing damage into the authoritative OUTBOUND HP push (the
+        // ApplyDamage->TakeRuntimeDamage result must reach outboundHP/0x36, not just runtime HP).
+        // Dormant by default. RNG byte-match is PROVEN (2026-05-30, re-test: client x64dbg == independent MT
+        // == server replay, on multiple seeds + a 26/26 pack). The outbound-HP wiring is CONFIRMED working
+        // (suffix carries the damaged value). The remaining popup is STAT-DECISION DRIFT, not RNG/HP-push:
+        // PlayerUnitStatsBuilder stubs the player's defensive stats, so ComputeSwing's hit/miss/block/crit
+        // decisions diverge from the client -> server applies damage the client didn't. See
+        // [[project-dr-reborn-stat-parity-root-cause-2026-05-30]]. Flip true only with the event source running.
+        public static bool UseClientEventReplay = true;   // TEMP 2026-05-30 — mob→player stat-parity validation; REVERT to false after
+
+        // Per-player room-RNG mirror — SEPARATE from the instance-level _roomRng (spawns/drops/
+        // world) so a player's replay fast-forward never disturbs world RNG. Cleared on reseed.
+        private readonly Dictionary<uint, MersenneTwister> _playerRngMirrors =
+            new Dictionary<uint, MersenneTwister>();
+
+        private MersenneTwister GetOrCreatePlayerRngMirror(uint playerEntityId)
+        {
+            if (!_roomRngInitialized) return null;
+            if (!_playerRngMirrors.TryGetValue(playerEntityId, out var m))
+            {
+                m = new MersenneTwister(_roomSeed);  // same seed the client got via opcode 0x0C
+                _playerRngMirrors[playerEntityId] = m;
+            }
+            return m;
+        }
+
+        /// <summary>
+        /// P1 — replay one client-reported mob→player swing. Fast-forwards the player's RNG
+        /// mirror to <paramref name="clientCount"/>, runs ComputeSwing with the mob's stats,
+        /// and applies the damage — byte-identical to what the client computed at that position.
+        /// No-op unless <see cref="UseClientEventReplay"/> is on. Safe to call for any player/mob.
+        /// </summary>
+        public void ApplyClientSwingEvent(uint playerEntityId, uint mobId, uint clientCount)
+        {
+            if (!UseClientEventReplay) return;
+            var mirror = GetOrCreatePlayerRngMirror(playerEntityId);
+            if (mirror == null) return;
+
+            uint serverPos = (uint)mirror.CallsSinceReseed;
+            if (clientCount < serverPos)
+            {
+                // Out-of-order / stale event — MT can't rewind. Skip (sanity cap).
+                Debug.LogError($"[REPLAY-SWING] SKIP stale player={playerEntityId} mob={mobId} clientCount={clientCount} < mirrorPos={serverPos}");
+                return;
+            }
+            int delta = (int)(clientCount - serverPos);
+            const int MaxFastForward = 50000;
+            if (delta > MaxFastForward)
+            {
+                Debug.LogError($"[REPLAY-SWING] SKIP delta={delta} exceeds cap {MaxFastForward} player={playerEntityId} mob={mobId}");
+                return;
+            }
+            for (int i = 0; i < delta; i++) mirror.Generate();
+
+            if (!MonsterAttackController.Instance.TryGetState(mobId, out var s))
+            {
+                Debug.LogError($"[REPLAY-SWING] SKIP no mob state player={playerEntityId} mob={mobId} (consumed {delta} to pos {mirror.CallsSinceReseed})");
+                return;
+            }
+            if (_mobDamageTargetProvider == null)
+                _mobDamageTargetProvider = new CombatPlayerDamageTargetProvider(this);
+            if (!_mobDamageTargetProvider.TryGetTarget(playerEntityId, out var targetStats))
+            {
+                Debug.LogError($"[REPLAY-SWING] SKIP no target player={playerEntityId} mob={mobId}");
+                return;
+            }
+
+            int rngPosBefore = mirror.CallsSinceReseed;
+            var result = MonsterDamageComputer.ComputeSwing(s.Stats, targetStats, mirror);
+            int rngPosAfter = mirror.CallsSinceReseed;
+
+            uint preResist = result.Damage > 0 ? (uint)result.Damage : 0u;
+            uint postResist = MonsterDamageComputer.OnQueryApplyDamage(
+                preResist, result.DamageType, targetStats, out bool resisted);
+
+            Debug.LogError(
+                $"[REPLAY-SWING] player={playerEntityId} mob={mobId} clientCount={clientCount} consumed={delta} " +
+                $"hit={result.Hit} blocked={result.Blocked} crit={result.Crit} dmg={result.Damage} " +
+                $"r1={result.R1Hit:X8} r2={result.R2Block:X8} r3={result.R3Damage:X8} " +
+                $"hitRoll={result.HitRoll} blockRoll={result.BlockRoll} " +
+                $"rngPosBefore={rngPosBefore} rngPosAfter={rngPosAfter} " +
+                $"dmgType={result.DamageType} postResist={postResist} resisted={resisted} " +
+                $"AR={result.AttackerAR} DR={result.TargetDR} hitCS={result.HitChanceScaled} attackStyle={result.AttackStyle}");
+
+            if (result.Hit && !result.Blocked && postResist > 0)
+                _mobDamageTargetProvider.ApplyDamage(playerEntityId, postResist);
+        }
+
+        // P2 test channel: drain "mobId count" lines from the bridge file and replay each as a
+        // client swing event for the (single, test) connected player. No-op unless replay is on.
+        // The bridge appends events + clears the file on reseed; we reset on file-shrink. The real
+        // path (P3) replaces this file channel with the per-swing 0x66 network emission.
+        public static string TestClientEventFile = @"C:\Users\tippi\Documents\Dungeon Runners\WORK\client_rng_events.txt";
+        private int _testEventLastLine = 0;
+        public void TryProcessTestEventFile()
+        {
+            if (!UseClientEventReplay || string.IsNullOrEmpty(TestClientEventFile)) return;
+            if (_players.Count == 0) return;
+            uint playerId = 0;
+            foreach (var kv in _players) { playerId = kv.Key; break; }  // single-player test
+            if (playerId == 0) return;
+            try
+            {
+                if (!System.IO.File.Exists(TestClientEventFile)) { _testEventLastLine = 0; return; }
+                var lines = System.IO.File.ReadAllLines(TestClientEventFile);
+                if (lines.Length < _testEventLastLine) _testEventLastLine = 0;  // file cleared (reseed)
+                for (int i = _testEventLastLine; i < lines.Length; i++)
+                {
+                    var parts = lines[i].Split(' ');
+                    if (parts.Length >= 2 &&
+                        uint.TryParse(parts[0], out uint mobId) &&
+                        uint.TryParse(parts[1], out uint count))
+                    {
+                        ApplyClientSwingEvent(playerId, mobId, count);
+                    }
+                }
+                _testEventLastLine = lines.Length;
+            }
+            catch { /* file IO races with the bridge are non-fatal in test mode */ }
+        }
+
+        /// <summary>
+        /// Test mode for validating fast-forward without the client byte-patch.
+        /// When TestClientRngFile is non-empty, server reads the latest integer
+        /// from that file before each swing and uses it as the client count.
+        /// The bot (or a script) writes the file from x32dbg memory reads.
+        /// Path is read once per swing — adjust file polling frequency at the
+        /// source. Set to empty string to disable.
+        /// </summary>
+        public static string TestClientRngFile = @"C:\Users\tippi\Documents\Dungeon Runners\WORK\client_rng_count.txt";
+
+        private void TryReadTestClientRngFile()
+        {
+            string path = TestClientRngFile;
+            if (string.IsNullOrEmpty(path)) return;
+            try
+            {
+                if (!System.IO.File.Exists(path)) return;
+                string text = System.IO.File.ReadAllText(path).Trim();
+                if (uint.TryParse(text, out uint count))
+                    ObserveClientRoomRngState(count);
+            }
+            catch { /* file IO failures are non-fatal in test mode */ }
+        }
+
+        /// <summary>
+        /// Fast-forward _roomRng to the latest reported client position by consuming
+        /// throwaway Generate() calls. Used by MonsterAttackController.Tick just
+        /// before ComputeSwing so server's r1/r2/r3 byte-match client's.
+        /// Returns the number of throwaway generates consumed (= drift at this moment).
+        /// </summary>
+        public int FastForwardRoomRngToClient()
+        {
+            if (!UseClientRngSync || _roomRng == null) return 0;
+            TryReadTestClientRngFile();
+            uint serverCount = (uint)_roomRng.CallsSinceReseed;
+            uint clientCount = _latestClientRoomRngCount;
+            if (clientCount <= serverCount) return 0;
+            int delta = (int)(clientCount - serverCount);
+            // Cap the fast-forward to a sanity limit so a bogus packet can't
+            // exhaust server CPU.
+            const int MaxFastForward = 50000;
+            if (delta > MaxFastForward)
+            {
+                Debug.LogError($"[CLIENT-RNG] FastForward: delta={delta} exceeds cap {MaxFastForward}; refusing");
+                return 0;
+            }
+            for (int i = 0; i < delta; i++) _roomRng.Generate();
+            Debug.LogError($"[CLIENT-RNG] FastForward: server {serverCount} → client {clientCount} (consumed {delta})");
+            return delta;
+        }
+
         // Legacy alias — kept so existing code that references SyncedRandom still compiles
         public MersenneTwister SyncedRandom => _roomRng;
         public uint RandomSeed => _roomSeed;
@@ -1586,6 +1801,7 @@ namespace DungeonRunners.Combat
             uint mtSeed = seed;
             _roomRng = new MersenneTwister(mtSeed);
             _roomRngInitialized = true;
+            ResetClientRngStateOnReseed(); // client's call counter resets at the same seed event
             Debug.LogError($"[ROOM-RNG] ★ Room RNG initialized with wireSeed=0x{seed:X8} mtSeed=0x{mtSeed:X8}");
             Debug.LogError($"[RNG-SEED] room initialize wire=0x{seed:X8} mt=0x{mtSeed:X8} rngPos=0 monsters={_activeMonsters.Count} players={_players.Count}");
         }
@@ -1676,12 +1892,7 @@ namespace DungeonRunners.Combat
             }
             TracePlayerPreSuffixCombatAdvance(playerEntityId, source ?? "FlushPlayerCombatBeforeSync", deltaTime, nativeDelta, elapsed, dueTicks, consumedTicks, previousAdvanceTime, nextAdvanceTime, nativeNow);
             AdvanceMonsterModifierRuntime(_roomRng, nativeNow, source ?? "FlushPlayerCombatBeforeSync");
-            // Phase 3 cutover gate (B4.5, 2026-05-28): when MonsterAttackController is the
-            // authoritative server-side mob damage source, skip legacy ProcessMonsterAttacks to
-            // avoid double-RNG-consumption from _roomRng. MAC becomes the sole consumer →
-            // r1/r2/r3 align with client → B4.2 byte-parity verifiable.
-            if (!MonsterAttackController.EnableServerMobDamage)
-                ProcessMonsterAttacks(0f, playerEntityId, false, null, nativeNow);
+            // Legacy ProcessMonsterAttacks call deleted 2026-05-29 — MAC is authoritative.
         }
 
         private float ResolvePlayerCombatAdvanceDelta(uint playerEntityId, float deltaTime, out float elapsed, out int dueTicks, out int consumedTicks, out float previousAdvanceTime, out float nextAdvanceTime)
@@ -3142,13 +3353,8 @@ namespace DungeonRunners.Combat
             return gateRaw;
         }
 
-        public void FlushPlayerAttackCommitsBeforeSync(uint playerEntityId)
-        {
-            if (playerEntityId == 0) return;
-            // Phase 3 cutover gate (B4.5, 2026-05-28): see FlushPlayerCombatBeforeSync.
-            if (!MonsterAttackController.EnableServerMobDamage)
-                ProcessMonsterAttacks(0f, playerEntityId, false, null, GetNativeCombatTime());
-        }
+        // FlushPlayerAttackCommitsBeforeSync deleted 2026-05-29: had no callers and only
+        // wrapped a deleted legacy ProcessMonsterAttacks gate. MAC handles attack commits.
 
         public void CancelMonsterPendingAttack(Monster monster, string reason)
         {
@@ -3748,10 +3954,9 @@ namespace DungeonRunners.Combat
             // Stage 2 diagnostic: throttled tick-entry log so we can confirm Update is invoking us
             float diagNow = Time.time;
 
-            // B5-followup (2026-05-28) position-sync diag: once per 5 seconds, dump the nearest-5 mobs
-            // to each player + the player's own position. Compare against client view (what the user
-            // visually sees attacking them) to identify which specific mob positions are stale on server.
-            if (diagNow - _posMobDumpLastTime >= 5.0f)
+            // position-sync diag: once per 5 seconds, dump the nearest-5 mobs to each player.
+            // Compare against client view to identify which specific mob positions are stale on server.
+            if (VerbosePositionTrace && diagNow - _posMobDumpLastTime >= 5.0f)
             {
                 _posMobDumpLastTime = diagNow;
                 foreach (var p in _players.Values)
@@ -3777,14 +3982,6 @@ namespace DungeonRunners.Combat
                     sb.Append("]");
                     Debug.LogError(sb.ToString());
                 }
-            }
-
-            // B4.3 (2026-05-28): unconditional entry probe — independent of throttle / players-count
-            // gating below. Tells us whether ProcessProximityAggro is being called at all.
-            if (diagNow - _proxiEntryProbeLastTime >= 3.0f)
-            {
-                _proxiEntryProbeLastTime = diagNow;
-                Debug.LogError($"[PROXIMITY-ENTRY] players={_players.Count} onlyMonster={(onlyMonster != null ? onlyMonster.EntityId.ToString() : "all")} t={diagNow:F2}");
             }
 
             // [PLAYER-POS] diagnostic — log server's tracked player position every second per player.
@@ -3885,12 +4082,12 @@ namespace DungeonRunners.Combat
                     SyncMonsterWanderClientVisiblePosition(monster, "proximity-acquire");
                     AggroMonster(monster, nearest, "proximity", false);
                     PropagateAlertShout(monster, "aggro-acquired");
-                    if (ShouldEmitProxiLog($"aggro-{monster.EntityId}", diagNow))
+                    if (VerbosePositionTrace && ShouldEmitProxiLog($"aggro-{monster.EntityId}", diagNow))
                         Debug.LogError($"[PROXIMITY-AGGRO] {monster.Name}#{monster.EntityId} acquired player={nearest.Name}#{nearest.EntityId} dist={(float)System.Math.Sqrt(nearestSq):F1} range={range:F1} alerted={monster.AlertedByShout}");
                 }
                 else if (absoluteNearest != null && nearMissReason != null && absoluteNearestSq <= (PROXI_NEAR_MISS_FACTOR * range) * (PROXI_NEAR_MISS_FACTOR * range))
                 {
-                    if (ShouldEmitProxiLog($"miss-{monster.EntityId}-{nearMissReason}", diagNow))
+                    if (VerbosePositionTrace && ShouldEmitProxiLog($"miss-{monster.EntityId}-{nearMissReason}", diagNow))
                     {
                         float distActual = (float)System.Math.Sqrt(absoluteNearestSq);
                         Debug.LogError($"[PROXIMITY-MISS] {monster.Name}#{monster.EntityId} reason={nearMissReason} closestPlayer={absoluteNearest.Name}#{absoluteNearest.EntityId} dist={distActual:F1} range={range:F1} mobPos=({monsterX:F1},{monsterY:F1}) playerPos=({absoluteNearest.PosX:F1},{absoluteNearest.PosY:F1})");
@@ -3972,9 +4169,7 @@ namespace DungeonRunners.Combat
         }
 
         private static int _posTraceCounter;
-        private static int _posMobWriteCounter;
         private static float _posMobDumpLastTime;
-        private static float _proxiEntryProbeLastTime;
         private void ProcessMonsterMovement(float deltaTime, uint playerEntityId, Monster onlyMonster, bool emitPositionChanged)
         {
             if (deltaTime <= 0f) return;
@@ -3984,7 +4179,7 @@ namespace DungeonRunners.Combat
             {
                 // B4.2 diag (2026-05-28): trace why monster.PosX isn't updating for in-combat mobs.
                 // Trace any mob with a non-zero TargetId (= the one(s) actively engaged) — throttled.
-                bool tracePos = monster != null && monster.TargetId != 0 && (_posTraceCounter++ % 30 == 0);
+                bool tracePos = VerbosePositionTrace && monster != null && monster.TargetId != 0 && (_posTraceCounter++ % 30 == 0);
                 if (!monster.IsAlive || !monster.AggroTriggered || monster.TargetId == 0)
                 {
                     if (tracePos) Debug.LogError($"[POS-TRACE] mob#{monster?.EntityId} BAIL-A alive={monster?.IsAlive} aggro={monster?.AggroTriggered} targetId={monster?.TargetId}");
@@ -4133,16 +4328,11 @@ namespace DungeonRunners.Combat
                 {
                     monster.PosX = moverNewX;
                     monster.PosY = moverNewY;
-                    // B5-followup (2026-05-28) position-sync diag
-                    if (_posMobWriteCounter++ % 30 == 0)
-                        Debug.LogError($"[POS-MOB-WRITE] mob={monster.EntityId} writer=mover pos=({moverNewX:F1},{moverNewY:F1}) prev=({prevMobX:F1},{prevMobY:F1}) tgtPos=({target.PosX:F1},{target.PosY:F1}) dist={dist:F1} step={step:F3}");
                 }
                 else
                 {
                     monster.PosX = legacyNewX;
                     monster.PosY = legacyNewY;
-                    if (_posMobWriteCounter++ % 30 == 0)
-                        Debug.LogError($"[POS-MOB-WRITE] mob={monster.EntityId} writer=legacy pos=({legacyNewX:F1},{legacyNewY:F1}) prev=({prevMobX:F1},{prevMobY:F1}) tgtPos=({target.PosX:F1},{target.PosY:F1}) dist={dist:F1} step={step:F3}");
                 }
                 monster.Heading = legacyHeading;
                 monster.State = MonsterState.Chase;
@@ -4260,269 +4450,11 @@ namespace DungeonRunners.Combat
             Debug.LogError($"[MON-SKILL-CD] set {monster.Name}#{monster.EntityId} skill={monster.PrimaryActiveSkillPath} ticks={monster.PrimaryActiveSkillCooldownRemainingTicks} source={source ?? "unknown"}");
         }
 
-        private void ProcessMonsterAttacks(float deltaTime)
-        {
-            ProcessMonsterAttacks(deltaTime, 0);
-        }
-
-        private void ProcessMonsterAttacks(float deltaTime, uint playerEntityId, bool allowNewAttacks = true)
-        {
-            ProcessMonsterAttacks(deltaTime, playerEntityId, allowNewAttacks, null);
-        }
-
-        private void ProcessMonsterAttacks(float deltaTime, uint playerEntityId, bool allowNewAttacks, Monster onlyMonster, float nativeNow = -1f)
-        {
-            if (_roomRng == null) return;
-            float now = nativeNow >= 0f ? nativeNow : GetNativeCombatTime();
-
-            foreach (var monster in SelectMonsters(onlyMonster))
-            {
-                AdvanceMonsterPrimarySkillCooldown(monster, now);
-                TryAssistFromAlertSource(monster, "attack-loop");
-                bool pendingClientVisibleAttack = monster.AttackPending && monster.AttackClientVisible;
-                bool pendingRuntimeAttack = monster.AttackPending && monster.AttackCommitTime > 0f;
-                if (!monster.AggroTriggered) continue;
-                if (monster.DeathPendingClientConfirmation
-                    && !(pendingRuntimeAttack && monster.AttackNativeContactOnly && !monster.AttackHitResolved))
-                {
-                    CancelMonsterPendingAttack(monster, "monster_death_pending_client_confirmation");
-                    continue;
-                }
-                if (!monster.IsAlive && !pendingClientVisibleAttack && !pendingRuntimeAttack)
-                {
-                    monster.AttackPending = false;
-                    monster.AttackSoundPending = false;
-                    monster.AttackHitResolved = false;
-                    monster.AttackStartedTime = 0f;
-                    monster.AttackEndTime = 0f;
-                    monster.AttackCommitTime = 0f;
-                    monster.AttackSoundTime = 0f;
-                    continue;
-                }
-                if (playerEntityId != 0 && monster.TargetId != playerEntityId) continue;
-                if (!_players.TryGetValue(monster.TargetId, out var target) || !target.IsAlive || target.PlayerState == null) continue;
-                if (target.PlayerState.IsZoneSpawnDamageImmune)
-                {
-                    CancelMonsterPendingAttack(monster, "target_zone_spawn_invulnerability");
-                    continue;
-                }
-                if (target.PlayerState.CurrentHPWire == 0 && target.PlayerState.SynchHP == 0)
-                {
-                    target.IsAlive = false;
-                    CancelMonsterPendingAttack(monster, "target_dead");
-                    continue;
-                }
-                float allowedRange = ResolveMonsterEffectiveAttackRange(monster);
-                if (allowedRange <= 0f) continue;
-                float dist = Distance2D(monster.PosX, monster.PosY, target.PosX, target.PosY);
-                bool attackPathClear = IsMonsterAttackPathClear(monster, target, null);
-                bool nativeClientContact = IsNativeClientCombatContact(monster, target, dist, allowedRange);
-                bool nativeTargetAction = HasNativeMonsterTargetAction(monster, target, dist);
-                bool weaponRuntimeReach = HasMonsterWeaponRuntimeReach(monster, target, dist, allowedRange, nativeClientContact);
-                TraceMonsterState(monster, "attack-loop", target, dist, allowedRange, monster.AttackPending ? "pending" : "ready");
-
-                if (monster.AttackPending)
-                {
-                    if (!attackPathClear)
-                    {
-                        CancelMonsterPendingAttack(monster, $"world_blocked dist={dist:F1} range={allowedRange:F1}");
-                        if (monster.IsAlive)
-                            monster.State = MonsterState.Chase;
-                        Debug.LogError($"[MON-DAMAGE] {monster.Name}#{monster.EntityId}->{target.Name} cancel worldBlocked dist={dist:F1} monsterRange={allowedRange:F1}");
-                        OnMonsterAttackResolved?.Invoke(monster, target, false, target.PlayerState.CurrentHPWire);
-                        continue;
-                    }
-                    if (!monster.AttackClientVisible)
-                    {
-                        if (dist > allowedRange + NATIVE_CONTACT_RANGE_EPSILON && !nativeClientContact)
-                        {
-                            CancelMonsterPendingAttack(monster, $"stale_deferred_contact dist={dist:F1} range={allowedRange:F1}");
-                            if (monster.IsAlive)
-                                monster.State = MonsterState.Chase;
-                            continue;
-                        }
-                        if (monster.IsAlive && monster.AttackCommitTime <= 0f)
-                        {
-                            SelectMonsterPrimarySkillForAttack(monster, target, dist, allowedRange, "pending-start");
-                            if (!weaponRuntimeReach && !monster.UsePrimaryActiveSkillThisAttack)
-                            {
-                                if (nativeTargetAction)
-                                    TraceFarTargetAction(monster, target, dist, allowedRange, "pending-start");
-                                DelayMonsterAttackRetry(monster, "weapon_range_pending_start");
-                                CancelMonsterPendingAttack(monster, $"weapon_range_pending_start dist={dist:F1} range={allowedRange:F1} targetRange={ResolveMonsterTargetSearchRange(monster, true):F1}");
-                                if (monster.IsAlive)
-                                    monster.State = MonsterState.Chase;
-                                continue;
-                            }
-                            int handlerCount = OnMonsterAttackStarted?.GetInvocationList().Length ?? 0;
-                            Debug.LogError($"[MON-ATTACK] dispatch start {monster.Name}->{target.Name} session={monster.AttackSessionId} handlers={handlerCount} dist={dist:F1} range={allowedRange:F1}");
-                            OnMonsterAttackStarted?.Invoke(monster, target, monster.AttackSessionId);
-                            if (!monster.AttackPending)
-                            {
-                                Debug.LogError($"[MON-ATTACK] {monster.Name}->{target.Name} START canceled session={monster.AttackSessionId}");
-                                continue;
-                            }
-                        }
-                        else if (monster.AttackCommitTime <= 0f)
-                        {
-                            CancelMonsterPendingAttack(monster, "dead_unarmed");
-                            continue;
-                        }
-                        if (monster.AttackClientVisible)
-                        {
-                            ArmMonsterClientVisibleAttack(monster, target, now);
-                            continue;
-                        }
-                        if (!monster.AttackClientVisible && monster.AttackNativeContactOnly && nativeClientContact)
-                        {
-                            ArmMonsterRuntimeAttack(monster, target, "NATIVE-CONTACT", now);
-                        }
-                        else if (!monster.AttackClientVisible)
-                        {
-                            DelayMonsterAttackRetry(monster, "unsent_native_monster_attack");
-                            CancelMonsterPendingAttack(monster, "unsent_native_monster_attack");
-                            Debug.LogError($"[MON-ATTACK] {monster.Name}->{target.Name} canceled unsent native UseTarget session={monster.AttackSessionId} dist={dist:F1} range={allowedRange:F1} nativeContact={nativeClientContact}");
-                            continue;
-                        }
-                    }
-                    if (monster.AttackHitResolved)
-                    {
-                        if (now < monster.AttackEndTime) continue;
-                        monster.AttackPending = false;
-                        monster.AttackClientVisible = false;
-                        monster.AttackNativeContactOnly = false;
-                        monster.AttackSoundPending = false;
-                        monster.AttackHitResolved = false;
-                        monster.AttackStartedTime = 0f;
-                        monster.AttackEndTime = 0f;
-                        monster.AttackCommitTime = 0f;
-                        monster.AttackSoundTime = 0f;
-                        if (monster.IsAlive)
-                            monster.State = MonsterState.Combat;
-                        TraceMonsterState(monster, "attack-complete", target, dist, allowedRange, "end");
-                        continue;
-                    }
-                    if (monster.AttackSoundPending && now >= monster.AttackSoundTime)
-                        ConsumeMonsterAttackSoundRng(monster);
-                    if (now < monster.AttackCommitTime) continue;
-                    if (monster.AttackSoundPending)
-                        ConsumeMonsterAttackSoundRng(monster);
-                    monster.AttackHitResolved = true;
-                    if (monster.AttackEndTime < now)
-                        monster.AttackEndTime = now;
-                    float commitDelta = Distance2D(monster.AttackCommitTargetX, monster.AttackCommitTargetY, target.PosX, target.PosY);
-                    bool attackClientVisible = monster.AttackClientVisible;
-                    bool commitTargetStillValid = attackPathClear
-                        && (weaponRuntimeReach
-                        || monster.UsePrimaryActiveSkillThisAttack
-                        || (attackClientVisible && AttackCommitTargetStillValid(monster, target)));
-                    if (!commitTargetStillValid)
-                    {
-                        monster.AttackPending = false;
-                        monster.AttackSoundPending = false;
-                        monster.CombatContactTargetId = 0;
-                        monster.CombatContactUntil = 0f;
-                        monster.AttackClientVisible = false;
-                        monster.AttackNativeContactOnly = false;
-                        monster.AttackHitResolved = false;
-                        monster.AttackStartedTime = 0f;
-                        monster.AttackEndTime = 0f;
-                        monster.AttackCommitTime = 0f;
-                        monster.AttackSoundTime = 0f;
-                        if (monster.IsAlive)
-                            monster.State = MonsterState.Chase;
-                        Debug.LogError($"[MON-DAMAGE] {monster.Name}#{monster.EntityId}->{target.Name} cancel movedOut dist={dist:F1} commitDelta={commitDelta:F1} monsterRange={allowedRange:F1} nativeContact={nativeClientContact} clientVisible={attackClientVisible}");
-                        OnMonsterAttackResolved?.Invoke(monster, target, false, target.PlayerState.CurrentHPWire);
-                        continue;
-                    }
-                    if (!attackClientVisible && !monster.AttackNativeContactOnly && !nativeClientContact)
-                    {
-                        monster.AttackPending = false;
-                        monster.AttackSoundPending = false;
-                        monster.CombatContactTargetId = 0;
-                        monster.CombatContactUntil = 0f;
-                        monster.AttackClientVisible = false;
-                        monster.AttackNativeContactOnly = false;
-                        monster.AttackHitResolved = false;
-                        monster.AttackStartedTime = 0f;
-                        monster.AttackEndTime = 0f;
-                        monster.AttackCommitTime = 0f;
-                        monster.AttackSoundTime = 0f;
-                        if (monster.IsAlive)
-                            monster.State = MonsterState.Chase;
-                        Debug.LogError($"[MON-DAMAGE] {monster.Name}#{monster.EntityId}->{target.Name} cancel noNativeAttack dist={dist:F1} commitDelta={commitDelta:F1} monsterRange={allowedRange:F1}");
-                        OnMonsterAttackResolved?.Invoke(monster, target, false, target.PlayerState.CurrentHPWire);
-                        continue;
-                    }
-                    ResolveMonsterAttackDamage(monster, target, dist, "MON-DAMAGE", "ProcessMonsterAttacks");
-                    continue;
-                }
-                else
-                {
-                    if (!monster.IsAlive) continue;
-                    if (!allowNewAttacks) continue;
-                    if (!attackPathClear)
-                    {
-                        ClearMonsterCombatContact(monster, target);
-                        continue;
-                    }
-                    SelectMonsterPrimarySkillForAttack(monster, target, dist, allowedRange, "new-start");
-                    if (!weaponRuntimeReach && !monster.UsePrimaryActiveSkillThisAttack)
-                    {
-                        if (nativeTargetAction)
-                            TraceFarTargetAction(monster, target, dist, allowedRange, "new-start");
-                        if (monster.State == MonsterState.Combat)
-                            monster.State = MonsterState.Chase;
-                        continue;
-                    }
-                    if (now < monster.LastAttackTime) continue;
-                    monster.AttackPending = true;
-                    monster.AttackClientVisible = false;
-                    monster.AttackNativeContactOnly = false;
-                    monster.AttackHitResolved = false;
-                    monster.AttackSoundRaw = 0;
-                    monster.AttackSoundGateRaw = 0;
-                    monster.AttackSoundRepeatRaw = 0;
-                    monster.AttackUseRaw = 0;
-                    monster.AttackStartedTime = now;
-                    monster.AttackCommitTime = 0f;
-                    monster.AttackSoundTime = 0f;
-                    monster.AttackEndTime = 0f;
-                    monster.AttackSoundPending = false;
-                    monster.AttackCommitTargetX = target.PosX;
-                    monster.AttackCommitTargetY = target.PosY;
-                    monster.State = MonsterState.Attacking;
-                    monster.AttackSessionId++;
-                    if (monster.AttackSessionId == 0) monster.AttackSessionId = 1;
-                    int handlerCount = OnMonsterAttackStarted?.GetInvocationList().Length ?? 0;
-                    Debug.LogError($"[MON-ATTACK] dispatch start {monster.Name}->{target.Name} session={monster.AttackSessionId} handlers={handlerCount} dist={dist:F1} range={allowedRange:F1}");
-                    TraceMonsterState(monster, "attack-start", target, dist, allowedRange, "dispatch");
-                    OnMonsterAttackStarted?.Invoke(monster, target, monster.AttackSessionId);
-                    if (monster.AttackPending && monster.AttackClientVisible)
-                        ArmMonsterClientVisibleAttack(monster, target, now);
-                    else if (monster.AttackPending && monster.AttackNativeContactOnly && nativeClientContact)
-                    {
-                        if (monster.AttackCommitTime <= 0f)
-                            ArmMonsterRuntimeAttack(monster, target, "NATIVE-CONTACT", now);
-                        Debug.LogError($"[MON-ATTACK] {monster.Name}->{target.Name} START kept native contact runtime session={monster.AttackSessionId} dist={dist:F1} range={allowedRange:F1}");
-                    }
-                    else if (monster.AttackPending)
-                    {
-                        DelayMonsterAttackRetry(monster, "unsent_native_monster_attack_start");
-                        CancelMonsterPendingAttack(monster, "unsent_native_monster_attack_start");
-                        Debug.LogError($"[MON-ATTACK] {monster.Name}->{target.Name} START canceled unsent native UseTarget session={monster.AttackSessionId} nativeContact={nativeClientContact}");
-                    }
-                    else
-                        Debug.LogError($"[MON-ATTACK] {monster.Name}->{target.Name} START canceled session={monster.AttackSessionId}");
-                    continue;
-                }
-            }
-        }
-
-        private void ArmMonsterClientVisibleAttack(Monster monster, CombatPlayer target, float nativeNow = -1f)
-        {
-            ArmMonsterRuntimeAttack(monster, target, "START", nativeNow);
-        }
+        // Phase 3 cutover legacy ProcessMonsterAttacks deleted 2026-05-29:
+        // MonsterAttackController.EnableServerMobDamage has been load-bearing TRUE; MAC is the
+        // sole mob→player swing source. Helpers below (CancelMonsterPendingAttack,
+        // ArmMonsterRuntimeAttack, SelectMonsterPrimarySkillForAttack, etc.) retained — still
+        // used by HpSync/event paths.
 
         private void ArmMonsterRuntimeAttack(Monster monster, CombatPlayer target, string marker, float nativeNow = -1f)
         {
@@ -4546,23 +4478,6 @@ namespace DungeonRunners.Combat
             TraceMonsterState(monster, "attack-arm", target, -1f, ResolveMonsterEffectiveAttackRange(monster), marker);
         }
 
-        public void Update(float deltaTime)
-        {
-            Update(deltaTime, true);
-        }
-
-        public void Update(float deltaTime, bool allowNewMonsterAttacks)
-        {
-            TraceCombatTick("Update", deltaTime, allowNewMonsterAttacks);
-            ProcessProximityAggro();
-            ProcessMonsterAssistAlerts();
-            ProcessMonsterMovement(deltaTime);
-            float nativeNow = GetNativeCombatTime();
-            AdvanceMonsterModifierRuntime(_roomRng, nativeNow, "Update");
-            ProcessMonsterAttacks(deltaTime, 0, allowNewMonsterAttacks, null, nativeNow);
-            UpdateNativeMaintenance(deltaTime);
-        }
-
         // ── Section 10d: server-side mob→player combat tick ────────────────
         // Drives MonsterAttackController. Aggregates ticks at 30Hz to match the
         // sim's native rate. Provider+accumulator are lazy/state-only so legacy
@@ -4574,6 +4489,26 @@ namespace DungeonRunners.Combat
 
         public bool TryGetCombatPlayerForController(uint entityId, out CombatPlayer player)
             => _players.TryGetValue(entityId, out player);
+
+        /// <summary>
+        /// Stat-parity fix 2026-05-30: keep the combat player's <see cref="PlayerState"/> pointing
+        /// at the connection's CURRENT live instance. On a relog the avatar entity id is unchanged
+        /// (same character), so the lifecycle re-register never fires, leaving <c>_players[id]</c>
+        /// bound to the previous connection's now-stale PlayerState while <c>GetPlayerState(connId)</c>
+        /// returns a fresh one per new connId. The combat replay then damages the stale copy while the
+        /// outbound HP suffix ships the fresh (always-full) one -> client told full HP -> Validate
+        /// mismatch on the first move -> desync popup. Called from the suffix path (which holds the live
+        /// state) so combat and the wire stay on ONE object. Returns true if a rebind occurred.
+        /// </summary>
+        public bool RebindPlayerStateIfChanged(uint entityId, PlayerState liveState)
+        {
+            if (liveState == null) return false;
+            if (!_players.TryGetValue(entityId, out var player) || player == null) return false;
+            if (ReferenceEquals(player.PlayerState, liveState)) return false;
+            Debug.LogError($"[COMBAT-REBIND] entity={entityId} combat PlayerState was stale; rebound to live connection state (oldHP={player.PlayerState?.CurrentHPWire} newHP={liveState.CurrentHPWire})");
+            player.PlayerState = liveState;
+            return true;
+        }
 
         private void RunServerMobCombatTick(float deltaTime)
         {
@@ -4595,6 +4530,10 @@ namespace DungeonRunners.Combat
 
             if (_mobDamageTargetProvider == null)
                 _mobDamageTargetProvider = new CombatPlayerDamageTargetProvider(this);
+
+            // P2: client-event-replay test channel — drain (mobId,count) events from the bridge
+            // file and replay them per-player. No-op unless UseClientEventReplay is on.
+            TryProcessTestEventFile();
 
             _mobCombatTickAccumulator += deltaTime;
             int ticks = Mathf.FloorToInt(_mobCombatTickAccumulator / NATIVE_UNIT_TICK_INTERVAL);
@@ -4637,7 +4576,7 @@ namespace DungeonRunners.Combat
         // Throttled diagnostic — fires every ~3 seconds if any mob is aggro'd, so we
         // can see whether the controller has registered mobs and a target without
         // spamming the log per-tick. Set false to silence after diagnosis.
-        public static bool VerboseMobCtrlTick = true;
+        public static bool VerboseMobCtrlTick = false;
         private float _mobCtrlDiagLastTime;
 
         public void UpdateNativeMonsterEntity(uint entityId, float deltaTime, bool allowNewMonsterAttacks)
@@ -4649,13 +4588,9 @@ namespace DungeonRunners.Combat
         {
             if (!_activeMonsters.TryGetValue(entityId, out var monster))
                 return;
-            // B5-followup (2026-05-28) position-sync diag: snapshot before all sub-process calls, compare after.
-            float posBeforeX = monster.PosX;
-            float posBeforeY = monster.PosY;
-            // B4.2 RNG-drift diag (2026-05-28): per-phase RNG-position snapshots to pinpoint what's
-            // consuming _roomRng outside the MAC swing (which is the only call we expect for byte-parity).
-            // Throttled per mob @ 30 ticks to avoid flooding.
-            bool traceRng = monster.AggroTriggered && (_rngPhaseCounter++ % 30 == 0);
+            // RNG-drift diag (gated by VerbosePositionTrace): per-phase RNG-position snapshots to
+            // pinpoint what's consuming _roomRng outside the MAC swing. Throttled per mob @ 30 ticks.
+            bool traceRng = VerbosePositionTrace && monster.AggroTriggered && (_rngPhaseCounter++ % 30 == 0);
             int rngPos0 = _roomRng != null ? _roomRng.CallsSinceReseed : 0;
             TraceCombatTick("UpdateNativeMonsterEntity", deltaTime, allowNewMonsterAttacks, monster);
             ProcessProximityAggro(0, monster);
@@ -4666,20 +4601,10 @@ namespace DungeonRunners.Combat
             int rngPos3 = _roomRng != null ? _roomRng.CallsSinceReseed : 0;
             AdvanceMonsterModifierRuntimeForTarget(entityId, _roomRng, nativeNow, "UpdateNativeMonsterEntity");
             int rngPos4 = _roomRng != null ? _roomRng.CallsSinceReseed : 0;
-            // Phase 3 cutover gate (B4.5, 2026-05-28): when MAC is authoritative, skip legacy.
-            if (!MonsterAttackController.EnableServerMobDamage)
-                ProcessMonsterAttacks(deltaTime, 0, allowNewMonsterAttacks, monster, nativeNow);
-            int rngPos5 = _roomRng != null ? _roomRng.CallsSinceReseed : 0;
-            if (traceRng && rngPos5 != rngPos0)
-                Debug.LogError($"[RNG-PHASE] mob={entityId} pre={rngPos0} ProxAggro+={rngPos1 - rngPos0} Assist+={rngPos2 - rngPos1} MoveSim+={rngPos3 - rngPos2} ModRT+={rngPos4 - rngPos3} LegacyAtk+={rngPos5 - rngPos4} total={rngPos5 - rngPos0}");
-            float dx = monster.PosX - posBeforeX;
-            float dy = monster.PosY - posBeforeY;
-            float deltaSq = dx * dx + dy * dy;
-            if (deltaSq > 1f && monster.AggroTriggered && (_posMobChangedCounter++ % 30 == 0))
-                Debug.LogError($"[POS-MOB-CHANGED] mob={entityId} tick=({posBeforeX:F1},{posBeforeY:F1})->({monster.PosX:F1},{monster.PosY:F1}) delta={Mathf.Sqrt(deltaSq):F2}");
+            if (traceRng && rngPos4 != rngPos0)
+                Debug.LogError($"[RNG-PHASE] mob={entityId} pre={rngPos0} ProxAggro+={rngPos1 - rngPos0} Assist+={rngPos2 - rngPos1} MoveSim+={rngPos3 - rngPos2} ModRT+={rngPos4 - rngPos3} total={rngPos4 - rngPos0}");
         }
         private static int _rngPhaseCounter;
-        private static int _posMobChangedCounter;
 
         public void UpdateNativeMaintenance(float deltaTime)
         {

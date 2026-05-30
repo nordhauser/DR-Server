@@ -76,8 +76,13 @@ namespace DungeonRunners.Combat
 
             // Discriminator adjustment (+0x314). For mob→player, attacker is mob, target is player.
             // Per spec: hitChance_scaled = hitChance × 256 − ((targetDiscrim − attackerDiscrim) × 5)
-            int discrimAttacker = attacker.Discriminator * 0x100;
-            int discrimTarget = target.Discriminator * 0x100;
+            // Stat-parity fix 2026-05-30: RAW discriminator (NOT *0x100). The client applies the delta as
+            // (rawDelta * 0x500) >> 8 == rawDelta * 5 (Ghidra), and the section-10 spec says the same. The old
+            // *0x100 overweighted the term 256x -> ~+10% hit AND a phantom ~10% mob crit (mobDisc2 vs playerDisc0),
+            // both making the server over-damage vs the client. Hit term below does *5; crit term does *0x500>>8;
+            // both are correct with raw values.
+            int discrimAttacker = attacker.Discriminator;
+            int discrimTarget = target.Discriminator;
             int hitChanceScaled = hitChance * 256 - ((discrimTarget - discrimAttacker) * 5);
             if (hitChanceScaled < 0x0A00) hitChanceScaled = 0x0A00; // PvE floor 10%
 

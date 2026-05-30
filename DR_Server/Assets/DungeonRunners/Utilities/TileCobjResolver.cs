@@ -50,6 +50,21 @@ namespace DungeonRunners.Utilities
             if (string.IsNullOrEmpty(tileTypeName)) return null;
             EnsureIndexed();
             if (_tileToPath == null) return null;
+
+            // 2026-05-28 — A1.3 explored tile-level aliasing for tutorial_loot_* →
+            // elmforest_loot_*_a (same logical shape, different theme). REVERTED:
+            // even tile-level cross-theme aliasing distorts the layout — the
+            // elmforest_loot tile drops walls in corridors the tutorial_loot variant
+            // leaves open. Phase 4b parity dropped 66% → 33% (case 2 went from
+            // SoftPass to "directReach mismatch ours=False client=True", i.e. we
+            // now have a wall where the client doesn't).
+            //
+            // Conclusion: missing-asset substitution across themes doesn't work.
+            // The default behavior (return null → cell stays fully walkable when
+            // its tile is missing) is the least-bad answer until we either find
+            // the actual tutorial_loot geometry source or accept the missing
+            // coverage. The 1/3 baseline failure stands; A1.4+A2 are the next
+            // axes to try.
             return _tileToPath.TryGetValue(tileTypeName.ToLowerInvariant(), out string fullPath) ? fullPath : null;
         }
 
@@ -61,7 +76,57 @@ namespace DungeonRunners.Utilities
             if (_leafToPath == null) return null;
 
             string leaf = LeafOf(extendsPath).ToLowerInvariant();
-            return _leafToPath.TryGetValue(leaf, out string fullPath) ? fullPath : null;
+            if (_leafToPath.TryGetValue(leaf, out string fullPath)) return fullPath;
+
+            // A1.3 follow-up (2026-05-28): cobj aliasing. The world data references
+            // qualifier-prefixed variants (_nm_ = navmesh marker, s_ = stair,
+            // t_ = transition, theme-prefixed entrances) whose actual collision
+            // geometry lives under the un-prefixed name. Without these aliases the
+            // PathMap silently leaves the wall geometry walkable, which causes
+            // Phase 4b directReach mismatches on captured client paths.
+            string alias = ResolveCobjAlias(leaf);
+            if (alias != null && _leafToPath.TryGetValue(alias, out string aliasedPath))
+            {
+                LogAliasOnce(leaf, alias);
+                return aliasedPath;
+            }
+
+            return null;
+        }
+
+        private static readonly HashSet<string> _aliasLogSeen =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        private static void LogAliasOnce(string leaf, string alias)
+        {
+            // Cheap thread-safe-ish dedup: HashSet has its own mutex via Add return,
+            // and we only need at-most-once log semantics, not strict at-least-once.
+            lock (_aliasLogSeen)
+            {
+                if (!_aliasLogSeen.Add(leaf)) return;
+            }
+            UnityEngine.Debug.LogError($"[PATHMAP-BUILD] cobj alias: '{leaf}' → '{alias}' (first hit this session)");
+        }
+
+        private static string ResolveCobjAlias(string lowerLeaf)
+        {
+            // 2026-05-28 LESSON LEARNED: leaf-name cobj aliasing across themes
+            // doesn't work, even for what look like semantic equivalents.
+            //
+            // Tried and REVERTED:
+            //   • _nm_ / _s_ / _t_ qualifier stripping — those are navmesh path markers
+            //     placed at WALKABLE locations, not wall geometry. Aliasing dropped
+            //     walls into corridors and made mazes impassable (parity 66% → 0%).
+            //   • elmforest_orokentrance_* → cave_orokentrance — cave entrance geometry
+            //     is shape-incompatible with where the elmforest entrance sits;
+            //     dropped a wall blocking a corridor (parity 66% → 33%).
+            //
+            // Conclusion: the unresolved cobj names ARE the right answer being null.
+            // The client's actual collision data for those locations comes from
+            // somewhere else (tile-bake at load time? hint-file we don't read yet?).
+            // The remaining 1/3 Phase 4b fail is a deeper problem than name aliasing —
+            // probably A1.4 (8-way slide) or beyond.
+            return null;
         }
 
         public static string ResolveCobjPathByLeaf(string leafName)

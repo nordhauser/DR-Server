@@ -32,6 +32,7 @@ namespace DungeonRunners.Combat
             TestRollCountOnHitNotBlocked();
             TestRollCountOnMiss();
             TestDeterminism();
+            TestDiscriminatorParity();
             TestSampleMobSwing();
             TestOnQueryApplyDamage();
             TestComputeReflectedDamage();
@@ -62,15 +63,12 @@ namespace DungeonRunners.Combat
             CheckEq("level 1", stats.Level, 1);
             CheckEq("AttackStyle = 1 (melee)", stats.AttackStyle, 1);
             CheckEq("WeaponDamageType = 0 (SLASHING)", stats.WeaponDamageType, 0);
-            // S10e: curve-based AR. AR=0.25 (Fixed32=64), MonsterAR curve at disc=2:
-            //   interp(L1=25600, L110=8396800) at 2.0 (= 512 Fixed32):
-            //     25600 + (8396800-25600) × (512-256)/(28160-256) = 25600 + 76798 = 102398
-            //   baseAR = (64 × 102398) >> 16 = 99
-            CheckEq("BaseAttackRating ≈ 99 (curve-based, disc=2, AR=0.25)", stats.BaseAttackRating, 99);
-            // DR=0.25: interp(L1=8960, L15=73472, L110=790272) at 2.0 (= 512 Fixed32):
-            //   between L1 and L15: 8960 + (73472-8960) × (512-256)/(3840-256) = 8960 + 4610 = 13570
-            //   baseDR = (64 × 13570) >> 16 = 13
-            CheckEq("BaseDefenseRating ≈ 13 (curve-based, disc=2, DR=0.25)", stats.BaseDefenseRating, 13);
+            // S10e + stat-parity 2026-05-30: curve-based AR/DR, disc = monster.Level (=1 for this level-1 build,
+            // matching Unit[+0x314] sent in the spawn), so the curve is queried at L1.0 (256 Fixed32) = the L1 anchor.
+            // AR=0.25 (Fixed32=64), MonsterAR curve at L1.0 = 25600: baseAR = (64 × 25600) >> 16 = 25
+            CheckEq("BaseAttackRating ≈ 25 (curve-based, disc=level=1, AR=0.25)", stats.BaseAttackRating, 25);
+            // DR=0.25, MonsterDR curve at L1.0 = 8960: baseDR = (64 × 8960) >> 16 = 8
+            CheckEq("BaseDefenseRating ≈ 8 (curve-based, disc=level=1, DR=0.25)", stats.BaseDefenseRating, 8);
             // 10d transform (no pre-scale per S10g session): ((auth × 256 - 256) × 25600) >> 16
             //   = ((0.25 × 256 - 256) × 25600) >> 16
             //   = ((64 - 256) × 25600) >> 16 = (-192 × 25600) >> 16 = -75
@@ -135,6 +133,26 @@ namespace DungeonRunners.Combat
             // All 20 swings should have consumed 2-3 calls each
             Check("total rolls in 40-60 range", totalRolls >= 40 && totalRolls <= 60,
                 $"totalRolls={totalRolls} for {trials} trials");
+        }
+
+        private static void TestDiscriminatorParity()
+        {
+            // Stat-parity 2026-05-30: discriminator delta uses RAW values (×5), not (disc×0x100)×5.
+            // mob disc=2, player disc=0, AR=100, DR=100 → hitChance=50 → hitChanceScaled = 50*256 - (0-2)*5 = 12810.
+            // The old ×0x100 bug would have produced 50*256 + 2560 = 15360 (~+10% hit + phantom mob crit).
+            var attacker = new MonsterUnitStats
+            {
+                Level = 1, AttackStyle = 1, WeaponDamageType = 0, Discriminator = 2,
+                BaseAttackRating = 100, BaseAttackRatingMod = 0, BaseCriticalChance = 0, CritMultiplier = 200,
+                WeaponDamagePerLevel = 10, WeaponVolatilityFixed = 128, WeaponDamageFixed = 256,
+            };
+            var target = new PlayerUnitStats
+            {
+                BaseDefenseRating = 100, BaseDefenseRatingMod = 0, Discriminator = 0, BlockChance = 0,
+            };
+            var result = MonsterDamageComputer.ComputeSwing(attacker, target, new MersenneTwister(0x5A5A5A5A));
+            Check("disc-parity: hitChanceScaled == 12810 (raw delta x5, not x1280)",
+                result.HitChanceScaled == 12810, $"hitChanceScaled={result.HitChanceScaled} (old-bug value=15360)");
         }
 
         private static void TestDeterminism()

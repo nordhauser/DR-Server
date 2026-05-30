@@ -83,6 +83,13 @@ namespace DungeonRunners.Core
                 // C6 — lock in OnQueryApplyDamage semantics + roll-count / determinism
                 // (touched 2026-05-28 to force Unity domain reload after first attempt cached old DLL)
                 DungeonRunners.Combat.MonsterDamageComputerSelfTest.RunAll();
+                // B-SPIKE Day 2: verify MT19937 position-inversion algorithm at boot.
+                // (touched 2026-05-29 to force Unity domain reload after first attempt cached old DLL)
+                Debug.LogError("[RNG-INFER-BOOT] about to call RngPositionInferrerSelfTest.RunAll");
+                DungeonRunners.Combat.RngPositionInferrerSelfTest.RunAll();
+                Debug.LogError("[RNG-INFER-BOOT] RngPositionInferrerSelfTest.RunAll returned");
+                // P1: client-event-replay (per-player RNG mirror) self-test
+                DungeonRunners.Combat.ClientEventReplaySelfTest.RunAll();
             }
             catch (Exception ex)
             {

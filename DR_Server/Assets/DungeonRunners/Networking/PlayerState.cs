@@ -222,6 +222,12 @@ namespace DungeonRunners.Networking
         private uint _clientSyncHPWire = 0;
         private float _clientSyncHPTime = -1f;
         private double _clientSyncHPCarry = 0d;
+        // Strict 1-tick regen cadence (2026-05-30): the native combat tick at the last regen
+        // advance. Drives the regen/cooldown loop by the REAL integer-tick delta instead of the
+        // float `now` elapsed, which could jump (suffix passes validationCutoffTime) and bulk-burn
+        // the whole 300-tick cooldown + regen to full in one call. -1 = re-anchor on next advance.
+        // See [[project-dr-reborn-hp-regen-parity-2026-05-30]] (client Unit::update @0x5093e0).
+        private long _lastClientSyncTick = -1L;
         private float _clientSyncRegenSuppressUntil = -1f;
         private bool _hasObservedClientHP = false;
         private uint _lastObservedClientHPWire = 0;
@@ -385,6 +391,7 @@ namespace DungeonRunners.Networking
             _clientSyncHPWire = _currentHPWire;
             _clientSyncHPTime = -1f;
             _clientSyncHPCarry = 0d;
+            _lastClientSyncTick = -1L;
             _clientSyncRegenSuppressUntil = -1f;
             _regenFactor = Mathf.RoundToInt(ResolveClientSyncHPRegenPerSecond());
             _regenCooldown = 0;
@@ -701,6 +708,7 @@ namespace DungeonRunners.Networking
             {
                 _clientSyncHPTime = nativeTime ?? Time.time;
                 _clientSyncHPCarry = 0d;
+                _lastClientSyncTick = -1L;   // re-anchor strict-tick marker on the next advance
             }
         }
 
@@ -792,9 +800,30 @@ namespace DungeonRunners.Networking
             const double nativeTickSeconds = 1d / 30d;
             double elapsed = now - _clientSyncHPTime + _clientSyncHPCarry;
             int ticks = (int)(elapsed / nativeTickSeconds);
+
+            // ── Strict 1-tick cadence (2026-05-30) ──────────────────────────────────────────
+            // Override the float-derived tick count with the authoritative integer
+            // NativeCombatTick delta. The client's regen tick (Unit::update @0x5093e0) decrements
+            // its cooldown [+0x316] by exactly 1 per native tick and CANNOT fast-forward. The old
+            // float `elapsed` inflated `ticks` whenever `now` jumped (the suffix path passes the
+            // validationCutoffTime, the ServerTick passes the live native time) — a single call
+            // then burned all 300 cooldown ticks AND regened to full, so HP read full right after
+            // a hit -> the next move desynced. The tick-counter delta is the REAL ticks elapsed,
+            // so the 300-tick cooldown holds through combat exactly like the client.
+            long currentNativeTick =
+                DungeonRunners.Combat.CombatManager.Instance != null
+                    ? (long)DungeonRunners.Combat.CombatManager.Instance.NativeCombatTick
+                    : -1L;
+            bool useTickCounter = currentNativeTick >= 0L;
+            if (useTickCounter)
+                ticks = _lastClientSyncTick < 0L ? 0 : (int)Math.Max(0L, currentNativeTick - _lastClientSyncTick);
+
             if (ticks <= 0)
             {
-                _clientSyncHPCarry = elapsed;
+                if (useTickCounter)
+                    _lastClientSyncTick = currentNativeTick;   // anchor/maintain the strict-tick marker
+                else
+                    _clientSyncHPCarry = elapsed;
                 _clientSyncHPTime = now;
                 if (oldCurrentHP != _currentHPWire || oldSyncHP != _clientSyncHPWire)
                     Debug.LogError($"[PLAYER-REGEN] source={source ?? "sync"} hp={oldCurrentHP}->{_currentHPWire} sync={oldSyncHP}->{_clientSyncHPWire} mana={oldMana}->{_currentManaWire}/{maxMana} hpCooldown={oldHPCooldown}->{_regenCooldown} manaCooldown={oldManaCooldown}->{_manaRegenCooldown} ticks=0 hpFactor={_regenFactor} manaFactor={_manaRegenFactor}");
@@ -836,7 +865,15 @@ namespace DungeonRunners.Networking
             }
             if (oldMana != _currentManaWire)
                 HasClientMana = true;
-            _clientSyncHPCarry = elapsed - ticks * nativeTickSeconds;
+            if (useTickCounter)
+            {
+                _lastClientSyncTick = currentNativeTick;   // advance the strict-tick marker
+                _clientSyncHPCarry = 0d;                    // integer ticks carry nothing
+            }
+            else
+            {
+                _clientSyncHPCarry = elapsed - ticks * nativeTickSeconds;
+            }
             _clientSyncHPTime = now;
             if (oldCurrentHP != _currentHPWire
                 || oldSyncHP != _clientSyncHPWire

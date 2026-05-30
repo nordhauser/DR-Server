@@ -9,10 +9,13 @@ namespace DungeonRunners.Combat
     /// and routes <c>ApplyDamage</c> to <see cref="PlayerState.TakeRuntimeDamage(uint)"/>.
     ///
     /// <para>
-    /// Damage is applied via the runtime path (no client-sync packet) — the server
-    /// keeps its own authoritative HP for death detection while the 666 client
-    /// continues to own its on-screen HP bar. Matches the "no client patches"
-    /// constraint and the HP-sync-popup avoidance goal.
+    /// Damage is applied via <see cref="PlayerState.TakeDamage(uint,float,bool)"/> (the
+    /// client-sync path) so the replayed hit reaches the outbound HP suffix the client
+    /// validates against. The client-event-replay model keeps the server's authoritative
+    /// HP byte-matched to the client's own local sim, then pushes it. (The earlier no-sync
+    /// <c>TakeRuntimeDamage</c> path left the hit invisible to the wire — regen flushed it
+    /// back to full before the suffix was built — so the client was always told full HP and
+    /// tripped Validate on the first move.)
     /// </para>
     /// </summary>
     public sealed class CombatPlayerDamageTargetProvider : MonsterAttackController.IDamageTargetProvider
@@ -57,11 +60,26 @@ namespace DungeonRunners.Combat
                 return;
 
             uint hpBefore = player.PlayerState.CurrentHPWire;
-            player.PlayerState.TakeRuntimeDamage(wireDamage);
+            // Stat-parity fix 2026-05-30: route replayed mob->player damage through the
+            // SYNC-updating path (was TakeRuntimeDamage = no client sync). The no-sync path
+            // left _clientSyncHPWire and the native tick clock stale, so the pre-suffix
+            // FlushPlayerHPRuntimeBeforeSync -> AdvanceClientSyncHP regenerated the hit back
+            // to full before the outbound suffix read SynchHP -> the client was perpetually
+            // told full HP while its own local sim showed the damage -> Validate mismatch on
+            // the first move -> desync popup. TakeDamage(nativeTime) syncs the HP baseline,
+            // resets the tick clock to the hit moment, and applies the post-damage regen
+            // cooldown, so the damaged value survives into the HP the client validates against.
+            float nativeTime = _combatManager.GetNativeCombatTime();
+            // advanceBeforeDamage:false — mirror the client. Unit::onApplyDamage @0x50be50 just
+            // subtracts; it does NOT regen before applying damage (regen is the separate Unit::update
+            // @0x5093e0 tick). The earlier `true` bulk-pre-regened to full before each hit (a hit
+            // logged hp 93696->97454, +15), corrupting the running HP total. Regen is handled by the
+            // ServerTick AdvanceClientSyncHP (the Unit::update mirror).
+            player.PlayerState.TakeDamage(wireDamage, nativeTime, advanceBeforeDamage: false);
             uint hpAfter = player.PlayerState.CurrentHPWire;
             Debug.LogError(
                 $"[MOB-DAMAGE-APPLY] player={player.Name}#{entityId} wireDamage={wireDamage} " +
-                $"hp={hpBefore}->{hpAfter} (256=1HP)");
+                $"hp={hpBefore}->{hpAfter} synchHP={player.PlayerState.SynchHP} (256=1HP)");
 
             // C9 hook point (plan vivid-marinating-pixel, 2026-05-28). When the
             // 1/15 HP fraction crosses a tick, call
@@ -86,20 +104,7 @@ namespace DungeonRunners.Combat
             float dx = monster.PosX - player.PosX;
             float dy = monster.PosY - player.PosY;
             distSquared = dx * dx + dy * dy;
-
-            // B4.2 diag (2026-05-28): mob attacks player on client but server thinks out-of-range.
-            // Dump both sides' tracked positions so we can compare against x32dbg-read client values.
-            // Throttled to ~1 per second to avoid flooding (called every controller tick).
-            _posDiagCounter++;
-            if (_posDiagCounter % 30 == 0)
-            {
-                Debug.LogError(
-                    $"[POS-DIAG] mob#{mobEntityId} server=({monster.PosX:F1},{monster.PosY:F1}) " +
-                    $"player#{playerEntityId} server=({player.PosX:F1},{player.PosY:F1}) " +
-                    $"dx={dx:F1} dy={dy:F1} distSq={distSquared:F1}");
-            }
             return true;
         }
-        private static int _posDiagCounter;
     }
 }

@@ -44,10 +44,13 @@ namespace DungeonRunners.Combat
             float effectiveAttackRating = float.IsNaN(attackRatingOverride) ? profile.AttackRating : attackRatingOverride;
             float effectiveDefenseRating = float.IsNaN(defenseRatingOverride) ? profile.DefenseRating : defenseRatingOverride;
 
-            // S10e 2026-05-27: discriminator IS the curve lookup key (per asm trace at
-            // 0x0050FA85 — MOVZX ECX,byte ptr [ESP+0x14] then SHL ECX,0x8). Disc=2 for
-            // all standard mobs.
-            const byte discriminator = 2;
+            // S10e 2026-05-27: discriminator IS the curve lookup key (asm 0x0050FA85: MOVZX ECX,byte ptr
+            // [ESP+0x14]; SHL ECX,0x8). Stat-parity 2026-05-30: that key is Unit[+0x314] = the byte the spawn
+            // sends = monster.Level (CombatPackets.WriteUnitReadInit writes `level` right after unitFlags).
+            // Live x64dbg read confirmed [+0x314]=1 for a level-1 mob. The old hardcoded 2 queried the curve at
+            // level 2.0 for EVERY mob → overstated a level-1 mob's AR as 99 vs the correct 25 (~4×) → major
+            // over-hit. Use the same level the spawn writes (clamped ≥1 like the spawn's `if(lvl==0)lvl=1`).
+            byte discriminator = (byte)(level <= 0 ? 1 : level);
 
             var stats = new MonsterUnitStats
             {
@@ -73,7 +76,7 @@ namespace DungeonRunners.Combat
                 // (1.25 × 256 × 6) >> 16 = 0, matching the captured pup cache value.
                 // For future high-CritChance mobs the formula yields a positive value.
                 BaseCriticalChance = ComputeBaseCriticalChance(profile.CritChance),
-                CritMultiplier = 150,  // placeholder 1.5× — TODO confirm via decompile
+                CritMultiplier = 200,  // client default 2.0× — Unit[+0x118], Ghidra @0x005099CA (was 150 placeholder)
                 BaseDamageBonus = 0,
 
                 // Base defensive (mob → not used when mob is attacker, but tracked for completeness)
@@ -177,14 +180,30 @@ namespace DungeonRunners.Combat
     {
         public static PlayerUnitStats Build(CombatPlayer player, int level = 1)
         {
-            // TODO: pull from player's actual gear/stats once we have a stat-system mirror.
-            // For v1, a level-1 unarmored hero with sensible defaults.
+            // Stat-parity fix 2026-05-30: use the player's REAL defense. The server already aggregates
+            // equipped-armor DR into PlayerState.ArmorDefenseRating (UnityGameServer.CalculateEquipmentBonuses,
+            // built with the reverse-engineered ItemDefenseRatingPerLevel=8.26 client knob, so it's already in
+            // client DR units). The avatar class .gc carries no base DefenseRating, so equipment dominates the
+            // client's hit-time DR. The old 10*level stub understated DR -> server over-hit -> Avatar HP desync.
+            var ps = player?.PlayerState;
+            // Avatar DR engine — x64dbg-pinned 2026-05-30 (Hero::endComputeAttributes @0x4F7950 + getDefenseRating @0x50FB30):
+            //   DR = baseCurveDR + derivedDR + equipment(+allocated)
+            //   baseCurveDR = ComputeBaseDR(authoredClassDR=1.0, disc=level)  [players REUSE the MonsterDR curve, 0x932DA8]
+            //   derivedDR   = (Strength × RPGSettings[+0x154]=3584=14.0 × DefenseRatingPerStrengthMod) >> 16 ; Fighter mod=1.0 -> Strength×14
+            // Live-confirmed: Strength 11 -> derived 154 (=EDX at 0x4F8248), + base ~31 = client DR 185.
+            // TODO: per-class authoredClassDR + DefenseRatingPerStrengthMod (FighterBase.gc / live UnitDesc[+0xD8]);
+            //       base term shows a ~4-unit gap vs live (server 35 vs client 31) — verify/refine in the move-test.
+            int strength = ps != null ? ps.Strength : 10;
+            int baseCurveDR = MonsterCurves.ComputeBaseDR(1.0f, (byte)Mathf.Clamp(level, 1, 110));
+            int derivedDR = (int)(((long)strength * 3584) >> 8);   // = Strength × 14 (RPGSettings[+0x154] × DefRatPerStrMod 1.0)
+            int armorDR = ps != null ? ps.ArmorDefenseRating : 0;
+            int dr = baseCurveDR + derivedDR + armorDR;
             return new PlayerUnitStats
             {
-                BaseDefenseRating = 10 * level,    // approximation
-                BaseDefenseRatingMod = 0,
-                BlockChance = 0,                   // no shield default
-                Discriminator = 0,
+                BaseDefenseRating = dr,
+                BaseDefenseRatingMod = 0,          // TODO Phase 2: equipment DR% from EquipmentStats + allocated-Strength DR
+                BlockChance = 0,                   // TODO Phase 2: shield block from gear (0 = correct for unshielded)
+                Discriminator = (ushort)Mathf.Clamp(level, 0, 255),  // player disc = level (live x64dbg: [+0x314]=1 at L1)
                 MeleeDefenseRating = 0,
                 MeleeDefenseRatingMod = 0,
                 RangedDefenseRating = 0,

@@ -41,7 +41,11 @@ namespace DungeonRunners.Combat
         // find the first call where server and client diverge.
         // Stack-trace lookups are slow — keep off in production. Flip to true for a single
         // test session, capture server.log, then flip back.
-        public static bool VerboseRngTrace = true;
+        // DISABLED 2026-05-29: per-Generate() logging + stack-trace lookup floods Unity's
+        // console during fast-forward (consumed 100s-1000s of generates per swing) and freezes
+        // the editor. The RNG-sync diagnostic that needed this is complete. Re-enable ONLY for a
+        // single short capture with NO fast-forward active.
+        public static bool VerboseRngTrace = false;
 
         /// <summary>
         /// Create uninitialized MT - must call Seed() before Generate()

@@ -69,6 +69,7 @@ namespace DungeonRunners.Combat
         public float AttackRating;       // base AR scalar
         public float DefenseRating;      // base DR scalar
         public float DamageMod;          // mob-class damage scalar
+        public float CritChance;         // mob-class authored crit chance (e.g. 1.25 from .gc)
         public float MaxHealth;          // mob-class HP scalar (combined with curve later)
         public float HealthRegen;        // per-mob regen mod
         public float Speed;              // run speed
@@ -240,6 +241,9 @@ namespace DungeonRunners.Combat
                 AttackRating  = desc.GetFloat("AttackRating", 0f),
                 DefenseRating = desc.GetFloat("DefenseRating", 0f),
                 DamageMod     = desc.GetFloat("DamageMod", 0f),
+                // .gc field is "CriticalChance" (verified: amazon_gatekeeper01 has
+                // "CriticalChance = 4.0;"). Mapping to the shorter local field name.
+                CritChance    = desc.GetFloat("CriticalChance", 0f),
                 MaxHealth     = desc.GetFloat("MaxHealth", 0f),
                 HealthRegen   = desc.GetFloat("HealthRegen", 0f),
                 Speed         = desc.GetFloat("Speed", 0f),

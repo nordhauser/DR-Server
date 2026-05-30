@@ -752,6 +752,33 @@ namespace DungeonRunners.Combat
                         cycle.ImpactSoundRaw = impactSoundRaw;
                         appliedDamage = (int)((oldHPWire > newHPWire ? oldHPWire - newHPWire : 0) + 255) / 256;
 
+                        // C4 skeleton (plan vivid-marinating-pixel, 2026-05-28).
+                        // Client behavior (audit §1.4 of WORK/AUDIT_HP_VALIDATION_PVE_VS_PVP_2026-05-28.md
+                        // and Unit::onApplyDamage @ 0x0050BE50): per non-killing hit, roll
+                        // random%100; if 0 (1% chance), apply CC effect by damage-ratio:
+                        //   ≥50% → KnockDown, ≥25% → KnockBack, ≥10% → Stun, <10% → none.
+                        // Each effect gated by CheckStunResist on target.
+                        //
+                        // Skeleton: log the damage-ratio + which effect WOULD fire if RNG
+                        // rolls 0. No RNG consumed (avoids room-RNG-stream desync until
+                        // x32dbg verification proves the consume order). No state set,
+                        // no broadcast, no resist check. Real wiring blocked on a Phase B
+                        // x32dbg session to confirm RNG order matches client.
+                        if (applied && !killed && cycle.Monster != null && cycle.Monster.MaxHPWire > 0)
+                        {
+                            long damageRatioPct = (long)damageWire * 100L / cycle.Monster.MaxHPWire;
+                            string wouldFire =
+                                damageRatioPct >= 50 ? "KNOCKDOWN" :
+                                damageRatioPct >= 25 ? "KNOCKBACK" :
+                                damageRatioPct >= 10 ? "STUN" :
+                                "NONE";
+                            Debug.LogError(
+                                $"[CC-CHECK] player={connKey} target={cycle.Monster.Name}#{cycle.Monster.EntityId} " +
+                                $"swing={cycle.SwingCount} lane=melee damageWire={damageWire} maxHPWire={cycle.Monster.MaxHPWire} " +
+                                $"damageRatioPct={damageRatioPct}% wouldFire={wouldFire} " +
+                                $"(skeleton — no RNG consumed; full wiring pending x32dbg parity)");
+                        }
+
                         Debug.LogError($"[WEAPON-CYCLE] {connKey} {(isCritical ? "CRIT" : "HIT")}: {actualDamage} dmgWire={damageWire} applied={applied} appliedDamage={appliedDamage} on {cycle.Monster.Name} HP={oldHPWire}->{newHPWire} proc=0x{damageProcRaw:X8} impact=0x{impactSoundRaw:X8} effect=0x{effectRaw:X8} rngPos={rng.CallsSinceReseed} [swing #{cycle.SwingCount}]");
                         if (killed && cycle.Monster != null)
                         {
@@ -1264,6 +1291,24 @@ namespace DungeonRunners.Combat
                 appliedDamage = (int)((oldHPWire > newHPWire ? oldHPWire - newHPWire : 0) + 255) / 256;
 
                 Debug.LogError($"[RANGED-PROJECTILE] {pending.ConnKey} {(isCritical ? "CRIT" : "HIT")}: {actualDamage} dmgWire={damageWire} applied={applied} appliedDamage={appliedDamage} target={pending.Monster.Name}#{pending.Monster.EntityId} HP={oldHPWire}->{newHPWire} impact=0x{impactSoundRaw:X8} effect=0x{effectRaw:X8} rngPos={rng.CallsSinceReseed} swing={pending.Swing} hitDist={pending.HitDistance:F2} flightTicks={pending.FlightTicks} dueTick={pending.DueNativeTick} delay={(pending.DueTime - pending.FireTime):F3}s worldBlocked={pending.WorldBlocked}");
+
+                // C4 skeleton (mirror of melee CC-CHECK at line ~755).
+                // Ranged hits also fire CC rolls in the client per Unit::onApplyDamage.
+                // Log-only, no RNG consumed, no behavior change.
+                if (applied && !killed && pending.Monster != null && pending.Monster.MaxHPWire > 0)
+                {
+                    long damageRatioPct = (long)damageWire * 100L / pending.Monster.MaxHPWire;
+                    string wouldFire =
+                        damageRatioPct >= 50 ? "KNOCKDOWN" :
+                        damageRatioPct >= 25 ? "KNOCKBACK" :
+                        damageRatioPct >= 10 ? "STUN" :
+                        "NONE";
+                    Debug.LogError(
+                        $"[CC-CHECK] player={pending.ConnKey} target={pending.Monster.Name}#{pending.Monster.EntityId} " +
+                        $"swing={pending.Swing} lane=ranged damageWire={damageWire} maxHPWire={pending.Monster.MaxHPWire} " +
+                        $"damageRatioPct={damageRatioPct}% wouldFire={wouldFire} " +
+                        $"(skeleton — no RNG consumed; full wiring pending x32dbg parity)");
+                }
                 if (killed)
                 {
                     _completedAttacks.Enqueue(new CompletedAttack

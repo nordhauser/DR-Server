@@ -85,6 +85,23 @@ namespace DungeonRunners.Combat
             float rangeWithEpsilon = attackRange + 1f / 16f;
             float attackRangeSquared = attackRange > 0f ? rangeWithEpsilon * rangeWithEpsilon : 0f;
 
+            // 2026-05-29 CLOBBER FIX: RegisterMonsterForServerCombat fires repeatedly for the
+            // same mob (spawn + WanderSimulator.RegisterMonster paths; observed ×7 per mob).
+            // The old code overwrote _states[id] with a fresh state every time, resetting
+            // TargetPlayerEntityId->0 and CooldownTicks->period. A re-register landing AFTER
+            // AggroMonster's SetTarget() silently wiped the aggro target, so Tick saw target==0
+            // and skipped — producing 0 swings AND 0 skips forever (no server mob damage ->
+            // client/server HP divergence -> SyncErrorRespawnDialog). Re-registration must
+            // refresh config WITHOUT disturbing an in-progress engagement.
+            if (_states.TryGetValue(mobEntityId, out var existing))
+            {
+                existing.Stats = stats;
+                existing.SwingPeriodTicks = period;
+                existing.AttackRangeSquared = attackRangeSquared;
+                // PRESERVE TargetPlayerEntityId + CooldownTicks (the live engagement state).
+                return;
+            }
+
             _states[mobEntityId] = new MobCombatState
             {
                 MobEntityId = mobEntityId,
@@ -120,6 +137,10 @@ namespace DungeonRunners.Combat
         public int Tick(MersenneTwister rng, IDamageTargetProvider targets)
         {
             int swings = 0;
+            // P1: when client-event-replay is active, the server replays per-mob swings from the
+            // client's reported events (CombatManager.ApplyClientSwingEvent); MAC's own cooldown-
+            // driven swinging would double-apply, so yield entirely.
+            if (CombatManager.UseClientEventReplay) return 0;
             foreach (var s in _states.Values)
             {
                 if (s.TargetPlayerEntityId == 0) continue;
@@ -157,6 +178,13 @@ namespace DungeonRunners.Combat
                     continue;
                 }
                 s.OutOfRangeSkipCount = 0;
+                // 2026-05-29 deterministic-mirror via client RNG-state sharing.
+                // Before each swing, fast-forward _roomRng to match client's reported
+                // call counter (via opcode 0x66 from DungeonRunners_RNG.exe). Server
+                // consumes throwaway Generates to align position with client; then
+                // ComputeSwing fires 3 generates that byte-match client's r1/r2/r3.
+                int ffConsumed = CombatManager.Instance.FastForwardRoomRngToClient();
+
                 // B4.2 diag (2026-05-28): snapshot rng position before and after the swing.
                 // Δ between consecutive swings tells us how many _roomRng calls happened in
                 // between (the controller does exactly 3 per swing; anything extra = drift source).

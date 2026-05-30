@@ -581,9 +581,14 @@ namespace DungeonRunners.Core
         {
             "[MOB-SWING]",            // ★ the actual roll-by-roll diagnostic
             "[MOB-SWING-SKIP]",       // ★ S12 range gate: skipped because mob out of attack range
+            "[REPLAY-SWING]",         // 2026-05-29 P1: client-event-replay per-swing result
+            "[REPLAY-SELFTEST]",      // 2026-05-29 P1: boot self-test
             "[MOB-CTRL-REGISTER]",    // ★ profile-missing failures on mob spawn (low volume)
             "[MOB-CTRL-DIAG]",        // ★ throttled controller state diagnostic (3s/per session)
             "[MOB-DAMAGE-APPLY]",     // ★ damage apply (gated off until flag flipped)
+            "[COMBAT-REBIND]",        // 2026-05-30 TEMP: stale-PlayerState rebind (one-shot; remove after HP-sync test)
+            "[PLAYER-REGEN]",         // 2026-05-30 TEMP: regen tick diagnostic (does regen erase replayed damage?)
+            "[PLAYER-REGEN-COOLDOWN]",// 2026-05-30 TEMP: post-damage regen suppression set (is the 10s cooldown applied on replayed hits?)
             "[SERVER-AGGRO]",         // ★ confirms aggro fires before swing
             "[ROOM-RNG]",             // ★ confirms RNG seed init
             "[RNG-SEED]",             // ★ seed transform diagnostic
@@ -623,20 +628,17 @@ namespace DungeonRunners.Core
             "[PATHMAPBUILD-SELFTEST]",// boot-time self-test output
             "[PATHMAP-SWEEP]",        // A1.2: threshold sweep results (off by default, gate via PathMapThresholdSweep.Enabled)
             "[PATHFINDER-PARITY]",    // A1.2 diag: per-case verdict from PathfinderClientParityTest
-            "[MDC-SELFTEST]",         // C6 (2026-05-28): MonsterDamageComputer.OnQueryApplyDamage parity + roll-count locks
-            "[MOB-REFLECT]",          // C7 (2026-05-28): reflect/thorns delivery back to mob when player has reflect gear
-            "[POS-DIAG]",             // B4.2 (2026-05-28): server-tracked mob/player positions for range-gate diagnostic
-            "[POS-TRACE]",            // B4.2 (2026-05-28): why ProcessMonsterMovement bails out for a specific mob
-            "[POS-PLAYER-IN]",        // B5-followup (2026-05-28): inbound 0x02 player movement packets
-            "[POS-MOB-IN-0x65]",      // B5-followup (2026-05-28): inbound 0x65 mob position packets (for aggro'd mobs)
-            "[POS-MOB-WRITE]",        // B5-followup (2026-05-28): ProcessMonsterMovement position writes (mover|legacy)
-            "[POS-MOB-CHANGED]",      // B5-followup (2026-05-28): per-tick position-delta race detector
-            "[POS-MOB-MOVER-STATE]",  // B5-followup (2026-05-28): mover state at aggro time (null = no UnitMoverSim path)
-            "[POS-MOB-DUMP]",         // B5-followup (2026-05-28): nearest-5 mobs to each player every 5s (compare to client-visible attackers)
-            "[RNG-PHASE]",            // B4.2 (2026-05-28): per-phase RNG consumption inside UpdateNativeMonsterEntity to find drift source
-            "[PROXIMITY-ENTRY]",      // B4.3 (2026-05-28): unconditional probe to prove ProcessProximityAggro is called
-            "[PROXIMITY-MISS]",       // B4.4 (2026-05-28): per-mob near-miss with gating reason (spawn-immune / out-of-range / pathmap-unreachable / player-zero-hp)
-            "[PROXIMITY-AGGRO]",      // B4.4 (2026-05-28): successful proximity aggro acquisition
+            "[MDC-SELFTEST]",         // C6: MonsterDamageComputer.OnQueryApplyDamage parity + roll-count locks (gated VerbosePositionTrace)
+            "[RNG-INFER-SELFTEST]",   // B-SPIKE Day 2: MT19937 position-inversion algorithm self-test
+            "[RNG-INFER-BOOT]",       // B-SPIKE Day 2: boot marker for inferrer call
+            "[CLIENT-RNG]",           // 2026-05-29: opcode 0x66 client RNG state share + FastForward log
+            "[MOB-REFLECT]",          // C7: reflect/thorns delivery back to mob when player has reflect gear
+            "[POS-TRACE]",            // ProcessMonsterMovement bail reasons (gated VerbosePositionTrace)
+            "[POS-MOB-DUMP]",         // nearest-5 mobs to each player every 5s (gated VerbosePositionTrace)
+            "[RNG-PHASE]",            // per-phase RNG consumption inside UpdateNativeMonsterEntity (gated VerbosePositionTrace)
+            "[RNG-TRACE]",            // ★★★ per-Generate() caller trace via MersenneTwister.VerboseRngTrace — primary RNG-drift diagnostic
+            "[PROXIMITY-MISS]",       // per-mob near-miss with gating reason (gated VerbosePositionTrace)
+            "[PROXIMITY-AGGRO]",      // successful proximity aggro acquisition (gated VerbosePositionTrace)
             "[CC-CHECK]",             // C4 skeleton: per-swing CC roll-shape diagnostic (no RNG consumed, no effect)
             "[WEAPON-CYCLE]",         // C4 verification: confirms player attack reached the swing tick
             "[LAYOUT-SEED]",          // session diag: maze layout seed for parity comparison
@@ -731,6 +733,11 @@ namespace DungeonRunners.Core
                 "[BOOT-PROBE]",              // 2026-05-27 — PA1.5: diagnostic to confirm ServerManager.Start path
                 "[MONSTER-ATTACK-SELFTEST]", // 2026-05-27 — Section 10 task S10.2 validation
                 "[MDC-SELFTEST]",            // 2026-05-27 — Section 10 task S10.3 MonsterDamageComputer validation
+                "[RNG-INFER-SELFTEST]",      // 2026-05-29 — B-SPIKE Day 2 MT19937 position-inversion self-test
+                "[RNG-INFER-BOOT]",          // 2026-05-29 — B-SPIKE Day 2 boot marker
+                "[CLIENT-RNG]",              // 2026-05-29 — opcode 0x66 client RNG state share + FastForward log
+                "[REPLAY-SWING]",            // 2026-05-29 P1 — client-event-replay per-swing result
+                "[REPLAY-SELFTEST]",         // 2026-05-29 P1 — boot self-test
                 "[MAC-SELFTEST]",            // 2026-05-27 — Section 10 task S10.4 MonsterAttackController validation
                 "[MOB-SWING]",               // 2026-05-27 — Section 10 mob swing diagnostic for x32dbg comparison
                 "[MOB-CTRL-REGISTER]",       // 2026-05-27 — S10d: profile-missing failures on mob spawn

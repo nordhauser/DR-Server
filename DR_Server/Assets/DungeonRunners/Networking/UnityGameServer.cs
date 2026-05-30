@@ -1404,6 +1404,10 @@ namespace DungeonRunners.Networking
             DungeonRunners.Combat.MonsterAttackDataSelfTest.RunAll();
             DungeonRunners.Combat.MonsterDamageComputerSelfTest.RunAll();
             DungeonRunners.Combat.MonsterAttackControllerSelfTest.RunAll();
+            // B-SPIKE Day 2: MT19937 position-inversion algorithm self-test
+            DungeonRunners.Combat.RngPositionInferrerSelfTest.RunAll();
+            // P1: client-event-replay (per-player RNG mirror) self-test
+            DungeonRunners.Combat.ClientEventReplaySelfTest.RunAll();
 
             // Load item stat lookups from existing game database
             DungeonRunners.Data.ItemStatDatabase.Instance.Load();
@@ -3449,7 +3453,14 @@ namespace DungeonRunners.Networking
             if (state == null) return false;
             uint playerEntityId = conn.Avatar != null ? (uint)conn.Avatar.Id : 0;
             if (playerEntityId != 0)
+            {
                 HpSyncService.Instance.RegisterPlayer(conn, state, playerEntityId);
+                // Stat-parity fix 2026-05-30: keep the combat sim's player on THIS live PlayerState.
+                // A relog mints a fresh per-connId PlayerState but leaves _players[id] bound to the
+                // prior connection's stale copy (avatar id unchanged -> no lifecycle re-register), so
+                // replayed mob damage lands on the stale copy while this suffix ships the fresh full one.
+                CombatManager.Instance.RebindPlayerStateIfChanged(playerEntityId, state);
+            }
             GetNativeValidationCutoff(out uint validationCutoffTick, out float validationCutoffTime);
             bool canApplyPlayerHP = CanApplyPlayerHPBeforeSuffix(context, packetName);
             bool pendingClientVisibleAttack = false;
@@ -9043,6 +9054,7 @@ namespace DungeonRunners.Networking
                 case 0x35: HandleOpcode_ComponentUpdate(conn, reader, messageType); break;
                 case 0x36: HandleOpcode_EntitySyncHP(conn, reader); break;
                 case 0x64: HandleOpcode_StateMachine(conn, reader); break;
+                case 0x66: HandleOpcode_ClientRngState(conn, reader); break;
 
                 // --- Missing opcodes — log full payload for wire format analysis ---
                 case 0x01: LogMissingOpcode(0x01, "BehaviorNotify", data, conn); break;
@@ -9092,6 +9104,7 @@ namespace DungeonRunners.Networking
                     case 0x35: HandleOpcode_ComponentUpdate(conn, reader, subType); break;
                     case 0x36: HandleOpcode_EntitySyncHP(conn, reader); break;
                     case 0x64: HandleOpcode_StateMachine(conn, reader); break;
+                    case 0x66: HandleOpcode_ClientRngState(conn, reader); break;
                     default:
                         byte[] leftover = reader.Remaining > 0 ? reader.PeekRemaining() : new byte[0];
                         Debug.LogWarning($"[ENTITY-STREAM] Unknown sub=0x{subType:X2} remain={reader.Remaining}");
@@ -9118,6 +9131,36 @@ namespace DungeonRunners.Networking
             uint clientSeed = reader.ReadUInt32();
             uint roomSeed = CombatManager.Instance.IsRoomRngReady ? CombatManager.Instance.RoomSeed : 0u;
             Debug.LogError($"[RNG-SEED] Ignored client seed: 0x{clientSeed:X8} current=0x{roomSeed:X8} ready={CombatManager.Instance.IsRoomRngReady}");
+        }
+
+        /// <summary>
+        /// Opcode 0x66 — DungeonRunners_RNG.exe sends its absolute Random::generate
+        /// call counter for the room RNG (ClientEntityManager+0x44). Server uses this
+        /// to fast-forward _roomRng to match client's position before each swing,
+        /// achieving byte-identical damage rolls without mirroring every client
+        /// RNG consumer (behavior states, fidgets, CC rolls, etc.).
+        /// Wire format: [uint32 absoluteCallCount].
+        /// </summary>
+        private void HandleOpcode_ClientRngState(RRConnection conn, LEReader reader)
+        {
+            // P1 per-swing event format: [uint32 mobId][uint32 absoluteRngCount] — replayed per
+            // player. Legacy single-count format: [uint32 absoluteRngCount] (test-bridge channel).
+            if (CombatManager.UseClientEventReplay && reader.Remaining >= 8)
+            {
+                uint mobId = reader.ReadUInt32();
+                uint clientCount = reader.ReadUInt32();
+                uint playerId = conn?.Avatar?.Id ?? 0;
+                if (playerId != 0)
+                    CombatManager.Instance.ApplyClientSwingEvent(playerId, mobId, clientCount);
+                if (VerbosePacketLogging)
+                    Debug.LogError($"[CLIENT-RNG] event mob={mobId} count={clientCount} player={playerId} from {conn?.LoginName}");
+                return;
+            }
+            if (reader.Remaining < 4) return;
+            uint count = reader.ReadUInt32();
+            CombatManager.Instance.ObserveClientRoomRngState(count);
+            if (VerbosePacketLogging)
+                Debug.LogError($"[CLIENT-RNG] received clientCount={count} from {conn?.LoginName}");
         }
 
         private void HandleOpcode_EntitySyncHP(RRConnection conn, LEReader reader)
@@ -11403,10 +11446,6 @@ namespace DungeonRunners.Networking
                     if (avatarId != 0)
                     {
                         CombatManager.Instance.UpdatePlayerPosition(avatarId, lastX, lastY);
-                        // B5-followup (2026-05-28) position-sync diag: every 0x02 packet that reaches here
-                        // logs the inbound position. Compare timestamps to detect 0x02-packet starvation
-                        // (no packets during "idle in combat" = no position updates = stale position).
-                        Debug.LogError($"[POS-PLAYER-IN] avatarId={avatarId} pos=({lastX:F1},{lastY:F1}) packetMoves={moveCount} sessionId={sessionId} t={Time.time:F2}");
                     }
                     // Throttled proximity check for goto quest objectives (1x/sec max)
                     CheckGotoProximity(conn);
@@ -11720,12 +11759,6 @@ namespace DungeonRunners.Networking
                                         _allEntityPositions[(ushort)monster.EntityId] = (monster.PosX, monster.PosY, monster.PosZ);
                                     applied++;
                                     if (VerbosePacketLogging) Debug.LogError($"[MONSTER-MOVE-0x65] {monster.Name} cid={componentId} flags=0x{moveFlags:X2} session={sessionId} pos=({monster.PosX:F1},{monster.PosY:F1}) heading={monster.Heading:F1}");
-                                    // B5-followup (2026-05-28) position-sync diag: always log for combat-engaged mobs.
-                                    // If aggro'd mobs RECEIVE 0x65 writes, the race vs ProcessMonsterMovement is live.
-                                    // If they DON'T receive 0x65 writes once aggro'd, the client has gone client-side-local and
-                                    // server-driven mover sim is sole writer.
-                                    if (monster.AggroTriggered)
-                                        Debug.LogError($"[POS-MOB-IN-0x65] mob={monster.EntityId} pos=({monster.PosX:F1},{monster.PosY:F1}) sessionId={sessionId} aggro=true targetId={monster.TargetId} t={Time.time:F2}");
                                 }
                                 if (applied != moveCount)
                                     Debug.LogError($"[MONSTER-MOVE-0x65] {monster.Name} cid={componentId} expected={moveCount} applied={applied} remaining={reader.Remaining}");

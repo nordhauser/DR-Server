@@ -1269,6 +1269,15 @@ namespace DungeonRunners.Managers
                     // The boot-time run hits zero matching PathMaps; the post-zone-in run can
                     // actually validate captured cases.
                     DungeonRunners.Core.PathfinderClientParityTest.RunAll();
+
+                    // A1.2 of plan vivid-marinating-pixel (2026-05-28): optional sweep of
+                    // PathMapBuilder.WallHeightThreshold against captured client traces. Off
+                    // by default — flip PathMapThresholdSweep.Enabled=true to fire once on
+                    // the next zone enter, read the [PATHMAP-SWEEP] summary line, then flip
+                    // back off. Doesn't replace the production PathMap (built above) — only
+                    // builds scratch maps for scoring.
+                    if (DungeonRunners.Utilities.PathMapThresholdSweep.Enabled)
+                        DungeonRunners.Utilities.PathMapThresholdSweep.Run(pathMapKey, cells);
                 }
             }
             catch (System.Exception ex)
